@@ -1,7 +1,6 @@
-# Go HTTP Reverse Proxy
+# Go HTTP Proxy
 
-This project provides a minimal reverse proxy written in Go. It can forward HTTP
-requests to a configurable backend and optionally serve HTTPS traffic.
+This project provides a minimal HTTP proxy written in Go. It can operate as a traditional forward proxy or as a reverse proxy forwarding requests to a configurable backend. HTTPS traffic can be proxied without providing a certificate when running in forward mode.
 
 ## Building
 
@@ -12,7 +11,7 @@ go build -o proxy
 ## Usage
 
 ```sh
-./proxy -target http://localhost:9000 -http :8080 \
+./proxy -mode reverse -target http://localhost:9000 -http :8080 \
         -https :8443 -cert path/to/cert.pem -key path/to/key.pem \
         -header "X-Example=1" -header "X-Other=2"
 ```
@@ -25,6 +24,7 @@ go build -o proxy
 - `-cert` – TLS certificate file used with `-https`.
 - `-key` – TLS key file used with `-https`.
 - `-header` – Custom header to add to upstream requests. Can be repeated.
+- `-mode` – Proxy mode: `forward` or `reverse`. Defaults to `forward`.
 
 ## Testing
 
