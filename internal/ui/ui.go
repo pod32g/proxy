@@ -30,13 +30,13 @@ var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 {{end}}
 </table>
 <h2>Add/Update Header</h2>
-<form method="POST" action="/header">
+<form method="POST" action="header">
 Name: <input name="name">
 Value: <input name="value">
 <button type="submit">Save</button>
 </form>
 <h2>Delete Header</h2>
-<form method="POST" action="/delete">
+<form method="POST" action="delete">
 Name: <input name="name">
 <button type="submit">Delete</button>
 </form>
