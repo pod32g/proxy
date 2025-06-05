@@ -60,7 +60,7 @@ func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 	if name != "" {
 		h.cfg.SetHeader(name, value)
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
 }
 
 func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
@@ -72,5 +72,5 @@ func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
 	if name != "" {
 		h.cfg.DeleteHeader(name)
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
 }
