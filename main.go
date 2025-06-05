@@ -73,10 +73,8 @@ func main() {
 		}
 		handler = proxy.New(target, logger, cfg.GetHeaders)
 	}
-	mux := http.NewServeMux()
 	uiHandler := ui.New(cfg, logger)
-	mux.Handle("/ui/", http.StripPrefix("/ui", uiHandler))
-	mux.Handle("/", handler)
+	mux := &server.Router{Proxy: handler, UI: uiHandler}
 
 	srv := server.Server{
 		HTTPAddr:  cfg.HTTPAddr,
