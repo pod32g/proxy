@@ -13,7 +13,8 @@ go build -o proxy
 
 ```sh
 ./proxy -target http://localhost:9000 -http :8080 \
-        -https :8443 -cert path/to/cert.pem -key path/to/key.pem
+        -https :8443 -cert path/to/cert.pem -key path/to/key.pem \
+        -header "X-Example=1" -header "X-Other=2"
 ```
 
 ### Flags
@@ -23,6 +24,7 @@ go build -o proxy
 - `-https` – HTTPS listen address. Disabled if empty.
 - `-cert` – TLS certificate file used with `-https`.
 - `-key` – TLS key file used with `-https`.
+- `-header` – Custom header to add to upstream requests. Can be repeated.
 
 ## Testing
 

@@ -9,13 +9,14 @@ import (
 )
 
 // New creates a reverse proxy to the given target URL.
-func New(target *url.URL, logger *log.Logger) *httputil.ReverseProxy {
+func New(target *url.URL, logger *log.Logger, headers map[string]string) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		// Example: force a specific header for all upstream requests
-		req.Header.Set("X-Forwarded-By", "MyGoProxy")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
 	}
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
