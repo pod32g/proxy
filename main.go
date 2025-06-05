@@ -11,6 +11,7 @@ import (
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/proxy"
 	"github.com/pod32g/proxy/internal/server"
+	"github.com/pod32g/proxy/internal/ui"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -36,14 +37,21 @@ func (h *headerFlags) Set(value string) error {
 	return nil
 }
 
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 func main() {
-	cfg := config.Config{}
-	flag.StringVar(&cfg.Mode, "mode", "forward", "proxy mode: forward or reverse")
-	flag.StringVar(&cfg.TargetURL, "target", "http://localhost:9000", "backend URL")
-	flag.StringVar(&cfg.HTTPAddr, "http", ":8080", "HTTP listen address")
-	flag.StringVar(&cfg.HTTPSAddr, "https", "", "HTTPS listen address")
-	flag.StringVar(&cfg.CertFile, "cert", "", "TLS certificate file")
-	flag.StringVar(&cfg.KeyFile, "key", "", "TLS key file")
+	cfg := &config.Config{}
+	flag.StringVar(&cfg.Mode, "mode", getenv("PROXY_MODE", "forward"), "proxy mode: forward or reverse")
+	flag.StringVar(&cfg.TargetURL, "target", getenv("PROXY_TARGET", "http://localhost:9000"), "backend URL")
+	flag.StringVar(&cfg.HTTPAddr, "http", getenv("PROXY_HTTP_ADDR", ":8080"), "HTTP listen address")
+	flag.StringVar(&cfg.HTTPSAddr, "https", getenv("PROXY_HTTPS_ADDR", ""), "HTTPS listen address")
+	flag.StringVar(&cfg.CertFile, "cert", getenv("PROXY_CERT_FILE", ""), "TLS certificate file")
+	flag.StringVar(&cfg.KeyFile, "key", getenv("PROXY_KEY_FILE", ""), "TLS key file")
 	var headers headerFlags
 	flag.Var(&headers, "header", "Custom header to add to upstream requests (format Name=Value, can be repeated)")
 	flag.Parse()
@@ -54,21 +62,25 @@ func main() {
 
 	var handler http.Handler
 	if cfg.Mode == "forward" {
-		handler = proxy.NewForward(logger, cfg.Headers)
+		handler = proxy.NewForward(logger, cfg.GetHeaders)
 	} else {
 		target, err := url.Parse(cfg.TargetURL)
 		if err != nil {
 			logger.Fatal("Invalid backend URL: %v", err)
 		}
-		handler = proxy.New(target, logger, cfg.Headers)
+		handler = proxy.New(target, logger, cfg.GetHeaders)
 	}
+	mux := http.NewServeMux()
+	uiHandler := ui.New(cfg)
+	mux.Handle("/ui/", http.StripPrefix("/ui", uiHandler))
+	mux.Handle("/", handler)
 
 	srv := server.Server{
 		HTTPAddr:  cfg.HTTPAddr,
 		HTTPSAddr: cfg.HTTPSAddr,
 		CertFile:  cfg.CertFile,
 		KeyFile:   cfg.KeyFile,
-		Handler:   handler,
+		Handler:   mux,
 		Logger:    logger,
 	}
 
