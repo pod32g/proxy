@@ -17,7 +17,7 @@ func newLogger() *log.Logger {
 func TestNewAddsHeader(t *testing.T) {
 	var received string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		received = r.Header.Get("X-Forwarded-By")
+		received = r.Header.Get("X-Test")
 	}))
 	defer backend.Close()
 
@@ -26,7 +26,8 @@ func TestNewAddsHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rp := New(u, newLogger())
+	headers := map[string]string{"X-Test": "value"}
+	rp := New(u, newLogger(), headers)
 	proxySrv := httptest.NewServer(rp)
 	defer proxySrv.Close()
 
@@ -36,14 +37,14 @@ func TestNewAddsHeader(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	if received != "MyGoProxy" {
-		t.Fatalf("expected header 'MyGoProxy', got %q", received)
+	if received != "value" {
+		t.Fatalf("expected header 'value', got %q", received)
 	}
 }
 
 func TestErrorHandlerReturnsBadGateway(t *testing.T) {
 	u, _ := url.Parse("http://127.0.0.1:1")
-	rp := New(u, newLogger())
+	rp := New(u, newLogger(), nil)
 	proxySrv := httptest.NewServer(rp)
 	defer proxySrv.Close()
 

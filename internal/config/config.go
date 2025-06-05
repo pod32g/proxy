@@ -7,4 +7,5 @@ type Config struct {
 	HTTPSAddr string
 	CertFile  string
 	KeyFile   string
+	Headers   map[string]string
 }
