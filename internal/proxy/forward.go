@@ -9,8 +9,9 @@ import (
 )
 
 // NewForward creates a forward proxy handler. It supports HTTPS via CONNECT
-// without requiring TLS certificates.
-func NewForward(logger *log.Logger, headers map[string]string) http.Handler {
+// without requiring TLS certificates. The headers function returns the headers
+// that should be added to outbound requests.
+func NewForward(logger *log.Logger, headers func() map[string]string) http.Handler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -20,7 +21,7 @@ func NewForward(logger *log.Logger, headers map[string]string) http.Handler {
 		}
 		outReq := r.Clone(r.Context())
 		outReq.RequestURI = ""
-		for k, v := range headers {
+		for k, v := range headers() {
 			outReq.Header.Set(k, v)
 		}
 		resp, err := transport.RoundTrip(outReq)
