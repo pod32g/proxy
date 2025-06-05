@@ -1,7 +1,12 @@
 package config
 
 // Config holds the runtime configuration for the proxy server.
-import "sync"
+import (
+	"sync"
+
+	log "github.com/pod32g/simple-logger"
+	"strings"
+)
 
 // Config holds the runtime configuration for the proxy server.
 type Config struct {
@@ -12,6 +17,8 @@ type Config struct {
 	HTTPSAddr string
 	CertFile  string
 	KeyFile   string
+
+	LogLevel log.LogLevel
 
 	Headers map[string]string
 
@@ -44,4 +51,54 @@ func (c *Config) GetHeaders() map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// SetLogLevel updates the logging level.
+func (c *Config) SetLogLevel(level log.LogLevel) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.LogLevel = level
+}
+
+// GetLogLevel returns the configured logging level.
+func (c *Config) GetLogLevel() log.LogLevel {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.LogLevel
+}
+
+// ParseLogLevel converts a string to a log.LogLevel.
+func ParseLogLevel(lvl string) log.LogLevel {
+	switch strings.ToUpper(lvl) {
+	case "DEBUG":
+		return log.DEBUG
+	case "INFO":
+		return log.INFO
+	case "WARN":
+		return log.WARN
+	case "ERROR":
+		return log.ERROR
+	case "FATAL":
+		return log.FATAL
+	default:
+		return log.INFO
+	}
+}
+
+// LevelString converts a log.LogLevel to its string representation.
+func LevelString(level log.LogLevel) string {
+	switch level {
+	case log.DEBUG:
+		return "DEBUG"
+	case log.INFO:
+		return "INFO"
+	case log.WARN:
+		return "WARN"
+	case log.ERROR:
+		return "ERROR"
+	case log.FATAL:
+		return "FATAL"
+	default:
+		return "INFO"
+	}
 }

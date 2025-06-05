@@ -52,13 +52,16 @@ func main() {
 	flag.StringVar(&cfg.HTTPSAddr, "https", getenv("PROXY_HTTPS_ADDR", ""), "HTTPS listen address")
 	flag.StringVar(&cfg.CertFile, "cert", getenv("PROXY_CERT_FILE", ""), "TLS certificate file")
 	flag.StringVar(&cfg.KeyFile, "key", getenv("PROXY_KEY_FILE", ""), "TLS key file")
+	logLevelStr := getenv("PROXY_LOG_LEVEL", "INFO")
+	flag.StringVar(&logLevelStr, "log-level", logLevelStr, "Log level (DEBUG, INFO, WARN, ERROR, FATAL)")
 	var headers headerFlags
 	flag.Var(&headers, "header", "Custom header to add to upstream requests (format Name=Value, can be repeated)")
 	flag.Parse()
 
 	cfg.Headers = headers
+	cfg.LogLevel = config.ParseLogLevel(logLevelStr)
 
-	logger := log.NewLogger(os.Stdout, log.INFO, &log.DefaultFormatter{})
+	logger := log.NewLogger(os.Stdout, cfg.LogLevel, &log.DefaultFormatter{})
 
 	var handler http.Handler
 	if cfg.Mode == "forward" {
@@ -71,7 +74,7 @@ func main() {
 		handler = proxy.New(target, logger, cfg.GetHeaders)
 	}
 	mux := http.NewServeMux()
-	uiHandler := ui.New(cfg)
+	uiHandler := ui.New(cfg, logger)
 	mux.Handle("/ui/", http.StripPrefix("/ui", uiHandler))
 	mux.Handle("/", handler)
 
