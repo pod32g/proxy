@@ -1,10 +1,14 @@
 package proxy
 
 import (
+	"bufio"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	log "github.com/pod32g/simple-logger"
@@ -56,4 +60,66 @@ func TestErrorHandlerReturnsBadGateway(t *testing.T) {
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("expected 502 status, got %d", resp.StatusCode)
 	}
+}
+
+func TestForwardAddsHeader(t *testing.T) {
+	var received string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received = r.Header.Get("X-Test")
+	}))
+	defer backend.Close()
+
+	fp := NewForward(newLogger(), map[string]string{"X-Test": "value"})
+	proxySrv := httptest.NewServer(fp)
+	defer proxySrv.Close()
+
+	proxyURL, _ := url.Parse(proxySrv.URL)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	resp, err := client.Get(backend.URL)
+	if err != nil {
+		t.Fatalf("proxy request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if received != "value" {
+		t.Fatalf("expected header 'value', got %q", received)
+	}
+}
+
+func TestForwardConnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			io.Copy(io.Discard, conn)
+			conn.Close()
+		}
+		close(done)
+	}()
+
+	fp := NewForward(newLogger(), nil)
+	proxySrv := httptest.NewServer(fp)
+	defer proxySrv.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(proxySrv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := ln.Addr().String()
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", host, host)
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(line, "200") {
+		t.Fatalf("expected 200 response, got %q", line)
+	}
+	conn.Close()
+	<-done
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -37,6 +38,7 @@ func (h *headerFlags) Set(value string) error {
 
 func main() {
 	cfg := config.Config{}
+	flag.StringVar(&cfg.Mode, "mode", "forward", "proxy mode: forward or reverse")
 	flag.StringVar(&cfg.TargetURL, "target", "http://localhost:9000", "backend URL")
 	flag.StringVar(&cfg.HTTPAddr, "http", ":8080", "HTTP listen address")
 	flag.StringVar(&cfg.HTTPSAddr, "https", "", "HTTPS listen address")
@@ -50,12 +52,16 @@ func main() {
 
 	logger := log.NewLogger(os.Stdout, log.INFO, &log.DefaultFormatter{})
 
-	target, err := url.Parse(cfg.TargetURL)
-	if err != nil {
-		logger.Fatal("Invalid backend URL: %v", err)
+	var handler http.Handler
+	if cfg.Mode == "forward" {
+		handler = proxy.NewForward(logger, cfg.Headers)
+	} else {
+		target, err := url.Parse(cfg.TargetURL)
+		if err != nil {
+			logger.Fatal("Invalid backend URL: %v", err)
+		}
+		handler = proxy.New(target, logger, cfg.Headers)
 	}
-
-	handler := proxy.New(target, logger, cfg.Headers)
 
 	srv := server.Server{
 		HTTPAddr:  cfg.HTTPAddr,
