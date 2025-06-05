@@ -16,9 +16,11 @@ func NewForward(logger *log.Logger, headers func() map[string]string) http.Handl
 	transport.Proxy = nil
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
+			logger.Debug("CONNECT request", r.Host)
 			handleConnect(w, r, logger)
 			return
 		}
+		logger.Debug("Forward proxy request", r.Method, sanitizedURL(r.URL))
 		outReq := r.Clone(r.Context())
 		outReq.RequestURI = ""
 		for k, v := range headers() {
@@ -38,6 +40,7 @@ func NewForward(logger *log.Logger, headers func() map[string]string) http.Handl
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger) {
+	logger.Debug("CONNECT tunnel", r.Host)
 	destConn, err := net.Dial("tcp", r.Host)
 	if err != nil {
 		logger.Error("CONNECT dial error: %v", err)
