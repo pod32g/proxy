@@ -25,10 +25,12 @@ go build -o proxy
 - `-key` – TLS key file used with `-https`. Can be set with `PROXY_KEY_FILE`.
 - `-header` – Custom header to add to upstream requests. Can be repeated.
 - `-mode` – Proxy mode: `forward` or `reverse`. Defaults to `forward` or `PROXY_MODE`.
+- `-log-level` – Logging level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`). Defaults to `INFO` or `PROXY_LOG_LEVEL`.
 
 ### Web UI
 
 A simple configuration UI is available at `/ui`. It allows adding, updating and deleting custom headers while the proxy is running.
+The UI also lets you change the log level at runtime which overrides the value from the environment or command line.
 
 ## Testing
 
