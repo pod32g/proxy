@@ -123,3 +123,18 @@ func TestForwardConnect(t *testing.T) {
 	conn.Close()
 	<-done
 }
+
+func TestForwardInvalidRequest(t *testing.T) {
+	fp := NewForward(newLogger(), func() map[string]string { return nil })
+	proxySrv := httptest.NewServer(fp)
+	defer proxySrv.Close()
+
+	resp, err := http.Get(proxySrv.URL + "/favicon.ico")
+	if err != nil {
+		t.Fatalf("proxy request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 status, got %d", resp.StatusCode)
+	}
+}
