@@ -21,6 +21,11 @@ func NewForward(logger *log.Logger, headers func() map[string]string) http.Handl
 			return
 		}
 		logger.Debug("Forward proxy request", r.Method, sanitizedURL(r.URL))
+		if r.URL.Scheme == "" || r.URL.Host == "" {
+			logger.Error("Invalid request URL: missing scheme or host")
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
 		outReq := r.Clone(r.Context())
 		outReq.RequestURI = ""
 		for k, v := range headers() {
