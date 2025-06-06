@@ -18,7 +18,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *s
 	mux.HandleFunc("/", h.index)
 	mux.HandleFunc("/general", h.general)
 	mux.HandleFunc("/analytics", h.analytics)
-	mux.HandleFunc("/auth", h.authPage)
+	mux.HandleFunc("/auth", h.auth)
 	mux.HandleFunc("/header", h.addHeader)
 	mux.HandleFunc("/delete", h.deleteHeader)
 	mux.HandleFunc("/loglevel", h.setLogLevel)
@@ -246,12 +246,32 @@ func (h *handler) analytics(w http.ResponseWriter, r *http.Request) {
 	analyticsPage.Execute(w, h.makeData())
 }
 
-func (h *handler) authPage(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+func (h *handler) auth(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		authPage.Execute(w, h.makeData())
+	case http.MethodPost:
+		enabled := r.FormValue("enabled") == "on"
+		user := r.FormValue("username")
+		pass := r.FormValue("password")
+		_, curUser, curPass := h.cfg.GetAuth()
+		if user == "" {
+			user = curUser
+		}
+		if pass == "" {
+			pass = curPass
+		}
+		h.cfg.SetAuth(enabled, user, pass)
+		if h.logger != nil {
+			h.logger.Info("Updated auth settings", "enabled=", enabled, "user=", user)
+		}
+		if h.store != nil {
+			h.store.Save(h.cfg)
+		}
+		http.Redirect(w, r, "/ui/auth", http.StatusSeeOther)
+	default:
 		http.NotFound(w, r)
-		return
 	}
-	authPage.Execute(w, h.makeData())
 }
 
 func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
@@ -317,31 +337,6 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 		h.store.Save(h.cfg)
 	}
 	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
-}
-
-func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.NotFound(w, r)
-		return
-	}
-	enabled := r.FormValue("enabled") == "on"
-	user := r.FormValue("username")
-	pass := r.FormValue("password")
-	_, curUser, curPass := h.cfg.GetAuth()
-	if user == "" {
-		user = curUser
-	}
-	if pass == "" {
-		pass = curPass
-	}
-	h.cfg.SetAuth(enabled, user, pass)
-	if h.logger != nil {
-		h.logger.Info("Updated auth settings", "enabled=", enabled, "user=", user)
-	}
-	if h.store != nil {
-		h.store.Save(h.cfg)
-	}
-	http.Redirect(w, r, "/ui/auth", http.StatusSeeOther)
 }
 
 func (h *handler) setStats(w http.ResponseWriter, r *http.Request) {

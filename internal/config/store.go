@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 
@@ -70,7 +71,9 @@ func NewStore(path string) (*Store, error) {
 		return nil, err
 	}
 	if err := initSchema(db); err != nil {
-		db.Close()
+		if cerr := db.Close(); cerr != nil {
+			return nil, fmt.Errorf("init schema: %w (close: %v)", err, cerr)
+		}
 		return nil, err
 	}
 	return &Store{db: db}, nil
@@ -102,13 +105,15 @@ func (s *Store) Load(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var name, value string
 		if err := rows.Scan(&name, &value); err != nil {
 			return err
 		}
 		cfg.SetHeader(name, value)
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	// settings
 	var val string
