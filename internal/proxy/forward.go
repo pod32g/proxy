@@ -31,7 +31,17 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string) http
 		}
 		outReq := r.Clone(r.Context())
 		outReq.RequestURI = ""
-		for k, v := range headers(r.RemoteAddr) {
+		hdrs := headers(r.RemoteAddr)
+		viaVal := hdrs["Via"]
+		if viaVal == "" {
+			viaVal = "1.1 go-proxy"
+		}
+		addProxyHeaders(outReq, r.RemoteAddr, viaVal)
+		for k, v := range hdrs {
+			if k == "Via" {
+				// already applied via addProxyHeaders
+				continue
+			}
 			outReq.Header.Set(k, v)
 		}
 		resp, err := transport.RoundTrip(outReq)

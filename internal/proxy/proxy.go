@@ -20,7 +20,16 @@ func New(target *url.URL, logger *log.Logger, headers func(string) map[string]st
 	proxy.Director = func(req *http.Request) {
 		logger.Debug("Reverse proxy request", req.Method, sanitizedURL(req.URL))
 		originalDirector(req)
-		for k, v := range headers(req.RemoteAddr) {
+		hdrs := headers(req.RemoteAddr)
+		viaVal := hdrs["Via"]
+		if viaVal == "" {
+			viaVal = "1.1 go-proxy"
+		}
+		addProxyHeaders(req, req.RemoteAddr, viaVal)
+		for k, v := range hdrs {
+			if k == "Via" {
+				continue
+			}
 			req.Header.Set(k, v)
 		}
 	}
