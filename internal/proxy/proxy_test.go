@@ -31,7 +31,7 @@ func TestNewAddsHeader(t *testing.T) {
 	}
 
 	headers := map[string]string{"X-Test": "value"}
-	rp := New(u, newLogger(), func(string) map[string]string { return headers })
+	rp := New(u, newLogger(), func(string) map[string]string { return headers }, func() bool { return false })
 	proxySrv := httptest.NewServer(rp)
 	defer proxySrv.Close()
 
@@ -48,7 +48,7 @@ func TestNewAddsHeader(t *testing.T) {
 
 func TestErrorHandlerReturnsBadGateway(t *testing.T) {
 	u, _ := url.Parse("http://127.0.0.1:1")
-	rp := New(u, newLogger(), func(string) map[string]string { return nil })
+	rp := New(u, newLogger(), func(string) map[string]string { return nil }, func() bool { return false })
 	proxySrv := httptest.NewServer(rp)
 	defer proxySrv.Close()
 
@@ -69,7 +69,7 @@ func TestForwardAddsHeader(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	fp := NewForward(newLogger(), func(string) map[string]string { return map[string]string{"X-Test": "value"} })
+	fp := NewForward(newLogger(), func(string) map[string]string { return map[string]string{"X-Test": "value"} }, func() bool { return false })
 	proxySrv := httptest.NewServer(fp)
 	defer proxySrv.Close()
 
@@ -102,7 +102,7 @@ func TestForwardConnect(t *testing.T) {
 		close(done)
 	}()
 
-	fp := NewForward(newLogger(), func(string) map[string]string { return nil })
+	fp := NewForward(newLogger(), func(string) map[string]string { return nil }, func() bool { return false })
 	proxySrv := httptest.NewServer(fp)
 	defer proxySrv.Close()
 
@@ -125,7 +125,7 @@ func TestForwardConnect(t *testing.T) {
 }
 
 func TestForwardInvalidRequest(t *testing.T) {
-	fp := NewForward(newLogger(), func(string) map[string]string { return nil })
+	fp := NewForward(newLogger(), func(string) map[string]string { return nil }, func() bool { return false })
 	proxySrv := httptest.NewServer(fp)
 	defer proxySrv.Close()
 

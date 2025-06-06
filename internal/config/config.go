@@ -23,6 +23,7 @@ type Config struct {
 	AuthEnabled  bool
 	StatsEnabled bool
 	DebugLogs    bool
+	UltraDebug   bool
 	SecretKey    string
 
 	LogLevel log.LogLevel
@@ -225,6 +226,20 @@ func (c *Config) DebugLogsEnabledState() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.DebugLogs
+}
+
+// SetUltraDebug enables or disables ultra debug logging.
+func (c *Config) SetUltraDebug(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.UltraDebug = enabled
+}
+
+// UltraDebugEnabledState returns whether ultra debug logging is enabled.
+func (c *Config) UltraDebugEnabledState() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.UltraDebug
 }
 
 // GetAuth returns the current authentication settings.

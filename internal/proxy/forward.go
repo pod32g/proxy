@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 
 	log "github.com/pod32g/simple-logger"
 )
@@ -14,7 +15,7 @@ import (
 // NewForward creates a forward proxy handler. It supports HTTPS via CONNECT
 // without requiring TLS certificates. The headers function returns the headers
 // that should be added to outbound requests and receives the client address.
-func NewForward(logger *log.Logger, headers func(string) map[string]string) http.Handler {
+func NewForward(logger *log.Logger, headers func(string) map[string]string, ultra func() bool) http.Handler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -24,6 +25,11 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string) http
 			return
 		}
 		logger.Debug("Forward proxy request", r.Method, sanitizedURL(r.URL))
+		if ultra != nil && ultra() {
+			if dump, err := httputil.DumpRequest(r, true); err == nil {
+				logger.Debug("forward request dump\n" + string(dump))
+			}
+		}
 		if r.URL.Scheme == "" || r.URL.Host == "" {
 			logger.Error("Invalid request URL: missing scheme or host")
 			http.Error(w, "Bad request", http.StatusBadRequest)
