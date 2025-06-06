@@ -1,17 +1,28 @@
 package server
 
 import (
+	"encoding/base64"
 	"net/http"
 	"strings"
 )
 
 // Router dispatches requests between the proxy handler and the UI handler.
 type Router struct {
-	Proxy http.Handler
-	UI    http.Handler
+	Proxy       http.Handler
+	UI          http.Handler
+	AuthEnabled bool
+	Username    string
+	Password    string
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if r.AuthEnabled && r.Username != "" {
+		if !authOK(r, req) {
+			w.Header().Set("WWW-Authenticate", "Basic realm=\"proxy\"")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	// CONNECT requests never have a path starting with '/'
 	if req.Method != http.MethodConnect && r.UI != nil {
 		if req.URL.Path == "/ui" {
@@ -30,4 +41,24 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	} else {
 		http.NotFound(w, req)
 	}
+}
+
+func authOK(r *Router, req *http.Request) bool {
+	user, pass, ok := req.BasicAuth()
+	if ok && user == r.Username && pass == r.Password {
+		return true
+	}
+	if auth := req.Header.Get("Proxy-Authorization"); auth != "" {
+		if strings.HasPrefix(strings.ToLower(auth), "basic ") {
+			b64 := strings.TrimSpace(auth[len("Basic "):])
+			data, err := base64.StdEncoding.DecodeString(b64)
+			if err == nil {
+				parts := strings.SplitN(string(data), ":", 2)
+				if len(parts) == 2 && parts[0] == r.Username && parts[1] == r.Password {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

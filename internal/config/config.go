@@ -18,6 +18,11 @@ type Config struct {
 	CertFile  string
 	KeyFile   string
 
+	Username    string
+	Password    string
+	AuthEnabled bool
+	SecretKey   string
+
 	LogLevel log.LogLevel
 
 	Headers map[string]string
@@ -101,4 +106,24 @@ func LevelString(level log.LogLevel) string {
 	default:
 		return "INFO"
 	}
+}
+
+// SetAuth updates the authentication settings. Empty username or password are ignored.
+func (c *Config) SetAuth(enabled bool, username, password string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.AuthEnabled = enabled
+	if username != "" {
+		c.Username = username
+	}
+	if password != "" {
+		c.Password = password
+	}
+}
+
+// GetAuth returns the current authentication settings.
+func (c *Config) GetAuth() (bool, string, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.AuthEnabled, c.Username, c.Password
 }

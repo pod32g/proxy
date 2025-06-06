@@ -13,6 +13,7 @@ go build -o proxy
 ```sh
 ./proxy -mode reverse -target http://localhost:9000 -http :8080 \
         -https :8443 -cert path/to/cert.pem -key path/to/key.pem \
+        -auth -auth-user admin -auth-pass secret -secret mykey \
         -header "X-Example=1" -header "X-Other=2"
 ```
 
@@ -23,6 +24,10 @@ go build -o proxy
 - `-https` – HTTPS listen address. Disabled if empty. Can be set with `PROXY_HTTPS_ADDR`.
 - `-cert` – TLS certificate file used with `-https`. Can be set with `PROXY_CERT_FILE`.
 - `-key` – TLS key file used with `-https`. Can be set with `PROXY_KEY_FILE`.
+- `-auth` – Enable basic authentication. Can be set with `PROXY_AUTH_ENABLED`.
+- `-auth-user` – Username for basic authentication. Can be set with `PROXY_AUTH_USER`.
+- `-auth-pass` – Password for basic authentication. Can be set with `PROXY_AUTH_PASS`.
+- `-secret` – Encryption key used to protect credentials. Can be set with `PROXY_SECRET_KEY`.
 - `-header` – Custom header to add to upstream requests. Can be repeated.
 - `-mode` – Proxy mode: `forward` or `reverse`. Defaults to `forward` or `PROXY_MODE`.
 - `-log-level` – Logging level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`). Defaults to `INFO` or `PROXY_LOG_LEVEL`.
@@ -32,6 +37,7 @@ go build -o proxy
 
 A simple configuration UI is available at `/ui`. It allows adding, updating and deleting custom headers while the proxy is running.
 The UI also lets you change the log level at runtime which overrides the value from the environment or command line.
+Authentication settings (enable/disable and credentials) can also be configured and are stored encrypted in the database.
 
 ## Testing
 
