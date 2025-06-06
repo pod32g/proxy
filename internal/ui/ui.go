@@ -15,10 +15,12 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *s
 	h := &handler{cfg: cfg, store: store, logger: logger, clients: clients, stats: stats}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.index)
+	mux.HandleFunc("/general", h.general)
+	mux.HandleFunc("/analytics", h.analytics)
+	mux.HandleFunc("/auth", h.authPage)
 	mux.HandleFunc("/header", h.addHeader)
 	mux.HandleFunc("/delete", h.deleteHeader)
 	mux.HandleFunc("/loglevel", h.setLogLevel)
-	mux.HandleFunc("/auth", h.setAuth)
 	mux.HandleFunc("/stats", h.setStats)
 	mux.HandleFunc("/events", h.events)
 	return mux
@@ -44,7 +46,7 @@ type pageData struct {
 	Stats         []server.Stat
 }
 
-var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
+var layout = template.Must(template.New("layout").Parse(`<!DOCTYPE html>
 <html>
 <head>
     <title>Proxy Config</title>
@@ -73,9 +75,9 @@ var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 <div class="sidebar">
     <h5 class="text-center">Menu</h5>
     <ul class="nav flex-column">
-        <li class="nav-item"><a href="#general" class="nav-link">General Settings</a></li>
-        <li class="nav-item"><a href="#analytics" class="nav-link">Analytics</a></li>
-        <li class="nav-item"><a href="#auth" class="nav-link">Authentication</a></li>
+        <li class="nav-item"><a href="/ui/general" class="nav-link">General Settings</a></li>
+        <li class="nav-item"><a href="/ui/analytics" class="nav-link">Analytics</a></li>
+        <li class="nav-item"><a href="/ui/auth" class="nav-link">Authentication</a></li>
     </ul>
 </div>
 <div class="content">
@@ -85,7 +87,18 @@ var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 <li>{{.}}</li>
 {{end}}
 </ul>
-<section id="general">
+{{template "content" .}}
+</div>
+<script>
+var es = new EventSource('events');
+es.onmessage = function(e){
+    document.getElementById('clients').textContent = e.data;
+};
+</script>
+</body>
+</html>`))
+
+var generalPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
 <h1>Headers</h1>
 <table>
 <thead><tr><th>Name</th><th>Value</th></tr></thead>
@@ -129,10 +142,9 @@ Current: {{.LogLevel}}
 </select>
 <button type="submit">Set</button>
 </form>
+{{end}}`))
 
-</section>
-
-<section id="analytics">
+var analyticsPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
 <h2>Top Websites</h2>
 {{if .StatsEnabled}}
 <table>
@@ -147,10 +159,9 @@ Current: {{.LogLevel}}
     <label><input type="checkbox" name="enabled" {{if .StatsEnabled}}checked{{end}}> Enable Analysis</label>
     <button type="submit">Save</button>
 </form>
+{{end}}`))
 
-</section>
-
-<section id="auth">
+var authPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
 <h2>Authentication</h2>
 <form method="POST" action="auth">
     <label><input type="checkbox" name="enabled" {{if .AuthEnabled}}checked{{end}}> Enable Auth</label><br>
@@ -158,22 +169,9 @@ Current: {{.LogLevel}}
     <label>Pass: <input type="password" name="password" placeholder="(unchanged)"></label><br>
     <button type="submit">Save</button>
 </form>
-</section>
-</div>
-<script>
-var es = new EventSource('events');
-es.onmessage = function(e){
-    document.getElementById('clients').textContent = e.data;
-};
-</script>
-</body>
-</html>`))
+{{end}}`))
 
-func (h *handler) index(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.NotFound(w, r)
-		return
-	}
+func (h *handler) makeData() pageData {
 	enabled, user, _ := h.cfg.GetAuth()
 	data := pageData{
 		Headers:       h.cfg.GetHeaders(),
@@ -192,7 +190,39 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 	if h.stats != nil && data.StatsEnabled {
 		data.Stats = h.stats.Top(10)
 	}
-	page.Execute(w, data)
+	return data
+}
+
+func (h *handler) index(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, "/general", http.StatusSeeOther)
+}
+
+func (h *handler) general(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	generalPage.Execute(w, h.makeData())
+}
+
+func (h *handler) analytics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	analyticsPage.Execute(w, h.makeData())
+}
+
+func (h *handler) authPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	authPage.Execute(w, h.makeData())
 }
 
 func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
@@ -216,7 +246,7 @@ func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 			h.store.Save(h.cfg)
 		}
 	}
-	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
+	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
 }
 
 func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
@@ -239,7 +269,7 @@ func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
 			h.store.Save(h.cfg)
 		}
 	}
-	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
+	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
 }
 
 func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
@@ -257,7 +287,7 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 	if h.store != nil {
 		h.store.Save(h.cfg)
 	}
-	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
+	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
 }
 
 func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
@@ -282,7 +312,7 @@ func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
 	if h.store != nil {
 		h.store.Save(h.cfg)
 	}
-	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
+	http.Redirect(w, r, "/ui/auth", http.StatusSeeOther)
 }
 
 func (h *handler) setStats(w http.ResponseWriter, r *http.Request) {
@@ -295,7 +325,7 @@ func (h *handler) setStats(w http.ResponseWriter, r *http.Request) {
 	if h.store != nil {
 		h.store.Save(h.cfg)
 	}
-	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
+	http.Redirect(w, r, "/ui/analytics", http.StatusSeeOther)
 }
 
 func (h *handler) events(w http.ResponseWriter, r *http.Request) {
