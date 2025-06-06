@@ -52,6 +52,10 @@ func main() {
 	flag.StringVar(&cfg.HTTPSAddr, "https", getenv("PROXY_HTTPS_ADDR", ""), "HTTPS listen address")
 	flag.StringVar(&cfg.CertFile, "cert", getenv("PROXY_CERT_FILE", ""), "TLS certificate file")
 	flag.StringVar(&cfg.KeyFile, "key", getenv("PROXY_KEY_FILE", ""), "TLS key file")
+	flag.BoolVar(&cfg.AuthEnabled, "auth", getenv("PROXY_AUTH_ENABLED", "") == "true", "enable basic auth")
+	flag.StringVar(&cfg.Username, "auth-user", getenv("PROXY_AUTH_USER", ""), "username for basic auth")
+	flag.StringVar(&cfg.Password, "auth-pass", getenv("PROXY_AUTH_PASS", ""), "password for basic auth")
+	flag.StringVar(&cfg.SecretKey, "secret", getenv("PROXY_SECRET_KEY", ""), "secret key for encryption")
 	logLevelStr := getenv("PROXY_LOG_LEVEL", "INFO")
 	flag.StringVar(&logLevelStr, "log-level", logLevelStr, "Log level (DEBUG, INFO, WARN, ERROR, FATAL)")
 	var headers headerFlags
@@ -86,7 +90,7 @@ func main() {
 		handler = proxy.New(target, logger, cfg.GetHeaders)
 	}
 	uiHandler := ui.New(cfg, store, logger)
-	mux := &server.Router{Proxy: handler, UI: uiHandler}
+	mux := &server.Router{Proxy: handler, UI: uiHandler, AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
 
 	srv := server.Server{
 		HTTPAddr:  cfg.HTTPAddr,

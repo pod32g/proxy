@@ -16,6 +16,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger) http.Handl
 	mux.HandleFunc("/header", h.addHeader)
 	mux.HandleFunc("/delete", h.deleteHeader)
 	mux.HandleFunc("/loglevel", h.setLogLevel)
+	mux.HandleFunc("/auth", h.setAuth)
 	return mux
 }
 
@@ -26,8 +27,10 @@ type handler struct {
 }
 
 type pageData struct {
-	Headers  map[string]string
-	LogLevel string
+	Headers     map[string]string
+	LogLevel    string
+	AuthEnabled bool
+	Username    string
 }
 
 var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
@@ -73,6 +76,14 @@ Current: {{.LogLevel}}
 </select>
 <button type="submit">Set</button>
 </form>
+
+<h2>Authentication</h2>
+<form method="POST" action="auth">
+    <label><input type="checkbox" name="enabled" {{if .AuthEnabled}}checked{{end}}> Enable Auth</label><br>
+    <label>User: <input name="username" value="{{.Username}}"></label><br>
+    <label>Pass: <input type="password" name="password" placeholder="(unchanged)"></label><br>
+    <button type="submit">Save</button>
+</form>
 </body>
 </html>`))
 
@@ -81,9 +92,12 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	enabled, user, _ := h.cfg.GetAuth()
 	data := pageData{
-		Headers:  h.cfg.GetHeaders(),
-		LogLevel: config.LevelString(h.cfg.GetLogLevel()),
+		Headers:     h.cfg.GetHeaders(),
+		LogLevel:    config.LevelString(h.cfg.GetLogLevel()),
+		AuthEnabled: enabled,
+		Username:    user,
 	}
 	page.Execute(w, data)
 }
@@ -130,6 +144,28 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 	if h.logger != nil {
 		h.logger.SetLevel(level)
 	}
+	if h.store != nil {
+		h.store.Save(h.cfg)
+	}
+	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
+}
+
+func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	enabled := r.FormValue("enabled") == "on"
+	user := r.FormValue("username")
+	pass := r.FormValue("password")
+	_, curUser, curPass := h.cfg.GetAuth()
+	if user == "" {
+		user = curUser
+	}
+	if pass == "" {
+		pass = curPass
+	}
+	h.cfg.SetAuth(enabled, user, pass)
 	if h.store != nil {
 		h.store.Save(h.cfg)
 	}

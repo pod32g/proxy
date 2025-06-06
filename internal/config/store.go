@@ -1,13 +1,66 @@
 package config
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"errors"
+	"io"
+	"strconv"
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
 // Store provides persistence for Config using SQLite.
 type Store struct {
 	db *sql.DB
+}
+
+func encrypt(key, plain string) (string, error) {
+	h := sha256.Sum256([]byte(key))
+	block, err := aes.NewCipher(h[:])
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	data := gcm.Seal(nonce, nonce, []byte(plain), nil)
+	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+func decrypt(key, cipherText string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(cipherText)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256([]byte(key))
+	block, err := aes.NewCipher(h[:])
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonceSize := gcm.NonceSize()
+	if len(raw) < nonceSize {
+		return "", errors.New("ciphertext too short")
+	}
+	nonce := raw[:nonceSize]
+	plain, err := gcm.Open(nil, nonce, raw[nonceSize:], nil)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
 }
 
 // NewStore opens or creates an SQLite database at path and initializes schema.
@@ -62,6 +115,27 @@ func (s *Store) Load(cfg *Config) error {
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='log_level'`).Scan(&val); err == nil {
 		cfg.SetLogLevel(ParseLogLevel(val))
 	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='auth_enabled'`).Scan(&val); err == nil {
+		cfg.AuthEnabled, _ = strconv.ParseBool(val)
+	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='username'`).Scan(&val); err == nil {
+		if cfg.SecretKey != "" {
+			if dec, err := decrypt(cfg.SecretKey, val); err == nil {
+				cfg.Username = dec
+			}
+		} else {
+			cfg.Username = val
+		}
+	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='password'`).Scan(&val); err == nil {
+		if cfg.SecretKey != "" {
+			if dec, err := decrypt(cfg.SecretKey, val); err == nil {
+				cfg.Password = dec
+			}
+		} else {
+			cfg.Password = val
+		}
+	}
 	return rows.Err()
 }
 
@@ -87,6 +161,28 @@ func (s *Store) Save(cfg *Config) error {
 	}
 	// log level
 	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('log_level', ?)`, LevelString(cfg.GetLogLevel())); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('auth_enabled', ?)`, strconv.FormatBool(cfg.AuthEnabled)); err != nil {
+		tx.Rollback()
+		return err
+	}
+	user := cfg.Username
+	pass := cfg.Password
+	if cfg.SecretKey != "" {
+		if enc, err := encrypt(cfg.SecretKey, cfg.Username); err == nil {
+			user = enc
+		}
+		if enc, err := encrypt(cfg.SecretKey, cfg.Password); err == nil {
+			pass = enc
+		}
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('username', ?)`, user); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('password', ?)`, pass); err != nil {
 		tx.Rollback()
 		return err
 	}
