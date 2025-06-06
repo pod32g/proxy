@@ -79,17 +79,19 @@ func main() {
 
 	logger := log.NewLogger(os.Stdout, cfg.LogLevel, &log.DefaultFormatter{})
 
+	tracker := server.NewClientTracker()
+
 	var handler http.Handler
 	if cfg.Mode == "forward" {
-		handler = proxy.NewForward(logger, cfg.GetHeaders)
+		handler = proxy.NewForward(logger, cfg.GetHeadersForClient)
 	} else {
 		target, err := url.Parse(cfg.TargetURL)
 		if err != nil {
 			logger.Fatal("Invalid backend URL: %v", err)
 		}
-		handler = proxy.New(target, logger, cfg.GetHeaders)
+		handler = proxy.New(target, logger, cfg.GetHeadersForClient)
 	}
-	uiHandler := ui.New(cfg, store, logger)
+	uiHandler := ui.New(cfg, store, logger, tracker)
 	mux := &server.Router{Proxy: handler, UI: uiHandler, AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
 
 	srv := server.Server{
@@ -99,6 +101,7 @@ func main() {
 		KeyFile:   cfg.KeyFile,
 		Handler:   mux,
 		Logger:    logger,
+		Clients:   tracker,
 	}
 
 	if err := srv.Start(); err != nil {
