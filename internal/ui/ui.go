@@ -198,7 +198,7 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	http.Redirect(w, r, "/general", http.StatusSeeOther)
+	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
 }
 
 func (h *handler) general(w http.ResponseWriter, r *http.Request) {
