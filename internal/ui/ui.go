@@ -37,6 +37,7 @@ type pageData struct {
 	AuthEnabled   bool
 	Username      string
 	ClientCount   int
+	ClientAddrs   []string
 }
 
 var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
@@ -52,6 +53,11 @@ var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 </head>
 <body>
 <p>Connected clients: <span id="clients">{{.ClientCount}}</span></p>
+<ul>
+{{range .ClientAddrs}}
+<li>{{.}}</li>
+{{end}}
+</ul>
 <h1>Headers</h1>
 <table>
 <thead><tr><th>Name</th><th>Value</th></tr></thead>
@@ -125,9 +131,11 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		AuthEnabled:   enabled,
 		Username:      user,
 		ClientCount:   0,
+		ClientAddrs:   nil,
 	}
 	if h.clients != nil {
 		data.ClientCount = h.clients.Count()
+		data.ClientAddrs = h.clients.Addrs()
 	}
 	page.Execute(w, data)
 }
