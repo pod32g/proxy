@@ -103,14 +103,15 @@ func main() {
 	}
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	apiHandler := api.New(cfg, store, logger, stats)
-	mux := &server.Router{Proxy: handler, UI: uiHandler, API: apiHandler, AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
+	mux := &server.Router{Proxy: handler, UI: uiHandler, API: apiHandler, Metrics: server.MetricsHandler(), AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
+	wrapped := server.MetricsMiddleware(mux)
 
 	srv := server.Server{
 		HTTPAddr:  cfg.HTTPAddr,
 		HTTPSAddr: cfg.HTTPSAddr,
 		CertFile:  cfg.CertFile,
 		KeyFile:   cfg.KeyFile,
-		Handler:   mux,
+		Handler:   wrapped,
 		Logger:    logger,
 		Clients:   tracker,
 	}
