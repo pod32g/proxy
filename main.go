@@ -76,8 +76,12 @@ func main() {
 		if err := store.Load(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		}
-		store.Save(cfg)
 		defer store.Close()
+	}
+
+	cfg.EnsureDefaultHeaders()
+	if store != nil {
+		store.Save(cfg)
 	}
 
 	logger := log.NewLogger(os.Stdout, cfg.LogLevel, &log.DefaultFormatter{})

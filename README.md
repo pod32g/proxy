@@ -42,6 +42,10 @@ The UI also lets you change the log level at runtime and toggle detailed request
 Authentication settings (enable/disable and credentials) can also be configured and are stored encrypted in the database.
 When enabled, the UI shows the top websites accessed through the proxy.
 
+By default the proxy adds the `Via` and `Proxy-Agent` headers to all outbound
+requests so that downstream servers can detect it is being used. These headers
+can be modified or removed through the Web UI just like any other custom header.
+
 ## Testing
 
 Run the unit tests with:

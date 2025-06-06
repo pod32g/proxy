@@ -33,6 +33,25 @@ type Config struct {
 	mu sync.RWMutex
 }
 
+// DefaultVia is the default Via header value used when none is configured.
+const DefaultVia = "1.1 go-proxy"
+
+// EnsureDefaultHeaders adds standard proxy headers with default values if they
+// are not already present in the configuration.
+func (c *Config) EnsureDefaultHeaders() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Headers == nil {
+		c.Headers = make(map[string]string)
+	}
+	if _, ok := c.Headers["Via"]; !ok {
+		c.Headers["Via"] = DefaultVia
+	}
+	if _, ok := c.Headers["Proxy-Agent"]; !ok {
+		c.Headers["Proxy-Agent"] = "go-proxy"
+	}
+}
+
 // SetHeader adds or updates a header in the config in a thread-safe manner.
 func (c *Config) SetHeader(name, value string) {
 	c.mu.Lock()
