@@ -1,2 +1,4 @@
+github.com/mattn/go-sqlite3 v1.14.24 h1:tpSp2G2KyMnnQu99ngJ47EIkWVmliIizyZBfPrBWDRM=
+github.com/mattn/go-sqlite3 v1.14.24/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/pod32g/simple-logger v0.3.0 h1:L0HpdiOXgtfzfTyFs/5uJmPEKG6MqOgBfT/eL+/VWVE=
 github.com/pod32g/simple-logger v0.3.0/go.mod h1:YL8A507f6WduvdSfrAAP1nEOwHTIlsEZ1wCIKDEBJaM=
