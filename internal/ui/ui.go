@@ -111,6 +111,9 @@ func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 	value := r.FormValue("value")
 	if name != "" {
 		h.cfg.SetHeader(name, value)
+		if h.logger != nil {
+			h.logger.Info("Set header", name, value)
+		}
 		if h.store != nil {
 			h.store.Save(h.cfg)
 		}
@@ -126,6 +129,9 @@ func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
 	name := r.FormValue("name")
 	if name != "" {
 		h.cfg.DeleteHeader(name)
+		if h.logger != nil {
+			h.logger.Info("Deleted header", name)
+		}
 		if h.store != nil {
 			h.store.Save(h.cfg)
 		}
@@ -143,6 +149,7 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 	h.cfg.SetLogLevel(level)
 	if h.logger != nil {
 		h.logger.SetLevel(level)
+		h.logger.Info("Set log level", levelStr)
 	}
 	if h.store != nil {
 		h.store.Save(h.cfg)
@@ -166,6 +173,9 @@ func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
 		pass = curPass
 	}
 	h.cfg.SetAuth(enabled, user, pass)
+	if h.logger != nil {
+		h.logger.Info("Updated auth settings", "enabled=", enabled, "user=", user)
+	}
 	if h.store != nil {
 		h.store.Save(h.cfg)
 	}
