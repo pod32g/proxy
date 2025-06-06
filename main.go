@@ -56,10 +56,22 @@ func main() {
 	flag.StringVar(&logLevelStr, "log-level", logLevelStr, "Log level (DEBUG, INFO, WARN, ERROR, FATAL)")
 	var headers headerFlags
 	flag.Var(&headers, "header", "Custom header to add to upstream requests (format Name=Value, can be repeated)")
+	dbPath := flag.String("db", getenv("PROXY_DB_PATH", "config.db"), "sqlite database path")
 	flag.Parse()
 
 	cfg.Headers = headers
 	cfg.LogLevel = config.ParseLogLevel(logLevelStr)
+
+	store, err := config.NewStore(*dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open DB: %v\n", err)
+	} else {
+		if err := store.Load(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		}
+		store.Save(cfg)
+		defer store.Close()
+	}
 
 	logger := log.NewLogger(os.Stdout, cfg.LogLevel, &log.DefaultFormatter{})
 
@@ -73,7 +85,7 @@ func main() {
 		}
 		handler = proxy.New(target, logger, cfg.GetHeaders)
 	}
-	uiHandler := ui.New(cfg, logger)
+	uiHandler := ui.New(cfg, store, logger)
 	mux := &server.Router{Proxy: handler, UI: uiHandler}
 
 	srv := server.Server{

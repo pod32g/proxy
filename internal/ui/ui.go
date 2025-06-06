@@ -9,8 +9,8 @@ import (
 )
 
 // New returns a handler that exposes a simple configuration UI.
-func New(cfg *config.Config, logger *log.Logger) http.Handler {
-	h := &handler{cfg: cfg, logger: logger}
+func New(cfg *config.Config, store *config.Store, logger *log.Logger) http.Handler {
+	h := &handler{cfg: cfg, store: store, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.index)
 	mux.HandleFunc("/header", h.addHeader)
@@ -21,6 +21,7 @@ func New(cfg *config.Config, logger *log.Logger) http.Handler {
 
 type handler struct {
 	cfg    *config.Config
+	store  *config.Store
 	logger *log.Logger
 }
 
@@ -84,6 +85,9 @@ func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 	value := r.FormValue("value")
 	if name != "" {
 		h.cfg.SetHeader(name, value)
+		if h.store != nil {
+			h.store.Save(h.cfg)
+		}
 	}
 	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
 }
@@ -96,6 +100,9 @@ func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
 	name := r.FormValue("name")
 	if name != "" {
 		h.cfg.DeleteHeader(name)
+		if h.store != nil {
+			h.store.Save(h.cfg)
+		}
 	}
 	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
 }
@@ -110,6 +117,9 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 	h.cfg.SetLogLevel(level)
 	if h.logger != nil {
 		h.logger.SetLevel(level)
+	}
+	if h.store != nil {
+		h.store.Save(h.cfg)
 	}
 	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
 }
