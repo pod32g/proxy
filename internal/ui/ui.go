@@ -23,6 +23,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *s
 	mux.HandleFunc("/delete", h.deleteHeader)
 	mux.HandleFunc("/loglevel", h.setLogLevel)
 	mux.HandleFunc("/debug", h.setDebug)
+	mux.HandleFunc("/ultra-debug", h.setUltraDebug)
 	mux.HandleFunc("/stats", h.setStats)
 	mux.HandleFunc("/stats-events", h.statsEvents)
 	mux.HandleFunc("/events", h.events)
@@ -48,6 +49,7 @@ type pageData struct {
 	StatsEnabled  bool
 	Stats         []server.Stat
 	DebugLogs     bool
+	UltraDebug    bool
 }
 
 var layout = template.Must(template.New("layout").Parse(`<!DOCTYPE html>
@@ -151,6 +153,11 @@ Current: {{.LogLevel}}
     <label><input type="checkbox" name="enabled" {{if .DebugLogs}}checked{{end}}> Enable request logging</label>
     <button type="submit">Save</button>
 </form>
+<h2>Ultra Debug Logging</h2>
+<form method="POST" action="ultra-debug">
+    <label><input type="checkbox" name="enabled" {{if .UltraDebug}}checked{{end}}> Enable ultra debug logging</label>
+    <button type="submit">Save</button>
+</form>
 {{end}}`))
 
 var analyticsPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
@@ -203,6 +210,7 @@ func (h *handler) makeData() pageData {
 		ClientAddrs:   nil,
 		StatsEnabled:  h.cfg.StatsEnabledState(),
 		DebugLogs:     h.cfg.DebugLogsEnabledState(),
+		UltraDebug:    h.cfg.UltraDebugEnabledState(),
 	}
 	if h.clients != nil {
 		data.ClientCount = h.clients.Count()
@@ -356,6 +364,19 @@ func (h *handler) setDebug(w http.ResponseWriter, r *http.Request) {
 	}
 	enabled := r.FormValue("enabled") == "on"
 	h.cfg.SetDebugLogs(enabled)
+	if h.store != nil {
+		h.store.Save(h.cfg)
+	}
+	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
+}
+
+func (h *handler) setUltraDebug(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	enabled := r.FormValue("enabled") == "on"
+	h.cfg.SetUltraDebug(enabled)
 	if h.store != nil {
 		h.store.Save(h.cfg)
 	}

@@ -14,11 +14,16 @@ func sanitizedURL(u *url.URL) string {
 
 // New creates a reverse proxy to the given target URL.
 // The headers function receives the client address and returns headers to set on each upstream request.
-func New(target *url.URL, logger *log.Logger, headers func(string) map[string]string) *httputil.ReverseProxy {
+func New(target *url.URL, logger *log.Logger, headers func(string) map[string]string, ultra func() bool) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		logger.Debug("Reverse proxy request", req.Method, sanitizedURL(req.URL))
+		if ultra != nil && ultra() {
+			if dump, err := httputil.DumpRequest(req, true); err == nil {
+				logger.Debug("reverse request dump\n" + string(dump))
+			}
+		}
 		originalDirector(req)
 		for k, v := range headers(req.RemoteAddr) {
 			req.Header.Set(k, v)

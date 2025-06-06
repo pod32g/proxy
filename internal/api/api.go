@@ -17,6 +17,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, stats *ser
 	mux.HandleFunc("/loglevel", h.logLevel)
 	mux.HandleFunc("/auth", h.auth)
 	mux.HandleFunc("/debug", h.debug)
+	mux.HandleFunc("/ultra-debug", h.ultraDebug)
 	mux.HandleFunc("/stats", h.statsHandler)
 	return mux
 }
@@ -49,6 +50,10 @@ type statsReq struct {
 }
 
 type debugReq struct {
+	Enabled bool `json:"enabled"`
+}
+
+type ultraDebugReq struct {
 	Enabled bool `json:"enabled"`
 }
 
@@ -180,6 +185,26 @@ func (h *handler) debug(w http.ResponseWriter, r *http.Request) {
 		h.cfg.SetDebugLogs(req.Enabled)
 		if h.logger != nil {
 			h.logger.Info("Set debug logs", req.Enabled)
+		}
+		if h.store != nil {
+			h.store.Save(h.cfg)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (h *handler) ultraDebug(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]bool{"enabled": h.cfg.UltraDebugEnabledState()})
+	case http.MethodPost:
+		var req ultraDebugReq
+		json.NewDecoder(r.Body).Decode(&req)
+		h.cfg.SetUltraDebug(req.Enabled)
+		if h.logger != nil {
+			h.logger.Info("Set ultra debug", req.Enabled)
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)

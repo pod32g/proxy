@@ -59,6 +59,7 @@ func main() {
 	flag.StringVar(&cfg.SecretKey, "secret", getenv("PROXY_SECRET_KEY", ""), "secret key for encryption")
 	flag.BoolVar(&cfg.StatsEnabled, "stats", getenv("PROXY_STATS_ENABLED", "") == "true", "enable traffic analysis")
 	flag.BoolVar(&cfg.DebugLogs, "debug-logs", getenv("PROXY_DEBUG_LOGS", "") == "true", "enable detailed request logging")
+	flag.BoolVar(&cfg.UltraDebug, "ultra-debug", getenv("PROXY_ULTRA_DEBUG", "") == "true", "enable ultra debug logging")
 	logLevelStr := getenv("PROXY_LOG_LEVEL", "INFO")
 	flag.StringVar(&logLevelStr, "log-level", logLevelStr, "Log level (DEBUG, INFO, WARN, ERROR, FATAL)")
 	var headers headerFlags
@@ -87,7 +88,7 @@ func main() {
 
 	var handler http.Handler
 	if cfg.Mode == "forward" {
-		h := proxy.NewForward(logger, cfg.GetHeadersForClient)
+		h := proxy.NewForward(logger, cfg.GetHeadersForClient, cfg.UltraDebugEnabledState)
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string {
 			if r.Method == http.MethodConnect {
 				return r.Host
@@ -99,10 +100,11 @@ func main() {
 		if err != nil {
 			logger.Fatal("Invalid backend URL: %v", err)
 		}
-		h := proxy.New(target, logger, cfg.GetHeadersForClient)
+		h := proxy.New(target, logger, cfg.GetHeadersForClient, cfg.UltraDebugEnabledState)
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string { return target.Host })
 	}
 	handler = server.DebugMiddleware(handler, logger, cfg.DebugLogsEnabledState)
+	handler = server.UltraDebugMiddleware(handler, logger, cfg.UltraDebugEnabledState)
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	apiHandler := api.New(cfg, store, logger, stats)
 	mux := &server.Router{Proxy: handler, UI: uiHandler, API: apiHandler, Metrics: server.MetricsHandler(), AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
