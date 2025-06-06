@@ -33,11 +33,12 @@ go build -o proxy
 - `-log-level` – Logging level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`). Defaults to `INFO` or `PROXY_LOG_LEVEL`.
 - `-db` – Path to the SQLite database used to persist runtime settings. Defaults to `config.db` or `PROXY_DB_PATH`.
 - `-stats` – Enable analysis of top visited websites. Can be set with `PROXY_STATS_ENABLED`.
+- `-debug-logs` – Enable detailed request logging. Can be set with `PROXY_DEBUG_LOGS`.
 
 ### Web UI
 
 A simple configuration UI is available at `/ui`. It now features a sidebar menu with links to separate pages for general settings, analytics and authentication. You can add, update and delete custom headers while the proxy is running.
-The UI also lets you change the log level at runtime which overrides the value from the environment or command line.
+The UI also lets you change the log level at runtime and toggle detailed request logging, both of which override the values from the environment or command line.
 Authentication settings (enable/disable and credentials) can also be configured and are stored encrypted in the database.
 When enabled, the UI shows the top websites accessed through the proxy.
 

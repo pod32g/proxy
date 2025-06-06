@@ -22,6 +22,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *s
 	mux.HandleFunc("/header", h.addHeader)
 	mux.HandleFunc("/delete", h.deleteHeader)
 	mux.HandleFunc("/loglevel", h.setLogLevel)
+	mux.HandleFunc("/debug", h.setDebug)
 	mux.HandleFunc("/stats", h.setStats)
 	mux.HandleFunc("/stats-events", h.statsEvents)
 	mux.HandleFunc("/events", h.events)
@@ -46,6 +47,7 @@ type pageData struct {
 	ClientAddrs   []string
 	StatsEnabled  bool
 	Stats         []server.Stat
+	DebugLogs     bool
 }
 
 var layout = template.Must(template.New("layout").Parse(`<!DOCTYPE html>
@@ -144,6 +146,11 @@ Current: {{.LogLevel}}
 </select>
 <button type="submit">Set</button>
 </form>
+<h2>Debug Logging</h2>
+<form method="POST" action="debug">
+    <label><input type="checkbox" name="enabled" {{if .DebugLogs}}checked{{end}}> Enable request logging</label>
+    <button type="submit">Save</button>
+</form>
 {{end}}`))
 
 var analyticsPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
@@ -195,6 +202,7 @@ func (h *handler) makeData() pageData {
 		ClientCount:   0,
 		ClientAddrs:   nil,
 		StatsEnabled:  h.cfg.StatsEnabledState(),
+		DebugLogs:     h.cfg.DebugLogsEnabledState(),
 	}
 	if h.clients != nil {
 		data.ClientCount = h.clients.Count()
@@ -339,6 +347,19 @@ func (h *handler) setStats(w http.ResponseWriter, r *http.Request) {
 		h.store.Save(h.cfg)
 	}
 	http.Redirect(w, r, "/ui/analytics", http.StatusSeeOther)
+}
+
+func (h *handler) setDebug(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	enabled := r.FormValue("enabled") == "on"
+	h.cfg.SetDebugLogs(enabled)
+	if h.store != nil {
+		h.store.Save(h.cfg)
+	}
+	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
 }
 
 func (h *handler) events(w http.ResponseWriter, r *http.Request) {

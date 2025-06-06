@@ -121,6 +121,9 @@ func (s *Store) Load(cfg *Config) error {
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='stats_enabled'`).Scan(&val); err == nil {
 		cfg.StatsEnabled, _ = strconv.ParseBool(val)
 	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='debug_logs'`).Scan(&val); err == nil {
+		cfg.DebugLogs, _ = strconv.ParseBool(val)
+	}
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='username'`).Scan(&val); err == nil {
 		if cfg.SecretKey != "" {
 			if dec, err := decrypt(cfg.SecretKey, val); err == nil {
@@ -172,6 +175,10 @@ func (s *Store) Save(cfg *Config) error {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('stats_enabled', ?)`, strconv.FormatBool(cfg.StatsEnabled)); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('debug_logs', ?)`, strconv.FormatBool(cfg.DebugLogs)); err != nil {
 		tx.Rollback()
 		return err
 	}

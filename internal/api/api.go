@@ -16,6 +16,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, stats *ser
 	mux.HandleFunc("/headers", h.headers)
 	mux.HandleFunc("/loglevel", h.logLevel)
 	mux.HandleFunc("/auth", h.auth)
+	mux.HandleFunc("/debug", h.debug)
 	mux.HandleFunc("/stats", h.statsHandler)
 	return mux
 }
@@ -44,6 +45,10 @@ type authReq struct {
 }
 
 type statsReq struct {
+	Enabled bool `json:"enabled"`
+}
+
+type debugReq struct {
 	Enabled bool `json:"enabled"`
 }
 
@@ -155,6 +160,26 @@ func (h *handler) statsHandler(w http.ResponseWriter, r *http.Request) {
 		h.cfg.SetStatsEnabled(req.Enabled)
 		if h.logger != nil {
 			h.logger.Info("Set stats enabled", req.Enabled)
+		}
+		if h.store != nil {
+			h.store.Save(h.cfg)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (h *handler) debug(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]bool{"enabled": h.cfg.DebugLogsEnabledState()})
+	case http.MethodPost:
+		var req debugReq
+		json.NewDecoder(r.Body).Decode(&req)
+		h.cfg.SetDebugLogs(req.Enabled)
+		if h.logger != nil {
+			h.logger.Info("Set debug logs", req.Enabled)
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)

@@ -22,6 +22,7 @@ type Config struct {
 	Password     string
 	AuthEnabled  bool
 	StatsEnabled bool
+	DebugLogs    bool
 	SecretKey    string
 
 	LogLevel log.LogLevel
@@ -191,6 +192,20 @@ func (c *Config) StatsEnabledState() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.StatsEnabled
+}
+
+// SetDebugLogs enables or disables debug request logging.
+func (c *Config) SetDebugLogs(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.DebugLogs = enabled
+}
+
+// DebugLogsEnabledState returns whether debug logging is enabled.
+func (c *Config) DebugLogsEnabledState() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.DebugLogs
 }
 
 // GetAuth returns the current authentication settings.
