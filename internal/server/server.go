@@ -15,6 +15,7 @@ type Server struct {
 	KeyFile   string
 	Handler   http.Handler
 	Logger    *log.Logger
+	Clients   *ClientTracker
 }
 
 // Start launches the HTTP server and, if configured, an HTTPS server.
@@ -32,6 +33,9 @@ func (s *Server) Start() error {
 				WriteTimeout: 10 * time.Second,
 				IdleTimeout:  30 * time.Second,
 			}
+			if s.Clients != nil {
+				httpsSrv.ConnState = s.Clients.ConnState
+			}
 			s.Logger.Info("Starting HTTPS proxy on", s.HTTPSAddr)
 			if err := httpsSrv.ListenAndServeTLS(s.CertFile, s.KeyFile); err != nil && err != http.ErrServerClosed {
 				s.Logger.Error("HTTPS server failed: %v", err)
@@ -45,6 +49,9 @@ func (s *Server) Start() error {
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
+	}
+	if s.Clients != nil {
+		httpSrv.ConnState = s.Clients.ConnState
 	}
 	s.Logger.Info("Starting HTTP proxy on", s.HTTPAddr)
 	return httpSrv.ListenAndServe()

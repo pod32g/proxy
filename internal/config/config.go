@@ -25,7 +25,8 @@ type Config struct {
 
 	LogLevel log.LogLevel
 
-	Headers map[string]string
+	Headers       map[string]string
+	ClientHeaders map[string]map[string]string
 
 	mu sync.RWMutex
 }
@@ -38,6 +39,62 @@ func (c *Config) SetHeader(name, value string) {
 		c.Headers = make(map[string]string)
 	}
 	c.Headers[name] = value
+}
+
+// SetClientHeader sets a header for a specific client.
+func (c *Config) SetClientHeader(client, name, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ClientHeaders == nil {
+		c.ClientHeaders = make(map[string]map[string]string)
+	}
+	if c.ClientHeaders[client] == nil {
+		c.ClientHeaders[client] = make(map[string]string)
+	}
+	c.ClientHeaders[client][name] = value
+}
+
+// DeleteClientHeader removes a header for a specific client.
+func (c *Config) DeleteClientHeader(client, name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ch, ok := c.ClientHeaders[client]; ok {
+		delete(ch, name)
+		if len(ch) == 0 {
+			delete(c.ClientHeaders, client)
+		}
+	}
+}
+
+// GetHeadersForClient returns headers combining global and client-specific ones.
+func (c *Config) GetHeadersForClient(client string) map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]string, len(c.Headers))
+	for k, v := range c.Headers {
+		out[k] = v
+	}
+	if ch, ok := c.ClientHeaders[client]; ok {
+		for k, v := range ch {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// GetAllClientHeaders returns a copy of all client-specific headers.
+func (c *Config) GetAllClientHeaders() map[string]map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]map[string]string, len(c.ClientHeaders))
+	for client, hdrs := range c.ClientHeaders {
+		m := make(map[string]string, len(hdrs))
+		for k, v := range hdrs {
+			m[k] = v
+		}
+		out[client] = m
+	}
+	return out
 }
 
 // DeleteHeader removes a header from the config.
