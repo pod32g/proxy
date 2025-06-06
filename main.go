@@ -58,6 +58,7 @@ func main() {
 	flag.StringVar(&cfg.Password, "auth-pass", getenv("PROXY_AUTH_PASS", ""), "password for basic auth")
 	flag.StringVar(&cfg.SecretKey, "secret", getenv("PROXY_SECRET_KEY", ""), "secret key for encryption")
 	flag.BoolVar(&cfg.StatsEnabled, "stats", getenv("PROXY_STATS_ENABLED", "") == "true", "enable traffic analysis")
+	flag.BoolVar(&cfg.DebugLogs, "debug-logs", getenv("PROXY_DEBUG_LOGS", "") == "true", "enable detailed request logging")
 	logLevelStr := getenv("PROXY_LOG_LEVEL", "INFO")
 	flag.StringVar(&logLevelStr, "log-level", logLevelStr, "Log level (DEBUG, INFO, WARN, ERROR, FATAL)")
 	var headers headerFlags
@@ -101,6 +102,7 @@ func main() {
 		h := proxy.New(target, logger, cfg.GetHeadersForClient)
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string { return target.Host })
 	}
+	handler = server.DebugMiddleware(handler, logger, cfg.DebugLogsEnabledState)
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	apiHandler := api.New(cfg, store, logger, stats)
 	mux := &server.Router{Proxy: handler, UI: uiHandler, API: apiHandler, Metrics: server.MetricsHandler(), AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
