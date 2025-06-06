@@ -68,6 +68,9 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 			} else {
 				h.cfg.SetClientHeader(req.Client, req.Name, req.Value)
 			}
+			if h.logger != nil {
+				h.logger.Info("Set header", req.Name, req.Value)
+			}
 			if h.store != nil {
 				h.store.Save(h.cfg)
 			}
@@ -81,6 +84,9 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 				h.cfg.DeleteHeader(req.Name)
 			} else {
 				h.cfg.DeleteClientHeader(req.Client, req.Name)
+			}
+			if h.logger != nil {
+				h.logger.Info("Deleted header", req.Name)
 			}
 			if h.store != nil {
 				h.store.Save(h.cfg)
@@ -103,6 +109,7 @@ func (h *handler) logLevel(w http.ResponseWriter, r *http.Request) {
 		h.cfg.SetLogLevel(lvl)
 		if h.logger != nil {
 			h.logger.SetLevel(lvl)
+			h.logger.Info("Set log level", req.Level)
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)
@@ -146,6 +153,9 @@ func (h *handler) statsHandler(w http.ResponseWriter, r *http.Request) {
 		var req statsReq
 		json.NewDecoder(r.Body).Decode(&req)
 		h.cfg.SetStatsEnabled(req.Enabled)
+		if h.logger != nil {
+			h.logger.Info("Set stats enabled", req.Enabled)
+		}
 		if h.store != nil {
 			h.store.Save(h.cfg)
 		}
