@@ -11,14 +11,15 @@ import (
 )
 
 // New returns a handler that exposes a simple configuration UI.
-func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *server.ClientTracker) http.Handler {
-	h := &handler{cfg: cfg, store: store, logger: logger, clients: clients}
+func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *server.ClientTracker, stats *server.DomainStats) http.Handler {
+	h := &handler{cfg: cfg, store: store, logger: logger, clients: clients, stats: stats}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.index)
 	mux.HandleFunc("/header", h.addHeader)
 	mux.HandleFunc("/delete", h.deleteHeader)
 	mux.HandleFunc("/loglevel", h.setLogLevel)
 	mux.HandleFunc("/auth", h.setAuth)
+	mux.HandleFunc("/stats", h.setStats)
 	mux.HandleFunc("/events", h.events)
 	return mux
 }
@@ -28,6 +29,7 @@ type handler struct {
 	store   *config.Store
 	logger  *log.Logger
 	clients *server.ClientTracker
+	stats   *server.DomainStats
 }
 
 type pageData struct {
@@ -38,6 +40,8 @@ type pageData struct {
 	Username      string
 	ClientCount   int
 	ClientAddrs   []string
+	StatsEnabled  bool
+	Stats         []server.Stat
 }
 
 var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
@@ -102,6 +106,21 @@ Current: {{.LogLevel}}
 <button type="submit">Set</button>
 </form>
 
+<h2>Top Websites</h2>
+{{if .StatsEnabled}}
+<table>
+<thead><tr><th>Host</th><th>Count</th></tr></thead>
+{{range .Stats}}
+<tr><td>{{.Host}}</td><td>{{.Count}}</td></tr>
+{{end}}
+</table>
+{{end}}
+<h2>Analysis</h2>
+<form method="POST" action="stats">
+    <label><input type="checkbox" name="enabled" {{if .StatsEnabled}}checked{{end}}> Enable Analysis</label>
+    <button type="submit">Save</button>
+</form>
+
 <h2>Authentication</h2>
 <form method="POST" action="auth">
     <label><input type="checkbox" name="enabled" {{if .AuthEnabled}}checked{{end}}> Enable Auth</label><br>
@@ -132,10 +151,14 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		Username:      user,
 		ClientCount:   0,
 		ClientAddrs:   nil,
+		StatsEnabled:  h.cfg.StatsEnabledState(),
 	}
 	if h.clients != nil {
 		data.ClientCount = h.clients.Count()
 		data.ClientAddrs = h.clients.Addrs()
+	}
+	if h.stats != nil && data.StatsEnabled {
+		data.Stats = h.stats.Top(10)
 	}
 	page.Execute(w, data)
 }
@@ -224,6 +247,19 @@ func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
 	if h.logger != nil {
 		h.logger.Info("Updated auth settings", "enabled=", enabled, "user=", user)
 	}
+	if h.store != nil {
+		h.store.Save(h.cfg)
+	}
+	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
+}
+
+func (h *handler) setStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	enabled := r.FormValue("enabled") == "on"
+	h.cfg.SetStatsEnabled(enabled)
 	if h.store != nil {
 		h.store.Save(h.cfg)
 	}

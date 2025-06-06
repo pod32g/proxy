@@ -56,6 +56,7 @@ func main() {
 	flag.StringVar(&cfg.Username, "auth-user", getenv("PROXY_AUTH_USER", ""), "username for basic auth")
 	flag.StringVar(&cfg.Password, "auth-pass", getenv("PROXY_AUTH_PASS", ""), "password for basic auth")
 	flag.StringVar(&cfg.SecretKey, "secret", getenv("PROXY_SECRET_KEY", ""), "secret key for encryption")
+	flag.BoolVar(&cfg.StatsEnabled, "stats", getenv("PROXY_STATS_ENABLED", "") == "true", "enable traffic analysis")
 	logLevelStr := getenv("PROXY_LOG_LEVEL", "INFO")
 	flag.StringVar(&logLevelStr, "log-level", logLevelStr, "Log level (DEBUG, INFO, WARN, ERROR, FATAL)")
 	var headers headerFlags
@@ -80,18 +81,26 @@ func main() {
 	logger := log.NewLogger(os.Stdout, cfg.LogLevel, &log.DefaultFormatter{})
 
 	tracker := server.NewClientTracker()
+	stats := server.NewDomainStats()
 
 	var handler http.Handler
 	if cfg.Mode == "forward" {
-		handler = proxy.NewForward(logger, cfg.GetHeadersForClient)
+		h := proxy.NewForward(logger, cfg.GetHeadersForClient)
+		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string {
+			if r.Method == http.MethodConnect {
+				return r.Host
+			}
+			return r.URL.Host
+		})
 	} else {
 		target, err := url.Parse(cfg.TargetURL)
 		if err != nil {
 			logger.Fatal("Invalid backend URL: %v", err)
 		}
-		handler = proxy.New(target, logger, cfg.GetHeadersForClient)
+		h := proxy.New(target, logger, cfg.GetHeadersForClient)
+		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string { return target.Host })
 	}
-	uiHandler := ui.New(cfg, store, logger, tracker)
+	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	mux := &server.Router{Proxy: handler, UI: uiHandler, AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
 
 	srv := server.Server{
