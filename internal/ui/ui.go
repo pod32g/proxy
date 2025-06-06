@@ -48,20 +48,44 @@ var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 <html>
 <head>
     <title>Proxy Config</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
     <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
+    body { font-family: Arial, sans-serif; }
+    .sidebar {
+        width: 220px;
+        position: fixed;
+        top: 0;
+        left: 0;
+        height: 100%;
+        padding-top: 60px;
+        background-color: #f8f9fa;
+    }
+    .content {
+        margin-left: 240px;
+        padding: 20px;
+    }
     table { border-collapse: collapse; margin-bottom: 1em; }
     th, td { padding: 4px 8px; border: 1px solid #ccc; }
     form { margin-bottom: 1em; }
     </style>
 </head>
 <body>
+<div class="sidebar">
+    <h5 class="text-center">Menu</h5>
+    <ul class="nav flex-column">
+        <li class="nav-item"><a href="#general" class="nav-link">General Settings</a></li>
+        <li class="nav-item"><a href="#analytics" class="nav-link">Analytics</a></li>
+        <li class="nav-item"><a href="#auth" class="nav-link">Authentication</a></li>
+    </ul>
+</div>
+<div class="content">
 <p>Connected clients: <span id="clients">{{.ClientCount}}</span></p>
 <ul>
 {{range .ClientAddrs}}
 <li>{{.}}</li>
 {{end}}
 </ul>
+<section id="general">
 <h1>Headers</h1>
 <table>
 <thead><tr><th>Name</th><th>Value</th></tr></thead>
@@ -106,6 +130,9 @@ Current: {{.LogLevel}}
 <button type="submit">Set</button>
 </form>
 
+</section>
+
+<section id="analytics">
 <h2>Top Websites</h2>
 {{if .StatsEnabled}}
 <table>
@@ -121,6 +148,9 @@ Current: {{.LogLevel}}
     <button type="submit">Save</button>
 </form>
 
+</section>
+
+<section id="auth">
 <h2>Authentication</h2>
 <form method="POST" action="auth">
     <label><input type="checkbox" name="enabled" {{if .AuthEnabled}}checked{{end}}> Enable Auth</label><br>
@@ -128,6 +158,8 @@ Current: {{.LogLevel}}
     <label>Pass: <input type="password" name="password" placeholder="(unchanged)"></label><br>
     <button type="submit">Save</button>
 </form>
+</section>
+</div>
 <script>
 var es = new EventSource('events');
 es.onmessage = function(e){
