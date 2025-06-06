@@ -31,22 +31,33 @@ type pageData struct {
 }
 
 var page = template.Must(template.New("index").Parse(`<!DOCTYPE html>
-<html><head><title>Proxy Config</title></head><body>
+<html>
+<head>
+    <title>Proxy Config</title>
+    <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    table { border-collapse: collapse; margin-bottom: 1em; }
+    th, td { padding: 4px 8px; border: 1px solid #ccc; }
+    form { margin-bottom: 1em; }
+    </style>
+</head>
+<body>
 <h1>Headers</h1>
 <table>
+<thead><tr><th>Name</th><th>Value</th></tr></thead>
 {{range $k, $v := .Headers}}
 <tr><td>{{$k}}</td><td>{{$v}}</td></tr>
 {{end}}
 </table>
 <h2>Add/Update Header</h2>
 <form method="POST" action="header">
-Name: <input name="name">
-Value: <input name="value">
+<label>Name: <input name="name"></label>
+<label>Value: <input name="value"></label>
 <button type="submit">Save</button>
 </form>
 <h2>Delete Header</h2>
 <form method="POST" action="delete">
-Name: <input name="name">
+<label>Name: <input name="name"></label>
 <button type="submit">Delete</button>
 </form>
 
@@ -62,7 +73,8 @@ Current: {{.LogLevel}}
 </select>
 <button type="submit">Set</button>
 </form>
-</body></html>`))
+</body>
+</html>`))
 
 func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
