@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"net/http"
 	"time"
 
@@ -32,6 +33,7 @@ func (s *Server) Start() error {
 				ReadTimeout:  5 * time.Second,
 				WriteTimeout: 10 * time.Second,
 				IdleTimeout:  30 * time.Second,
+				TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 			}
 			if s.Clients != nil {
 				httpsSrv.ConnState = s.Clients.ConnState
