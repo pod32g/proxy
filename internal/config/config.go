@@ -18,10 +18,11 @@ type Config struct {
 	CertFile  string
 	KeyFile   string
 
-	Username    string
-	Password    string
-	AuthEnabled bool
-	SecretKey   string
+	Username     string
+	Password     string
+	AuthEnabled  bool
+	StatsEnabled bool
+	SecretKey    string
 
 	LogLevel log.LogLevel
 
@@ -176,6 +177,20 @@ func (c *Config) SetAuth(enabled bool, username, password string) {
 	if password != "" {
 		c.Password = password
 	}
+}
+
+// SetStatsEnabled enables or disables statistics collection.
+func (c *Config) SetStatsEnabled(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.StatsEnabled = enabled
+}
+
+// StatsEnabledState returns whether statistics are enabled.
+func (c *Config) StatsEnabledState() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.StatsEnabled
 }
 
 // GetAuth returns the current authentication settings.
