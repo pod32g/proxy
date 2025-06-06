@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Proxy Configuration</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="container py-4">
+    <h1 class="mb-4">Proxy Configuration</h1>
+    <div id="headers" class="mb-4"></div>
+    <form id="addHeader" class="mb-3">
+        <div class="row g-2">
+            <div class="col"><input class="form-control" placeholder="Name" name="name"></div>
+            <div class="col"><input class="form-control" placeholder="Value" name="value"></div>
+            <div class="col"><input class="form-control" placeholder="Client" name="client"></div>
+            <div class="col"><button class="btn btn-primary" type="submit">Add</button></div>
+        </div>
+    </form>
+    <div class="mb-4">
+        <label>Log Level</label>
+        <select id="loglevel" class="form-select w-auto d-inline-block"></select>
+    </div>
+    <div id="stats" class="mt-4"></div>
+<script src="script.js"></script>
+</body>
+</html>

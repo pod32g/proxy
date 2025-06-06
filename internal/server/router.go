@@ -10,6 +10,7 @@ import (
 type Router struct {
 	Proxy       http.Handler
 	UI          http.Handler
+	API         http.Handler
 	AuthEnabled bool
 	Username    string
 	Password    string
@@ -24,16 +25,22 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	// CONNECT requests never have a path starting with '/'
-	if req.Method != http.MethodConnect && r.UI != nil {
-		if req.URL.Path == "/ui" {
-			http.Redirect(w, req, "/ui/", http.StatusMovedPermanently)
+	if req.Method != http.MethodConnect {
+		if r.API != nil && strings.HasPrefix(req.URL.Path, "/api/") {
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api")
+			r.API.ServeHTTP(w, req)
 			return
 		}
-		if strings.HasPrefix(req.URL.Path, "/ui/") {
-			// strip prefix as ServeMux would do
-			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/ui")
-			r.UI.ServeHTTP(w, req)
-			return
+		if r.UI != nil {
+			if req.URL.Path == "/ui" {
+				http.Redirect(w, req, "/ui/", http.StatusMovedPermanently)
+				return
+			}
+			if strings.HasPrefix(req.URL.Path, "/ui/") {
+				req.URL.Path = strings.TrimPrefix(req.URL.Path, "/ui")
+				r.UI.ServeHTTP(w, req)
+				return
+			}
 		}
 	}
 	if r.Proxy != nil {

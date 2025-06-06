@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/pod32g/proxy/internal/api"
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/proxy"
 	"github.com/pod32g/proxy/internal/server"
@@ -101,7 +102,8 @@ func main() {
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string { return target.Host })
 	}
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
-	mux := &server.Router{Proxy: handler, UI: uiHandler, AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
+	apiHandler := api.New(cfg, store, logger, stats)
+	mux := &server.Router{Proxy: handler, UI: uiHandler, API: apiHandler, AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
 
 	srv := server.Server{
 		HTTPAddr:  cfg.HTTPAddr,
