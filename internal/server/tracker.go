@@ -67,6 +67,7 @@ func (c *ClientTracker) notify() {
 		default:
 		}
 	}
+	SetActiveClients(c.cnt)
 }
 
 // ConnState is intended to be used as http.Server.ConnState callback.

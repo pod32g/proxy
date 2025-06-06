@@ -48,3 +48,15 @@ Run the unit tests with:
 ```sh
 go test ./...
 ```
+
+## Metrics
+
+Prometheus metrics are exposed on `/metrics`. A basic monitoring stack using
+Prometheus and Grafana can be started with Docker Compose:
+
+```sh
+docker-compose up
+```
+
+This will launch Prometheus on <http://localhost:9090> and Grafana on
+<http://localhost:3000> (admin/admin).
