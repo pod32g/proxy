@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -22,6 +23,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *s
 	mux.HandleFunc("/delete", h.deleteHeader)
 	mux.HandleFunc("/loglevel", h.setLogLevel)
 	mux.HandleFunc("/stats", h.setStats)
+	mux.HandleFunc("/stats-events", h.statsEvents)
 	mux.HandleFunc("/events", h.events)
 	return mux
 }
@@ -147,12 +149,23 @@ Current: {{.LogLevel}}
 var analyticsPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
 <h2>Top Websites</h2>
 {{if .StatsEnabled}}
-<table>
+<table id="top">
 <thead><tr><th>Host</th><th>Count</th></tr></thead>
+<tbody>
 {{range .Stats}}
 <tr><td>{{.Host}}</td><td>{{.Count}}</td></tr>
 {{end}}
+</tbody>
 </table>
+<script>
+var statsSrc = new EventSource('stats-events');
+statsSrc.onmessage = function(e){
+    var data = JSON.parse(e.data);
+    var html = '';
+    data.forEach(function(s){ html += '<tr><td>'+s.Host+'</td><td>'+s.Count+'</td></tr>'; });
+    document.querySelector('#top tbody').innerHTML = html;
+};
+</script>
 {{end}}
 <h2>Analysis</h2>
 <form method="POST" action="stats">
@@ -353,6 +366,39 @@ func (h *handler) events(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			notify(c)
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (h *handler) statsEvents(w http.ResponseWriter, r *http.Request) {
+	if h.stats == nil {
+		http.Error(w, "stats not available", http.StatusServiceUnavailable)
+		return
+	}
+	if !h.cfg.StatsEnabledState() {
+		http.Error(w, "analysis disabled", http.StatusServiceUnavailable)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	ch := h.stats.Subscribe()
+	defer h.stats.Unsubscribe(ch)
+	for {
+		select {
+		case stats, ok := <-ch:
+			if !ok {
+				return
+			}
+			b, _ := json.Marshal(stats)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
 		case <-r.Context().Done():
 			return
 		}
