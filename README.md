@@ -36,7 +36,7 @@ go build -o proxy
 
 ### Web UI
 
-A simple configuration UI is available at `/ui`. It allows adding, updating and deleting custom headers while the proxy is running.
+A simple configuration UI is available at `/ui`. It now features a sidebar menu with sections for general settings, analytics and authentication. You can add, update and delete custom headers while the proxy is running.
 The UI also lets you change the log level at runtime which overrides the value from the environment or command line.
 Authentication settings (enable/disable and credentials) can also be configured and are stored encrypted in the database.
 When enabled, the UI shows the top websites accessed through the proxy.
