@@ -34,6 +34,7 @@ func (s *Server) Start() error {
 				WriteTimeout: 10 * time.Second,
 				IdleTimeout:  30 * time.Second,
 				TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
+				TLSConfig:    &tls.Config{NextProtos: []string{"http/1.1"}},
 			}
 			if s.Clients != nil {
 				httpsSrv.ConnState = s.Clients.ConnState
