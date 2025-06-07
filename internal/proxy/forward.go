@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"strings"
 
 	log "github.com/pod32g/simple-logger"
 )
@@ -66,13 +65,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, ultr
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger) {
-	destConn, err := net.Dial("tcp", r.Host)
-	if err != nil {
-		// If the initial dial fails due to IPv6 issues, try IPv4
-		if opErr, ok := err.(*net.OpError); ok && strings.Contains(opErr.Err.Error(), "network is unreachable") {
-			destConn, err = net.Dial("tcp4", r.Host)
-		}
-	}
+	destConn, err := (&net.Dialer{}).DialContext(r.Context(), "tcp", r.Host)
 	if err != nil {
 		logger.Error("CONNECT dial error: %v", err)
 		http.Error(w, "Bad gateway", http.StatusBadGateway)
