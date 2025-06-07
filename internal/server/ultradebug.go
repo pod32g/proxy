@@ -17,10 +17,13 @@ func UltraDebugMiddleware(next http.Handler, logger *log.Logger, enabled func() 
 			next.ServeHTTP(w, r)
 			return
 		}
-		if dump, err := httputil.DumpRequest(r, true); err == nil {
-			logger.Debug("full request\n" + string(dump))
-		} else {
-			logger.Debug("dump request error", err)
+		// Skip ultra debug logging for HTTPS and CONNECT requests.
+		if r.TLS == nil && r.Method != http.MethodConnect && r.URL.Scheme != "https" {
+			if dump, err := httputil.DumpRequest(r, true); err == nil {
+				logger.Debug("full request\n" + string(dump))
+			} else {
+				logger.Debug("dump request error", err)
+			}
 		}
 		rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)

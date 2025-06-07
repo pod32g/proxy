@@ -25,7 +25,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, ultr
 			return
 		}
 		logger.Debug("Forward proxy request", r.Method, sanitizedURL(r.URL))
-		if ultra != nil && ultra() {
+		if ultra != nil && ultra() && r.URL.Scheme != "https" {
 			if dump, err := httputil.DumpRequest(r, true); err == nil {
 				logger.Debug("forward request dump\n" + string(dump))
 			}
