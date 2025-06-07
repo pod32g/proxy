@@ -18,10 +18,12 @@ func New(target *url.URL, logger *log.Logger, headers func(string) map[string]st
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
-		logger.Debug("Reverse proxy request", req.Method, sanitizedURL(req.URL))
-		if ultra != nil && ultra() && target.Scheme != "https" {
-			if dump, err := httputil.DumpRequest(req, true); err == nil {
-				logger.Debug("reverse request dump\n" + string(dump))
+		if req.TLS == nil && target.Scheme != "https" {
+			logger.Debug("Reverse proxy request", req.Method, sanitizedURL(req.URL))
+			if ultra != nil && ultra() {
+				if dump, err := httputil.DumpRequest(req, true); err == nil {
+					logger.Debug("reverse request dump\n" + string(dump))
+				}
 			}
 		}
 		originalDirector(req)

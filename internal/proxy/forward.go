@@ -21,14 +21,15 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, ultr
 	transport.Proxy = nil
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
-			logger.Debug("CONNECT request", r.Host)
 			handleConnect(w, r, logger)
 			return
 		}
-		logger.Debug("Forward proxy request", r.Method, sanitizedURL(r.URL))
-		if ultra != nil && ultra() && r.URL.Scheme != "https" {
-			if dump, err := httputil.DumpRequest(r, true); err == nil {
-				logger.Debug("forward request dump\n" + string(dump))
+		if r.URL.Scheme != "https" {
+			logger.Debug("Forward proxy request", r.Method, sanitizedURL(r.URL))
+			if ultra != nil && ultra() {
+				if dump, err := httputil.DumpRequest(r, true); err == nil {
+					logger.Debug("forward request dump\n" + string(dump))
+				}
 			}
 		}
 		if r.URL.Scheme == "" || r.URL.Host == "" {
@@ -65,7 +66,6 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, ultr
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger) {
-	logger.Debug("CONNECT tunnel", r.Host)
 	destConn, err := net.Dial("tcp", r.Host)
 	if err != nil {
 		// If the initial dial fails due to IPv6 issues, try IPv4
