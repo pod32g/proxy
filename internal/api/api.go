@@ -16,6 +16,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, stats *ser
 	mux.HandleFunc("/headers", h.headers)
 	mux.HandleFunc("/loglevel", h.logLevel)
 	mux.HandleFunc("/auth", h.auth)
+	mux.HandleFunc("/identity", h.identity)
 	mux.HandleFunc("/stats", h.statsHandler)
 	return mux
 }
@@ -45,6 +46,11 @@ type authReq struct {
 
 type statsReq struct {
 	Enabled bool `json:"enabled"`
+}
+
+type identityReq struct {
+	Name string `json:"name"`
+	ID   string `json:"id"`
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
@@ -131,6 +137,27 @@ func (h *handler) auth(w http.ResponseWriter, r *http.Request) {
 		h.cfg.SetAuth(req.Enabled, req.Username, req.Password)
 		if h.logger != nil {
 			h.logger.Info("updated auth settings")
+		}
+		if h.store != nil {
+			h.store.Save(h.cfg)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (h *handler) identity(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		name, id := h.cfg.GetIdentity()
+		writeJSON(w, map[string]string{"name": name, "id": id})
+	case http.MethodPost:
+		var req identityReq
+		json.NewDecoder(r.Body).Decode(&req)
+		h.cfg.SetIdentity(req.Name, req.ID)
+		if h.logger != nil {
+			h.logger.Info("updated identity")
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)

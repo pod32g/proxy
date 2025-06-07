@@ -57,6 +57,8 @@ func main() {
 	flag.StringVar(&cfg.Username, "auth-user", getenv("PROXY_AUTH_USER", ""), "username for basic auth")
 	flag.StringVar(&cfg.Password, "auth-pass", getenv("PROXY_AUTH_PASS", ""), "password for basic auth")
 	flag.StringVar(&cfg.SecretKey, "secret", getenv("PROXY_SECRET_KEY", ""), "secret key for encryption")
+	flag.StringVar(&cfg.ProxyName, "proxy-name", getenv("PROXY_NAME", ""), "proxy name for identification")
+	flag.StringVar(&cfg.ProxyID, "proxy-id", getenv("PROXY_ID", ""), "proxy identifier")
 	flag.BoolVar(&cfg.StatsEnabled, "stats", getenv("PROXY_STATS_ENABLED", "") == "true", "enable traffic analysis")
 	logLevelStr := getenv("PROXY_LOG_LEVEL", "INFO")
 	flag.StringVar(&logLevelStr, "log-level", logLevelStr, "Log level (DEBUG, INFO, WARN, ERROR, FATAL)")

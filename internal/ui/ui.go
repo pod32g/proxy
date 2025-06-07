@@ -18,6 +18,8 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *s
 	mux.HandleFunc("/", h.index)
 	mux.HandleFunc("/general", h.general)
 	mux.HandleFunc("/analytics", h.analytics)
+	mux.HandleFunc("/identity", h.identityPage)
+	mux.HandleFunc("/set-identity", h.setIdentity)
 	mux.HandleFunc("/auth", h.authPage)
 	mux.HandleFunc("/header", h.addHeader)
 	mux.HandleFunc("/delete", h.deleteHeader)
@@ -42,6 +44,8 @@ type pageData struct {
 	LogLevel      string
 	AuthEnabled   bool
 	Username      string
+	ProxyName     string
+	ProxyID       string
 	ClientCount   int
 	ClientAddrs   []string
 	StatsEnabled  bool
@@ -79,6 +83,7 @@ var layout = template.Must(template.New("layout").Parse(`<!DOCTYPE html>
     <ul class="nav flex-column">
         <li class="nav-item"><a href="/ui/general" class="nav-link">General Settings</a></li>
         <li class="nav-item"><a href="/ui/analytics" class="nav-link">Analytics</a></li>
+        <li class="nav-item"><a href="/ui/identity" class="nav-link">Identity</a></li>
         <li class="nav-item"><a href="/ui/auth" class="nav-link">Authentication</a></li>
     </ul>
 </div>
@@ -174,6 +179,15 @@ statsSrc.onmessage = function(e){
 </form>
 {{end}}`))
 
+var identityPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
+<h2>Proxy Identity</h2>
+<form method="POST" action="set-identity">
+    <label>Name: <input name="name" value="{{.ProxyName}}"></label><br>
+    <label>ID: <input name="id" value="{{.ProxyID}}"></label><br>
+    <button type="submit">Save</button>
+</form>
+{{end}}`))
+
 var authPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
 <h2>Authentication</h2>
 <form method="POST" action="auth">
@@ -192,6 +206,8 @@ func (h *handler) makeData() pageData {
 		LogLevel:      config.LevelString(h.cfg.GetLogLevel()),
 		AuthEnabled:   enabled,
 		Username:      user,
+		ProxyName:     h.cfg.ProxyName,
+		ProxyID:       h.cfg.ProxyID,
 		ClientCount:   0,
 		ClientAddrs:   nil,
 		StatsEnabled:  h.cfg.StatsEnabledState(),
@@ -228,6 +244,14 @@ func (h *handler) analytics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	analyticsPage.Execute(w, h.makeData())
+}
+
+func (h *handler) identityPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	identityPage.Execute(w, h.makeData())
 }
 
 func (h *handler) authPage(w http.ResponseWriter, r *http.Request) {
@@ -301,6 +325,23 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 		h.store.Save(h.cfg)
 	}
 	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
+}
+
+func (h *handler) setIdentity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	name := r.FormValue("name")
+	id := r.FormValue("id")
+	h.cfg.SetIdentity(name, id)
+	if h.logger != nil {
+		h.logger.Info("Updated identity", name, id)
+	}
+	if h.store != nil {
+		h.store.Save(h.cfg)
+	}
+	http.Redirect(w, r, "/ui/identity", http.StatusSeeOther)
 }
 
 func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {

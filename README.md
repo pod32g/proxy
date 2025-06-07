@@ -28,6 +28,8 @@ go build -o proxy
 - `-auth-user` – Username for basic authentication. Can be set with `PROXY_AUTH_USER`.
 - `-auth-pass` – Password for basic authentication. Can be set with `PROXY_AUTH_PASS`.
 - `-secret` – Encryption key used to protect credentials. Can be set with `PROXY_SECRET_KEY`.
+- `-proxy-name` – Name used to identify this proxy instance. Can be set with `PROXY_NAME`.
+- `-proxy-id` – Identifier for this proxy instance. Can be set with `PROXY_ID`.
 - `-header` – Custom header to add to upstream requests. Can be repeated.
 - `-mode` – Proxy mode: `forward` or `reverse`. Defaults to `forward` or `PROXY_MODE`.
 - `-log-level` – Logging level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`). Defaults to `INFO` or `PROXY_LOG_LEVEL`.
@@ -36,10 +38,11 @@ go build -o proxy
 
 ### Web UI
 
-A simple configuration UI is available at `/ui`. It now features a sidebar menu with links to separate pages for general settings, analytics and authentication. You can add, update and delete custom headers while the proxy is running.
+A simple configuration UI is available at `/ui`. It now features a sidebar menu with links to pages for general settings, analytics, identity and authentication. You can add, update and delete custom headers while the proxy is running.
 The UI also lets you change the log level at runtime which overrides the value from the environment or command line.
 Authentication settings (enable/disable and credentials) can also be configured and are stored encrypted in the database.
 When enabled, the UI shows the top websites accessed through the proxy.
+The new Identity page lets you set a name and ID for the proxy which are sent on each upstream request using the `X-Proxy-Name` and `X-Proxy-Id` headers.
 
 ## Testing
 
