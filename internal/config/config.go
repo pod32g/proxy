@@ -24,6 +24,9 @@ type Config struct {
 	StatsEnabled bool
 	SecretKey    string
 
+	ProxyName string
+	ProxyID   string
+
 	LogLevel log.LogLevel
 
 	Headers       map[string]string
@@ -71,7 +74,7 @@ func (c *Config) DeleteClientHeader(client, name string) {
 func (c *Config) GetHeadersForClient(client string) map[string]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make(map[string]string, len(c.Headers))
+	out := make(map[string]string, len(c.Headers)+2)
 	for k, v := range c.Headers {
 		out[k] = v
 	}
@@ -79,6 +82,12 @@ func (c *Config) GetHeadersForClient(client string) map[string]string {
 		for k, v := range ch {
 			out[k] = v
 		}
+	}
+	if c.ProxyName != "" {
+		out["X-Proxy-Name"] = c.ProxyName
+	}
+	if c.ProxyID != "" {
+		out["X-Proxy-Id"] = c.ProxyID
 	}
 	return out
 }
@@ -184,6 +193,25 @@ func (c *Config) SetStatsEnabled(enabled bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.StatsEnabled = enabled
+}
+
+// SetIdentity updates the proxy identity headers.
+func (c *Config) SetIdentity(name, id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if name != "" {
+		c.ProxyName = name
+	}
+	if id != "" {
+		c.ProxyID = id
+	}
+}
+
+// GetIdentity returns the configured proxy name and id.
+func (c *Config) GetIdentity() (string, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ProxyName, c.ProxyID
 }
 
 // StatsEnabledState returns whether statistics are enabled.
