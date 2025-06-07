@@ -11,6 +11,7 @@ type Router struct {
 	Proxy       http.Handler
 	UI          http.Handler
 	API         http.Handler
+	Metrics     http.Handler
 	AuthEnabled bool
 	Username    string
 	Password    string
@@ -26,6 +27,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	// CONNECT requests never have a path starting with '/'
 	if req.Method != http.MethodConnect {
+		if r.Metrics != nil && req.URL.Path == "/metrics" {
+			r.Metrics.ServeHTTP(w, req)
+			return
+		}
 		if r.API != nil && strings.HasPrefix(req.URL.Path, "/api/") {
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api")
 			r.API.ServeHTTP(w, req)
