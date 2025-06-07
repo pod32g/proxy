@@ -4,6 +4,8 @@ import (
 	"net"
 	"net/http"
 	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // ClientTracker tracks the number of active client connections.
@@ -12,6 +14,7 @@ type ClientTracker struct {
 	cnt   int
 	subs  map[chan int]struct{}
 	addrs map[string]int
+	gauge prometheus.Gauge
 }
 
 // NewClientTracker creates a new ClientTracker.
@@ -20,6 +23,16 @@ func NewClientTracker() *ClientTracker {
 		subs:  make(map[chan int]struct{}),
 		addrs: make(map[string]int),
 	}
+}
+
+// SetGauge assigns a Prometheus gauge to report the active connection count.
+func (c *ClientTracker) SetGauge(g prometheus.Gauge) {
+	c.mu.Lock()
+	c.gauge = g
+	if g != nil {
+		g.Set(float64(c.cnt))
+	}
+	c.mu.Unlock()
 }
 
 // Count returns the current number of active connections.
@@ -66,6 +79,9 @@ func (c *ClientTracker) notify() {
 		case ch <- c.cnt:
 		default:
 		}
+	}
+	if c.gauge != nil {
+		c.gauge.Set(float64(c.cnt))
 	}
 }
 

@@ -1,0 +1,68 @@
+package server
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+type Metrics struct {
+	Requests *prometheus.CounterVec
+	Duration *prometheus.HistogramVec
+	Clients  prometheus.Gauge
+}
+
+func NewMetrics() *Metrics {
+	m := &Metrics{
+		Requests: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "proxy_http_requests_total",
+				Help: "Total number of HTTP requests processed",
+			},
+			[]string{"method", "code"},
+		),
+		Duration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "proxy_http_request_duration_seconds",
+				Help:    "Duration of HTTP requests",
+				Buckets: prometheus.DefBuckets,
+			},
+			[]string{"method"},
+		),
+		Clients: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "proxy_active_clients",
+				Help: "Number of active client connections",
+			},
+		),
+	}
+	prometheus.MustRegister(m.Requests, m.Duration, m.Clients)
+	return m
+}
+
+// MetricsMiddleware records Prometheus metrics for requests.
+func MetricsMiddleware(next http.Handler, m *Metrics) http.Handler {
+	if next == nil || m == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+		dur := time.Since(start).Seconds()
+		m.Duration.WithLabelValues(r.Method).Observe(dur)
+		m.Requests.WithLabelValues(r.Method, strconv.Itoa(rec.status)).Inc()
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}

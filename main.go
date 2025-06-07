@@ -14,6 +14,7 @@ import (
 	"github.com/pod32g/proxy/internal/server"
 	"github.com/pod32g/proxy/internal/ui"
 	log "github.com/pod32g/simple-logger"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type headerFlags map[string]string
@@ -83,7 +84,9 @@ func main() {
 
 	logger := log.NewLogger(os.Stdout, cfg.LogLevel, &log.DefaultFormatter{})
 
+	metrics := server.NewMetrics()
 	tracker := server.NewClientTracker()
+	tracker.SetGauge(metrics.Clients)
 	stats := server.NewDomainStats()
 
 	var handler http.Handler
@@ -103,9 +106,10 @@ func main() {
 		h := proxy.New(target, logger, cfg.GetHeadersForClient)
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string { return target.Host })
 	}
+	handler = server.MetricsMiddleware(handler, metrics)
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	apiHandler := api.New(cfg, store, logger, stats)
-	mux := &server.Router{Proxy: handler, UI: uiHandler, API: apiHandler, AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
+	mux := &server.Router{Proxy: handler, UI: uiHandler, API: apiHandler, Metrics: promhttp.Handler(), AuthEnabled: cfg.AuthEnabled, Username: cfg.Username, Password: cfg.Password}
 
 	srv := server.Server{
 		HTTPAddr:  cfg.HTTPAddr,

@@ -51,3 +51,16 @@ Run the unit tests with:
 ```sh
 go test ./...
 ```
+
+## Metrics and Monitoring
+
+Prometheus metrics are exposed on `/metrics`. A `docker-compose.yml` file is
+included to start the proxy along with Prometheus and Grafana:
+
+```sh
+docker compose up
+```
+
+Prometheus is configured via `prometheus.yml` to scrape the proxy service. Once
+running, Grafana is available on <http://localhost:3000> and Prometheus on
+<http://localhost:9090>.
