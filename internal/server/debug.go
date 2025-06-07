@@ -21,7 +21,9 @@ func DebugMiddleware(next http.Handler, logger *log.Logger, enabled func() bool)
 		rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)
 		dur := time.Since(start)
-		logger.Debug("request", r.Method, sanitized(r), "status", rw.status, "dur", dur)
+		if r.TLS == nil && r.URL.Scheme != "https" && r.Method != http.MethodConnect {
+			logger.Debug("request", r.Method, sanitized(r), "status", rw.status, "dur", dur)
+		}
 	})
 }
 
@@ -35,7 +37,11 @@ func sanitized(r *http.Request) string {
 	}
 	scheme := r.URL.Scheme
 	if scheme == "" {
-		scheme = "http"
+		if r.TLS != nil {
+			scheme = "https"
+		} else {
+			scheme = "http"
+		}
 	}
 	return scheme + "://" + host + r.URL.Path
 }
