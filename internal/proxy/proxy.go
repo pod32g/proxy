@@ -19,7 +19,7 @@ func New(target *url.URL, logger *log.Logger, headers func(string) map[string]st
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		logger.Debug("Reverse proxy request", req.Method, sanitizedURL(req.URL))
-		if ultra != nil && ultra() {
+		if ultra != nil && ultra() && target.Scheme != "https" {
 			if dump, err := httputil.DumpRequest(req, true); err == nil {
 				logger.Debug("reverse request dump\n" + string(dump))
 			}
