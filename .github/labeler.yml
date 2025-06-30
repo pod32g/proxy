@@ -1,0 +1,20 @@
+backend:
+  - '*.go'
+  - cmd/**
+  - internal/**
+  - main/**
+  - main.go
+
+frontend:
+  - web/**
+
+infrastructure:
+  - Dockerfile
+  - docker-compose.yml
+  - k8s/**
+  - prometheus.yml
+
+docs:
+  - docs/**
+  - README.md
+  - CONTRIBUTING.md
