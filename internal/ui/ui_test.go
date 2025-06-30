@@ -1,10 +1,12 @@
 package ui
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/server"
@@ -112,5 +114,77 @@ func TestSetIdentityAndStats(t *testing.T) {
 	}
 	if !cfg.StatsEnabledState() {
 		t.Fatalf("stats not enabled")
+	}
+}
+
+type testWriter struct {
+	header http.Header
+	buf    strings.Builder
+	status int
+}
+
+func (w *testWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *testWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
+func (w *testWriter) WriteHeader(s int)           { w.status = s }
+func (w *testWriter) Flush()                      {}
+
+func TestEventsStream(t *testing.T) {
+	tracker := server.NewClientTracker()
+	h := &handler{cfg: &config.Config{}, clients: tracker}
+
+	req := httptest.NewRequest("GET", "/events", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+	w := &testWriter{}
+
+	done := make(chan struct{})
+	go func() {
+		h.events(w, req)
+		close(done)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	tracker.ConnState(nil, http.StateNew)
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	<-done
+
+	out := w.buf.String()
+	if !strings.Contains(out, "data: 0") || !strings.Contains(out, "data: 1") {
+		t.Fatalf("unexpected stream: %q", out)
+	}
+}
+
+func TestStatsEventsStream(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.SetStatsEnabled(true)
+	stats := server.NewDomainStats()
+	h := &handler{cfg: cfg, stats: stats}
+
+	req := httptest.NewRequest("GET", "/stats-events", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+	w := &testWriter{}
+
+	done := make(chan struct{})
+	go func() {
+		h.statsEvents(w, req)
+		close(done)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	stats.Record("example.com")
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	<-done
+
+	if !strings.Contains(w.buf.String(), "example.com") {
+		t.Fatalf("stats not streamed: %q", w.buf.String())
 	}
 }
