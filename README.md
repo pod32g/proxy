@@ -44,6 +44,8 @@ Authentication settings (enable/disable and credentials) can also be configured 
 When enabled, the UI shows the top websites accessed through the proxy.
 The new Identity page lets you set a name and ID for the proxy which are sent on each upstream request using the `X-Proxy-Name` and `X-Proxy-Id` headers.
 
+More details about the interface and its pages can be found in [docs/GUI.md](docs/GUI.md).
+
 ## Testing
 
 Run the unit tests with:
