@@ -66,3 +66,8 @@ docker compose up
 Prometheus is configured via `prometheus.yml` to scrape the proxy service. Once
 running, Grafana is available on <http://localhost:3000> and Prometheus on
 <http://localhost:9090>.
+
+## Contributing
+
+Pull requests run the **Test** GitHub Actions workflow which executes `go test ./...`. Configure a branch protection rule on `main` so this check must succeed before merging.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for more information.
