@@ -67,6 +67,18 @@ Prometheus is configured via `prometheus.yml` to scrape the proxy service. Once
 running, Grafana is available on <http://localhost:3000> and Prometheus on
 <http://localhost:9090>.
 
+## Kubernetes Deployment
+
+Kubernetes manifests can be found in `k8s/`. Deploy the proxy, Prometheus and
+Grafana with:
+
+```sh
+kubectl apply -f k8s/
+```
+
+Prometheus is exposed on port 9090 and Grafana on port 3000.
+
+
 ## Contributing
 
 Pull requests run the **Test** GitHub Actions workflow which executes `go test ./...`. Configure a branch protection rule on `main` so this check must succeed before merging.
