@@ -15,6 +15,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Install Pact dependencies
+        run: go generate ./tools
       - name: Run tests with coverage
         run: |
           go test -coverprofile=coverage.out ./...

@@ -51,6 +51,10 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
 Run the unit tests with:
 
 ```sh
+go generate ./tools    # installs Pact libraries needed for contract tests
+```
+
+```sh
 go test ./...
 ```
 
