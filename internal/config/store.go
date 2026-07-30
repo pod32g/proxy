@@ -10,8 +10,10 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/scrypt"
 )
 
 // Store provides persistence for Config using SQLite.
@@ -19,9 +21,39 @@ type Store struct {
 	db *sql.DB
 }
 
-func encrypt(key, plain string) (string, error) {
-	h := sha256.Sum256([]byte(key))
-	block, err := aes.NewCipher(h[:])
+// Ciphertext written by this package is tagged so the key derivation can be
+// changed without stranding databases written by an older build. Untagged
+// values predate the salted KDF and are read with the legacy derivation.
+const cipherV2Prefix = "v2:"
+
+const (
+	// scrypt parameters. N is the work factor; 1<<15 is the interactive-login
+	// preset and costs ~32MB and a few tens of milliseconds, which is
+	// unnoticeable here because credentials are only sealed on save.
+	scryptN   = 1 << 15
+	scryptR   = 8
+	scryptP   = 1
+	keyLen    = 32
+	kdfSaltLn = 16
+)
+
+// deriveKey stretches the operator's secret into an AES key. The salt makes a
+// stolen database useless for precomputation, and scrypt's cost makes guessing
+// a human-chosen secret expensive rather than instant.
+func deriveKey(secret string, salt []byte) ([]byte, error) {
+	return scrypt.Key([]byte(secret), salt, scryptN, scryptR, scryptP, keyLen)
+}
+
+// deriveKeyLegacy reproduces the original unsalted SHA-256 derivation. Read-only:
+// nothing is ever written with it again, and Save re-seals with the current
+// scheme the first time it runs.
+func deriveKeyLegacy(secret string) []byte {
+	h := sha256.Sum256([]byte(secret))
+	return h[:]
+}
+
+func seal(key []byte, plain string) (string, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
 	}
@@ -33,17 +65,15 @@ func encrypt(key, plain string) (string, error) {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return "", err
 	}
-	data := gcm.Seal(nonce, nonce, []byte(plain), nil)
-	return base64.StdEncoding.EncodeToString(data), nil
+	return base64.StdEncoding.EncodeToString(gcm.Seal(nonce, nonce, []byte(plain), nil)), nil
 }
 
-func decrypt(key, cipherText string) (string, error) {
-	raw, err := base64.StdEncoding.DecodeString(cipherText)
+func open(key []byte, encoded string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return "", err
 	}
-	h := sha256.Sum256([]byte(key))
-	block, err := aes.NewCipher(h[:])
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
 	}
@@ -51,16 +81,46 @@ func decrypt(key, cipherText string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	nonceSize := gcm.NonceSize()
-	if len(raw) < nonceSize {
+	if len(raw) < gcm.NonceSize() {
 		return "", errors.New("ciphertext too short")
 	}
-	nonce := raw[:nonceSize]
-	plain, err := gcm.Open(nil, nonce, raw[nonceSize:], nil)
+	plain, err := gcm.Open(nil, raw[:gcm.NonceSize()], raw[gcm.NonceSize():], nil)
 	if err != nil {
 		return "", err
 	}
 	return string(plain), nil
+}
+
+// encrypt seals plain with a salted, stretched key and tags the result.
+func encrypt(secret string, salt []byte, plain string) (string, error) {
+	if len(salt) == 0 {
+		return "", errors.New("missing kdf salt")
+	}
+	key, err := deriveKey(secret, salt)
+	if err != nil {
+		return "", err
+	}
+	out, err := seal(key, plain)
+	if err != nil {
+		return "", err
+	}
+	return cipherV2Prefix + out, nil
+}
+
+// decrypt opens ciphertext written by either scheme, picking the derivation
+// from the tag rather than guessing.
+func decrypt(secret string, salt []byte, cipherText string) (string, error) {
+	if tagged, ok := strings.CutPrefix(cipherText, cipherV2Prefix); ok {
+		if len(salt) == 0 {
+			return "", errors.New("missing kdf salt")
+		}
+		key, err := deriveKey(secret, salt)
+		if err != nil {
+			return "", err
+		}
+		return open(key, tagged)
+	}
+	return open(deriveKeyLegacy(secret), cipherText)
 }
 
 // NewStore opens or creates an SQLite database at path and initializes schema.
@@ -93,6 +153,44 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// salt returns the stored KDF salt, or nil when the database has never been
+// written with an encryption secret.
+func (s *Store) salt() ([]byte, error) {
+	var encoded string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key='kdf_salt'`).Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return base64.StdEncoding.DecodeString(encoded)
+}
+
+// ensureSalt returns the stored salt, minting one on first use.
+func ensureSalt(tx *sql.Tx) ([]byte, error) {
+	var encoded string
+	err := tx.QueryRow(`SELECT value FROM settings WHERE key='kdf_salt'`).Scan(&encoded)
+	if err == nil {
+		if salt, decErr := base64.StdEncoding.DecodeString(encoded); decErr == nil && len(salt) > 0 {
+			return salt, nil
+		}
+		// Unreadable salt: fall through and mint a replacement. Anything sealed
+		// with the old one is unrecoverable either way.
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	salt := make([]byte, kdfSaltLn)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('kdf_salt', ?)`,
+		base64.StdEncoding.EncodeToString(salt)); err != nil {
+		return nil, err
+	}
+	return salt, nil
+}
+
 // Load populates cfg with data from the store. It overrides fields present in the database.
 func (s *Store) Load(cfg *Config) error {
 	if s == nil || s.db == nil {
@@ -110,42 +208,58 @@ func (s *Store) Load(cfg *Config) error {
 		}
 		cfg.SetHeader(name, value)
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	salt, err := s.salt()
+	if err != nil {
+		return err
+	}
+
 	// settings
 	var val string
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='log_level'`).Scan(&val); err == nil {
 		cfg.SetLogLevel(ParseLogLevel(val))
 	}
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='auth_enabled'`).Scan(&val); err == nil {
-		cfg.AuthEnabled, _ = strconv.ParseBool(val)
+		enabled, _ := strconv.ParseBool(val)
+		cfg.SetAuthEnabled(enabled)
 	}
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='stats_enabled'`).Scan(&val); err == nil {
-		cfg.StatsEnabled, _ = strconv.ParseBool(val)
+		enabled, _ := strconv.ParseBool(val)
+		cfg.SetStatsEnabled(enabled)
 	}
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='proxy_name'`).Scan(&val); err == nil {
-		cfg.ProxyName = val
+		cfg.SetProxyName(val)
 	}
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='proxy_id'`).Scan(&val); err == nil {
-		cfg.ProxyID = val
+		cfg.SetProxyID(val)
 	}
+
+	_, user, pass := cfg.GetAuth()
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='username'`).Scan(&val); err == nil {
-		if cfg.SecretKey != "" {
-			if dec, err := decrypt(cfg.SecretKey, val); err == nil {
-				cfg.Username = dec
-			}
-		} else {
-			cfg.Username = val
-		}
+		user = s.plaintext(cfg.SecretKey, salt, val, user)
 	}
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='password'`).Scan(&val); err == nil {
-		if cfg.SecretKey != "" {
-			if dec, err := decrypt(cfg.SecretKey, val); err == nil {
-				cfg.Password = dec
-			}
-		} else {
-			cfg.Password = val
-		}
+		pass = s.plaintext(cfg.SecretKey, salt, val, pass)
 	}
-	return rows.Err()
+	cfg.SetCredentials(user, pass)
+	return nil
+}
+
+// plaintext decodes a stored credential, falling back to the value already in
+// the config when the secret cannot open it — a wrong -secret should not
+// silently blank out working credentials.
+func (s *Store) plaintext(secret string, salt []byte, stored, current string) string {
+	if secret == "" {
+		return stored
+	}
+	dec, err := decrypt(secret, salt, stored)
+	if err != nil {
+		return current
+	}
+	return dec
 }
 
 // Save writes the given configuration to the store.
@@ -157,55 +271,62 @@ func (s *Store) Save(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
 	// headers
 	if _, err := tx.Exec(`DELETE FROM headers`); err != nil {
-		tx.Rollback()
 		return err
 	}
 	for k, v := range cfg.GetHeaders() {
 		if _, err := tx.Exec(`INSERT INTO headers(name, value) VALUES(?, ?)`, k, v); err != nil {
-			tx.Rollback()
 			return err
 		}
 	}
-	// log level
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('log_level', ?)`, LevelString(cfg.GetLogLevel())); err != nil {
-		tx.Rollback()
-		return err
+
+	authEnabled, user, pass := cfg.GetAuth()
+	proxyName, proxyID := cfg.GetIdentity()
+	settings := [][2]string{
+		{"log_level", LevelString(cfg.GetLogLevel())},
+		{"auth_enabled", strconv.FormatBool(authEnabled)},
+		{"stats_enabled", strconv.FormatBool(cfg.StatsEnabledState())},
+		{"proxy_name", proxyName},
+		{"proxy_id", proxyID},
 	}
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('auth_enabled', ?)`, strconv.FormatBool(cfg.AuthEnabled)); err != nil {
-		tx.Rollback()
-		return err
-	}
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('stats_enabled', ?)`, strconv.FormatBool(cfg.StatsEnabled)); err != nil {
-		tx.Rollback()
-		return err
-	}
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('proxy_name', ?)`, cfg.ProxyName); err != nil {
-		tx.Rollback()
-		return err
-	}
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('proxy_id', ?)`, cfg.ProxyID); err != nil {
-		tx.Rollback()
-		return err
-	}
-	user := cfg.Username
-	pass := cfg.Password
+
 	if cfg.SecretKey != "" {
-		if enc, err := encrypt(cfg.SecretKey, cfg.Username); err == nil {
+		salt, err := ensureSalt(tx)
+		if err != nil {
+			return err
+		}
+		// Only substitute the ciphertext if sealing succeeded; writing the
+		// plaintext because encryption failed would be the worst outcome.
+		if enc, err := encrypt(cfg.SecretKey, salt, user); err == nil {
 			user = enc
+		} else {
+			return err
 		}
-		if enc, err := encrypt(cfg.SecretKey, cfg.Password); err == nil {
+		if enc, err := encrypt(cfg.SecretKey, salt, pass); err == nil {
 			pass = enc
+		} else {
+			return err
 		}
 	}
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('username', ?)`, user); err != nil {
-		tx.Rollback()
-		return err
-	}
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES('password', ?)`, pass); err != nil {
-		tx.Rollback()
-		return err
+	settings = append(settings, [2]string{"username", user}, [2]string{"password", pass})
+
+	for _, kv := range settings {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)`, kv[0], kv[1]); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
+}
+
+// CredentialsAtRisk reports whether Save would persist non-empty credentials
+// without encrypting them, so the caller can warn once the logger exists.
+func CredentialsAtRisk(cfg *Config) bool {
+	if cfg.SecretKey != "" {
+		return false
+	}
+	_, user, pass := cfg.GetAuth()
+	return user != "" || pass != ""
 }

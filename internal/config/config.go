@@ -2,10 +2,11 @@ package config
 
 // Config holds the runtime configuration for the proxy server.
 import (
+	"fmt"
+	"strings"
 	"sync"
 
 	log "github.com/pod32g/simple-logger"
-	"strings"
 )
 
 // Config holds the runtime configuration for the proxy server.
@@ -139,7 +140,22 @@ func (c *Config) GetLogLevel() log.LogLevel {
 	return c.LogLevel
 }
 
-// ParseLogLevel converts a string to a log.LogLevel.
+// LogLevels lists the accepted logging levels, in increasing severity.
+var LogLevels = []string{"DEBUG", "INFO", "WARN", "ERROR", "FATAL"}
+
+// ParseLogLevelStrict is ParseLogLevel with the silent fallback removed, so a
+// typo surfaces at startup (or as a 400) instead of quietly becoming INFO.
+func ParseLogLevelStrict(lvl string) (log.LogLevel, error) {
+	up := strings.ToUpper(lvl)
+	for _, known := range LogLevels {
+		if up == known {
+			return ParseLogLevel(up), nil
+		}
+	}
+	return log.INFO, fmt.Errorf("invalid log level %q (want one of %s)", lvl, strings.Join(LogLevels, ", "))
+}
+
+// ParseLogLevel converts a string to a log.LogLevel, defaulting to INFO.
 func ParseLogLevel(lvl string) log.LogLevel {
 	switch strings.ToUpper(lvl) {
 	case "DEBUG":
@@ -188,6 +204,24 @@ func (c *Config) SetAuth(enabled bool, username, password string) {
 	}
 }
 
+// SetAuthEnabled toggles authentication without touching the stored credentials.
+func (c *Config) SetAuthEnabled(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.AuthEnabled = enabled
+}
+
+// SetCredentials replaces the credentials verbatim, empty values included.
+// SetAuth is the UI/API path and deliberately ignores blanks so "leave the
+// password alone" works; this is the persistence path, where a blank stored
+// value has to round-trip faithfully.
+func (c *Config) SetCredentials(username, password string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Username = username
+	c.Password = password
+}
+
 // SetStatsEnabled enables or disables statistics collection.
 func (c *Config) SetStatsEnabled(enabled bool) {
 	c.mu.Lock()
@@ -205,6 +239,22 @@ func (c *Config) SetIdentity(name, id string) {
 	if id != "" {
 		c.ProxyID = id
 	}
+}
+
+// SetProxyName replaces the proxy name verbatim, empty values included.
+// SetIdentity ignores blanks for the UI's benefit; loading persisted state
+// needs the literal value.
+func (c *Config) SetProxyName(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ProxyName = name
+}
+
+// SetProxyID replaces the proxy id verbatim, empty values included.
+func (c *Config) SetProxyID(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ProxyID = id
 }
 
 // GetIdentity returns the configured proxy name and id.

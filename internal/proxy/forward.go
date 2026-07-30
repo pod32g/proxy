@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 
 	log "github.com/pod32g/simple-logger"
 )
@@ -31,6 +32,10 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string) http
 		}
 		outReq := r.Clone(r.Context())
 		outReq.RequestURI = ""
+		// r.Clone copies every header the client sent to the *proxy*, including
+		// the credentials it used to authenticate to us. Strip the per-hop set
+		// before it reaches the origin.
+		removeHopByHop(outReq.Header)
 		for k, v := range headers(r.RemoteAddr) {
 			outReq.Header.Set(k, v)
 		}
@@ -41,6 +46,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string) http
 			return
 		}
 		defer resp.Body.Close()
+		removeHopByHop(resp.Header)
 		copyHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
@@ -82,6 +88,37 @@ func transfer(dst io.WriteCloser, src io.ReadCloser) {
 	io.Copy(dst, src)
 	dst.Close()
 	src.Close()
+}
+
+// hopByHopHeaders are meaningful only between one sender and the immediate
+// recipient, and must not be forwarded across a proxy hop (RFC 7230 §6.1).
+// Proxy-Authorization matters most here: it carries the credentials the client
+// used on *us*, and forwarding it hands them to every origin the client visits.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// removeHopByHop deletes the per-hop headers, including any the peer named in
+// its own Connection header, which is how a sender extends the list.
+func removeHopByHop(h http.Header) {
+	for _, f := range h.Values("Connection") {
+		for _, name := range strings.Split(f, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				h.Del(name)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
 }
 
 func copyHeader(dst, src http.Header) {

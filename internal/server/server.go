@@ -18,6 +18,32 @@ type Server struct {
 	Clients   *ClientTracker
 }
 
+// A proxy must not bound how long a transfer takes: it has no idea whether the
+// body is a 200-byte JSON reply, a multi-gigabyte download, or an SSE stream
+// that stays open for hours. ReadTimeout and WriteTimeout cover the whole
+// request and response, so any value large enough for the slowest legitimate
+// transfer is useless as a defence anyway. Bound the parts that should be
+// bounded instead — how long a client may dawdle over its headers, and how long
+// an idle keep-alive connection may sit — and let the bodies take as long as
+// they take.
+const (
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 120 * time.Second
+)
+
+func (s *Server) newHTTPServer(addr string) *http.Server {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+	if s.Clients != nil {
+		srv.ConnState = s.Clients.ConnState
+	}
+	return srv
+}
+
 // Start launches the HTTP server and, if configured, an HTTPS server.
 func (s *Server) Start() error {
 	if s.Handler == nil {
@@ -26,16 +52,7 @@ func (s *Server) Start() error {
 
 	if s.HTTPSAddr != "" && s.CertFile != "" && s.KeyFile != "" {
 		go func() {
-			httpsSrv := &http.Server{
-				Addr:         s.HTTPSAddr,
-				Handler:      s.Handler,
-				ReadTimeout:  5 * time.Second,
-				WriteTimeout: 10 * time.Second,
-				IdleTimeout:  30 * time.Second,
-			}
-			if s.Clients != nil {
-				httpsSrv.ConnState = s.Clients.ConnState
-			}
+			httpsSrv := s.newHTTPServer(s.HTTPSAddr)
 			s.Logger.Info("Starting HTTPS proxy on", s.HTTPSAddr)
 			if err := httpsSrv.ListenAndServeTLS(s.CertFile, s.KeyFile); err != nil && err != http.ErrServerClosed {
 				s.Logger.Error("HTTPS server failed: %v", err)
@@ -43,16 +60,7 @@ func (s *Server) Start() error {
 		}()
 	}
 
-	httpSrv := &http.Server{
-		Addr:         s.HTTPAddr,
-		Handler:      s.Handler,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  30 * time.Second,
-	}
-	if s.Clients != nil {
-		httpSrv.ConnState = s.Clients.ConnState
-	}
+	httpSrv := s.newHTTPServer(s.HTTPAddr)
 	s.Logger.Info("Starting HTTP proxy on", s.HTTPAddr)
 	return httpSrv.ListenAndServe()
 }

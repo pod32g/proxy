@@ -1,6 +1,9 @@
 package ui
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -21,6 +24,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *s
 	mux.HandleFunc("/identity", h.identityPage)
 	mux.HandleFunc("/set-identity", h.setIdentity)
 	mux.HandleFunc("/auth", h.authPage)
+	mux.HandleFunc("/set-auth", h.setAuth)
 	mux.HandleFunc("/header", h.addHeader)
 	mux.HandleFunc("/delete", h.deleteHeader)
 	mux.HandleFunc("/loglevel", h.setLogLevel)
@@ -50,6 +54,68 @@ type pageData struct {
 	ClientAddrs   []string
 	StatsEnabled  bool
 	Stats         []server.Stat
+	CSRFToken     string
+}
+
+// CSRF uses the double-submit pattern: a random token is stored in a cookie and
+// echoed in a hidden form field, and a request is honoured only when the two
+// match. Another origin can cause the browser to send the cookie but cannot
+// read it to populate the field. This matters because basic-auth credentials
+// are attached to cross-site requests automatically, so an authenticated
+// operator visiting a hostile page could otherwise have the proxy reconfigured
+// underneath them.
+const csrfCookieName = "proxy_csrf"
+const csrfFieldName = "csrf_token"
+
+func newCSRFToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// issueCSRF returns the caller's token, minting and setting one if needed.
+func (h *handler) issueCSRF(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie(csrfCookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
+	token, err := newCSRFToken()
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Error("Failed to generate CSRF token: %v", err)
+		}
+		return ""
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:  csrfCookieName,
+		Value: token,
+		// The UI is mounted under /ui by the router; scope the cookie to match.
+		Path:     "/ui",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+	})
+	return token
+}
+
+// checkCSRF reports whether a state-changing request carries a form token
+// matching its cookie, and writes the rejection when it does not.
+func (h *handler) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
+	cookie, err := r.Cookie(csrfCookieName)
+	if err != nil || cookie.Value == "" {
+		http.Error(w, "Missing CSRF cookie", http.StatusForbidden)
+		return false
+	}
+	sent := r.FormValue(csrfFieldName)
+	if sent == "" || subtle.ConstantTimeCompare([]byte(sent), []byte(cookie.Value)) != 1 {
+		if h.logger != nil {
+			h.logger.Warn("Rejected request with bad CSRF token", r.URL.Path)
+		}
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 var layout = template.Must(template.New("layout").Parse(`<!DOCTYPE html>
@@ -125,6 +191,7 @@ var generalPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "c
 {{end}}
 <h2>Add/Update Header</h2>
 <form method="POST" action="header">
+<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
 <label>Name: <input name="name"></label>
 <label>Value: <input name="value"></label>
 <label>Client: <input name="client" placeholder="(global)"></label>
@@ -132,6 +199,7 @@ var generalPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "c
 </form>
 <h2>Delete Header</h2>
 <form method="POST" action="delete">
+<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
 <label>Name: <input name="name"></label>
 <label>Client: <input name="client" placeholder="(global)"></label>
 <button type="submit">Delete</button>
@@ -140,6 +208,7 @@ var generalPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "c
 <h2>Log Level</h2>
 Current: {{.LogLevel}}
 <form method="POST" action="loglevel">
+<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
 <select name="level">
 <option>DEBUG</option>
 <option>INFO</option>
@@ -174,6 +243,7 @@ statsSrc.onmessage = function(e){
 {{end}}
 <h2>Analysis</h2>
 <form method="POST" action="stats">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <label><input type="checkbox" name="enabled" {{if .StatsEnabled}}checked{{end}}> Enable Analysis</label>
     <button type="submit">Save</button>
 </form>
@@ -182,6 +252,7 @@ statsSrc.onmessage = function(e){
 var identityPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
 <h2>Proxy Identity</h2>
 <form method="POST" action="set-identity">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <label>Name: <input name="name" value="{{.ProxyName}}"></label><br>
     <label>ID: <input name="id" value="{{.ProxyID}}"></label><br>
     <button type="submit">Save</button>
@@ -190,7 +261,8 @@ var identityPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "
 
 var authPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
 <h2>Authentication</h2>
-<form method="POST" action="auth">
+<form method="POST" action="set-auth">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <label><input type="checkbox" name="enabled" {{if .AuthEnabled}}checked{{end}}> Enable Auth</label><br>
     <label>User: <input name="username" value="{{.Username}}"></label><br>
     <label>Pass: <input type="password" name="password" placeholder="(unchanged)"></label><br>
@@ -198,19 +270,23 @@ var authPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "cont
 </form>
 {{end}}`))
 
-func (h *handler) makeData() pageData {
+func (h *handler) makeData(w http.ResponseWriter, r *http.Request) pageData {
 	enabled, user, _ := h.cfg.GetAuth()
+	// Read identity through the accessor: SetIdentity writes these under the
+	// config lock, so touching the fields directly races with any concurrent save.
+	proxyName, proxyID := h.cfg.GetIdentity()
 	data := pageData{
 		Headers:       h.cfg.GetHeaders(),
 		ClientHeaders: h.cfg.GetAllClientHeaders(),
 		LogLevel:      config.LevelString(h.cfg.GetLogLevel()),
 		AuthEnabled:   enabled,
 		Username:      user,
-		ProxyName:     h.cfg.ProxyName,
-		ProxyID:       h.cfg.ProxyID,
+		ProxyName:     proxyName,
+		ProxyID:       proxyID,
 		ClientCount:   0,
 		ClientAddrs:   nil,
 		StatsEnabled:  h.cfg.StatsEnabledState(),
+		CSRFToken:     h.issueCSRF(w, r),
 	}
 	if h.clients != nil {
 		data.ClientCount = h.clients.Count()
@@ -235,7 +311,7 @@ func (h *handler) general(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	generalPage.Execute(w, h.makeData())
+	generalPage.Execute(w, h.makeData(w, r))
 }
 
 func (h *handler) analytics(w http.ResponseWriter, r *http.Request) {
@@ -243,7 +319,7 @@ func (h *handler) analytics(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	analyticsPage.Execute(w, h.makeData())
+	analyticsPage.Execute(w, h.makeData(w, r))
 }
 
 func (h *handler) identityPage(w http.ResponseWriter, r *http.Request) {
@@ -251,7 +327,7 @@ func (h *handler) identityPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	identityPage.Execute(w, h.makeData())
+	identityPage.Execute(w, h.makeData(w, r))
 }
 
 func (h *handler) authPage(w http.ResponseWriter, r *http.Request) {
@@ -259,12 +335,15 @@ func (h *handler) authPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	authPage.Execute(w, h.makeData())
+	authPage.Execute(w, h.makeData(w, r))
 }
 
 func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.NotFound(w, r)
+		return
+	}
+	if !h.checkCSRF(w, r) {
 		return
 	}
 	name := r.FormValue("name")
@@ -291,6 +370,9 @@ func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !h.checkCSRF(w, r) {
+		return
+	}
 	name := r.FormValue("name")
 	client := r.FormValue("client")
 	if name != "" {
@@ -314,8 +396,15 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !h.checkCSRF(w, r) {
+		return
+	}
 	levelStr := r.FormValue("level")
-	level := config.ParseLogLevel(levelStr)
+	level, err := config.ParseLogLevelStrict(levelStr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	h.cfg.SetLogLevel(level)
 	if h.logger != nil {
 		h.logger.SetLevel(level)
@@ -330,6 +419,9 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 func (h *handler) setIdentity(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.NotFound(w, r)
+		return
+	}
+	if !h.checkCSRF(w, r) {
 		return
 	}
 	name := r.FormValue("name")
@@ -347,6 +439,9 @@ func (h *handler) setIdentity(w http.ResponseWriter, r *http.Request) {
 func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.NotFound(w, r)
+		return
+	}
+	if !h.checkCSRF(w, r) {
 		return
 	}
 	enabled := r.FormValue("enabled") == "on"
@@ -372,6 +467,9 @@ func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
 func (h *handler) setStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.NotFound(w, r)
+		return
+	}
+	if !h.checkCSRF(w, r) {
 		return
 	}
 	enabled := r.FormValue("enabled") == "on"

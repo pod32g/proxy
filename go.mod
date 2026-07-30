@@ -6,6 +6,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/pod32g/simple-logger v0.3.0
 	github.com/prometheus/client_golang v1.22.0
+	golang.org/x/crypto v0.31.0
 )
 
 require (

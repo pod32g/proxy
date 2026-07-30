@@ -36,6 +36,17 @@ go build -o proxy
 - `-db` – Path to the SQLite database used to persist runtime settings. Defaults to `config.db` or `PROXY_DB_PATH`.
 - `-stats` – Enable analysis of top visited websites. Can be set with `PROXY_STATS_ENABLED`.
 
+`-mode` and `-log-level` are validated at startup: an unrecognised value is an
+error rather than a silent fall back to `reverse` or `INFO`.
+
+### Configuration precedence
+
+Settings are resolved **flag > environment > stored > default**. Anything you
+pass explicitly wins over the value in the SQLite database, so a flag or
+environment variable in a deployment manifest is always the effective setting.
+Values you do *not* supply come from the database, which is how changes made
+through the UI survive a restart.
+
 ### Web UI
 
 A simple configuration UI is available at `/ui`. It now features a sidebar menu with links to pages for general settings, analytics, identity and authentication. You can add, update and delete custom headers while the proxy is running.
@@ -45,6 +56,34 @@ When enabled, the UI shows the top websites accessed through the proxy.
 The new Identity page lets you set a name and ID for the proxy which are sent on each upstream request using the `X-Proxy-Name` and `X-Proxy-Id` headers.
 
 More details about the interface and its pages can be found in [docs/GUI.md](docs/GUI.md).
+
+## Security notes
+
+- **The admin surface is only reachable by addressing the proxy directly.**
+  `/ui/`, `/api/` and `/metrics` are served for origin-form requests only. A
+  client asking the proxy to fetch `http://example.com/api/headers` gets
+  `example.com`, not the proxy's own configuration.
+- **Authentication is enforced per request.** Credentials changed through the UI
+  or API take effect immediately, with no restart. If authentication is enabled
+  without a usable username *and* password, the proxy fails closed and refuses
+  every request rather than passing traffic unauthenticated.
+- **Set `-secret` if you enable authentication.** Credentials are encrypted at
+  rest with AES-GCM under a scrypt-derived key and a per-database salt. Without
+  `-secret` they are stored in plaintext, and the proxy warns at startup.
+  Databases written by earlier versions are read transparently and re-encrypted
+  under the current scheme on the next save.
+- **The UI and API are CSRF-protected.** UI forms carry a double-submit token;
+  the JSON API requires an `application/json` body and rejects cross-origin
+  requests.
+- **Proxy credentials are not forwarded upstream.** `Proxy-Authorization` and
+  the other hop-by-hop headers are stripped before a request leaves the proxy.
+
+## Health checks
+
+`/healthz` returns `200 ok` and is answered before the authentication gate, so
+liveness and readiness probes keep working with `-auth` enabled. Like the rest
+of the admin surface it is only served for requests addressed to the proxy
+directly.
 
 ## Testing
 

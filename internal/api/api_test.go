@@ -23,6 +23,9 @@ func doReq(t *testing.T, h http.Handler, method, path string, body interface{}) 
 		json.NewEncoder(&buf).Encode(body)
 	}
 	req := httptest.NewRequest(method, path, &buf)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -93,5 +96,72 @@ func TestStatsEndpoint(t *testing.T) {
 	rec := doReq(t, h, "GET", "/stats", nil)
 	if rec.Code != 200 {
 		t.Fatalf("get stats")
+	}
+}
+
+// A cross-origin form POST is the shape that reaches an API without a CORS
+// preflight; it must not be honoured just because the caller is authenticated.
+func TestGuardRejectsCrossOriginAndFormPosts(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		origin      string
+		contentType string
+		want        int
+	}{
+		{"json, no origin", "", "application/json", http.StatusNoContent},
+		{"json, same origin", "http://example.com", "application/json", http.StatusNoContent},
+		{"json with charset", "", "application/json; charset=utf-8", http.StatusNoContent},
+		{"cross origin", "http://evil.test", "application/json", http.StatusForbidden},
+		{"form encoded", "", "application/x-www-form-urlencoded", http.StatusUnsupportedMediaType},
+		{"text plain", "", "text/plain", http.StatusUnsupportedMediaType},
+		{"no content type", "", "", http.StatusUnsupportedMediaType},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, h := newAPI()
+			var buf bytes.Buffer
+			json.NewEncoder(&buf).Encode(map[string]string{"name": "A", "value": "1"})
+			req := httptest.NewRequest("POST", "/headers", &buf)
+			req.Host = "example.com"
+			if tc.contentType != "" {
+				req.Header.Set("Content-Type", tc.contentType)
+			}
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("got %d, want %d", rec.Code, tc.want)
+			}
+			mutated := len(cfg.GetHeaders()) > 0
+			if mutated != (tc.want == http.StatusNoContent) {
+				t.Fatalf("config mutated=%v for status %d", mutated, rec.Code)
+			}
+		})
+	}
+}
+
+// Reads stay open to cross-origin callers; only mutations are gated.
+func TestGuardAllowsReads(t *testing.T) {
+	_, h := newAPI()
+	req := httptest.NewRequest("GET", "/headers", nil)
+	req.Header.Set("Origin", "http://evil.test")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+}
+
+// An invalid level is a caller error, not a reason to silently drop to INFO.
+func TestLogLevelRejectsInvalid(t *testing.T) {
+	cfg, h := newAPI()
+	cfg.SetLogLevel(config.ParseLogLevel("ERROR"))
+	rec := doReq(t, h, "POST", "/loglevel", map[string]string{"level": "VERBOSE"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+	if cfg.GetLogLevel() != config.ParseLogLevel("ERROR") {
+		t.Fatal("invalid level changed the configured level")
 	}
 }

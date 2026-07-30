@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"mime"
 	"net/http"
+	"net/url"
 
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/server"
@@ -18,7 +20,58 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, stats *ser
 	mux.HandleFunc("/auth", h.auth)
 	mux.HandleFunc("/identity", h.identity)
 	mux.HandleFunc("/stats", h.statsHandler)
-	return mux
+	return guard(mux, logger)
+}
+
+// guard rejects state-changing calls a browser could be induced to make from
+// another site. Two checks, for two shapes of the same attack:
+//
+//   - Origin, when present, must match the host being addressed.
+//   - The body must be declared as JSON. A cross-origin form POST — the one
+//     request shape that reaches us without a CORS preflight — cannot set that
+//     content type, and a fetch that does set it triggers a preflight we never
+//     answer.
+//
+// This matters because basic-auth credentials are attached to cross-site
+// requests automatically, so the caller being authenticated proves nothing
+// about who initiated the request.
+func guard(next http.Handler, logger *log.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			if !sameOrigin(r) {
+				if logger != nil {
+					logger.Warn("Rejected cross-origin API request from", r.Header.Get("Origin"))
+				}
+				http.Error(w, "Cross-origin request rejected", http.StatusForbidden)
+				return
+			}
+			if !isJSON(r) {
+				http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sameOrigin reports whether the request either omits Origin — a non-browser
+// client, which cannot be induced into a cross-site request — or names the
+// host it is already talking to.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return u.Host == r.Host
+}
+
+func isJSON(r *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mediaType == "application/json"
 }
 
 type handler struct {
@@ -111,7 +164,12 @@ func (h *handler) logLevel(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var req logLevelReq
 		json.NewDecoder(r.Body).Decode(&req)
-		lvl := config.ParseLogLevel(req.Level)
+		// Reject a typo instead of silently dropping the caller to INFO.
+		lvl, err := config.ParseLogLevelStrict(req.Level)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		h.cfg.SetLogLevel(lvl)
 		if h.logger != nil {
 			h.logger.SetLevel(lvl)

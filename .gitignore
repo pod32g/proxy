@@ -1,1 +1,15 @@
 .idea
+
+# Build output: `go build` and `go build -o proxy` both land at the repo root.
+/main
+/proxy
+
+# Runtime state. The SQLite config database holds credentials — encrypted only
+# when -secret is set — so it must never be committed.
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Test output
+coverage.out
