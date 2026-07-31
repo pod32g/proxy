@@ -1,11 +1,11 @@
 # Build stage
-FROM golang:1.23-bullseye AS builder
+FROM golang:1.25-bookworm AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-# CGO stays on: the config store uses mattn/go-sqlite3. Building against
-# bullseye's older glibc keeps the binary runnable on the bookworm runtime.
+# CGO stays on: the config store uses mattn/go-sqlite3. Build and runtime share
+# a bookworm base so the binary links against the glibc it will actually run on.
 RUN go build -o proxy ./
 
 # Runtime stage

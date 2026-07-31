@@ -1,12 +1,12 @@
 module github.com/pod32g/proxy
 
-go 1.23.3
+go 1.25.0
 
 require (
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/pod32g/simple-logger v0.3.0
 	github.com/prometheus/client_golang v1.22.0
-	golang.org/x/crypto v0.31.0
+	golang.org/x/crypto v0.54.0
 )
 
 require (
@@ -17,6 +17,6 @@ require (
 	github.com/prometheus/client_model v0.6.1 // indirect
 	github.com/prometheus/common v0.62.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
-	golang.org/x/sys v0.30.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	google.golang.org/protobuf v1.36.5 // indirect
 )
