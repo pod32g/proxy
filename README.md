@@ -154,6 +154,10 @@ kubectl apply -f k8s/
 Prometheus is exposed on port 9090 and Grafana on port 3000.
 
 
+## License
+
+Released under the [MIT License](LICENSE).
+
 ## Contributing
 
 Pull requests run the **Test** GitHub Actions workflow which executes `go test ./...`. Configure a branch protection rule on `main` so this check must succeed before merging.
