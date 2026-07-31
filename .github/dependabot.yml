@@ -1,0 +1,27 @@
+# Dependabot version updates. This file only takes effect on the default branch —
+# it previously lived only on a side branch named `dependabot`, which additionally
+# blocked Git from creating any `dependabot/*` branch and so broke updates and the
+# dependency-graph refresh entirely.
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # One PR per batch rather than one per module: the x/* modules move together,
+    # and a wall of single-dependency PRs is a wall nobody reads.
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
