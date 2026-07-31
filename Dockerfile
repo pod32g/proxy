@@ -27,5 +27,11 @@ ENV PROXY_DB_PATH=/var/lib/proxy/config.db
 
 USER 10001:10001
 EXPOSE 8080 8443
+
+# The binary probes itself: debian-slim ships neither curl nor wget, and adding
+# one just to make a single HTTP request would grow the image for nothing.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["proxy", "-healthcheck"]
+
 ENTRYPOINT ["proxy"]
 CMD ["-http", ":8080"]

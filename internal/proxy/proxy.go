@@ -20,13 +20,13 @@ func New(target *url.URL, logger *log.Logger, headers func(string) map[string]st
 	proxy.Director = func(req *http.Request) {
 		logger.Debug("Reverse proxy request", req.Method, sanitizedURL(req.URL))
 		originalDirector(req)
-		for k, v := range headers(req.RemoteAddr) {
+		for k, v := range headers(clientIP(req.RemoteAddr)) {
 			req.Header.Set(k, v)
 		}
 	}
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		logger.Error("Upstream Error: %v", err)
+		logger.Error("Upstream error:", err)
 		http.Error(rw, "Bad gateway", http.StatusBadGateway)
 	}
 

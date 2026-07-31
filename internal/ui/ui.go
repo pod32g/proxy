@@ -83,7 +83,7 @@ func (h *handler) issueCSRF(w http.ResponseWriter, r *http.Request) string {
 	token, err := newCSRFToken()
 	if err != nil {
 		if h.logger != nil {
-			h.logger.Error("Failed to generate CSRF token: %v", err)
+			h.logger.Error("Failed to generate CSRF token:", err)
 		}
 		return ""
 	}
@@ -122,9 +122,20 @@ var layout = template.Must(template.New("layout").Parse(`<!DOCTYPE html>
 <html>
 <head>
     <title>Proxy Config</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <!-- Styles are inline on purpose. A CDN <link> here would put a third
+         party in the page where credentials are set, and would leave the admin
+         UI unstyled and hanging on a blocked request in the restricted
+         networks a proxy tends to be deployed into. -->
     <style>
-    body { font-family: Arial, sans-serif; }
+    body { font-family: Arial, sans-serif; margin: 0; color: #212529; }
+    h1, h2, h3, h5 { margin: 0.6em 0 0.4em; }
+    .nav { list-style: none; padding: 0; margin: 0; }
+    .nav-item { margin: 0; }
+    .nav-link { display: block; padding: 8px 16px; color: #0d6efd; text-decoration: none; }
+    .nav-link:hover { background: #e9ecef; }
+    .text-center { text-align: center; }
+    button, input, select { font: inherit; padding: 3px 6px; }
+    button { cursor: pointer; }
     .sidebar {
         width: 220px;
         position: fixed;
@@ -234,10 +245,22 @@ var analyticsPage = template.Must(template.Must(layout.Clone()).Parse(`{{define 
 <script>
 var statsSrc = new EventSource('stats-events');
 statsSrc.onmessage = function(e){
-    var data = JSON.parse(e.data);
-    var html = '';
-    data.forEach(function(s){ html += '<tr><td>'+s.Host+'</td><td>'+s.Count+'</td></tr>'; });
-    document.querySelector('#top tbody').innerHTML = html;
+    var data = JSON.parse(e.data) || [];
+    var body = document.querySelector('#top tbody');
+    // Built as text nodes rather than an innerHTML string: hostnames come from
+    // whatever clients ask the proxy for, and the initial server render escapes
+    // them via html/template. Assembling markup here would have quietly undone
+    // that on the first live update.
+    body.replaceChildren();
+    data.forEach(function(s){
+        var tr = document.createElement('tr');
+        var host = document.createElement('td');
+        host.textContent = s.Host;
+        var count = document.createElement('td');
+        count.textContent = s.Count;
+        tr.appendChild(host); tr.appendChild(count);
+        body.appendChild(tr);
+    });
 };
 </script>
 {{end}}

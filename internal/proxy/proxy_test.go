@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	log "github.com/pod32g/simple-logger"
 )
@@ -69,7 +70,7 @@ func TestForwardAddsHeader(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	fp := NewForward(newLogger(), func(string) map[string]string { return map[string]string{"X-Test": "value"} })
+	fp := NewForward(newLogger(), func(string) map[string]string { return map[string]string{"X-Test": "value"} }, testPolicy())
 	proxySrv := httptest.NewServer(fp)
 	defer proxySrv.Close()
 
@@ -102,7 +103,7 @@ func TestForwardConnect(t *testing.T) {
 		close(done)
 	}()
 
-	fp := NewForward(newLogger(), func(string) map[string]string { return nil })
+	fp := NewForward(newLogger(), func(string) map[string]string { return nil }, testPolicy())
 	proxySrv := httptest.NewServer(fp)
 	defer proxySrv.Close()
 
@@ -125,7 +126,7 @@ func TestForwardConnect(t *testing.T) {
 }
 
 func TestForwardInvalidRequest(t *testing.T) {
-	fp := NewForward(newLogger(), func(string) map[string]string { return nil })
+	fp := NewForward(newLogger(), func(string) map[string]string { return nil }, testPolicy())
 	proxySrv := httptest.NewServer(fp)
 	defer proxySrv.Close()
 
@@ -153,7 +154,7 @@ func TestForwardStripsHopByHopHeaders(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	h := NewForward(newLogger(), func(string) map[string]string { return nil })
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, testPolicy())
 
 	req := httptest.NewRequest(http.MethodGet, origin.URL+"/", nil)
 	req.RequestURI = ""
@@ -203,7 +204,7 @@ func TestForwardStillAppliesConfiguredHeaders(t *testing.T) {
 
 	h := NewForward(newLogger(), func(string) map[string]string {
 		return map[string]string{"X-Proxy-Name": "edge", "X-Override": "from-proxy"}
-	})
+	}, testPolicy())
 	req := httptest.NewRequest(http.MethodGet, origin.URL+"/", nil)
 	req.RequestURI = ""
 	req.Header.Set("X-Override", "from-client")
@@ -211,5 +212,150 @@ func TestForwardStillAppliesConfiguredHeaders(t *testing.T) {
 
 	if got.Get("X-Proxy-Name") != "edge" || got.Get("X-Override") != "from-proxy" {
 		t.Fatalf("configured headers not applied: %v", got)
+	}
+}
+
+// Tests dial loopback listeners on arbitrary ports, which the shipping default
+// deliberately refuses. Policy behaviour has its own tests below.
+func testPolicy() Policy {
+	return Policy{AllowPrivate: true, ConnectPorts: allPorts()}
+}
+
+func allPorts() []int {
+	out := make([]int, 0, 65535)
+	for i := 1; i <= 65535; i++ {
+		out = append(out, i)
+	}
+	return out
+}
+
+// A forward proxy takes destinations from untrusted clients, so the default
+// must not let them reach the proxy host's own network.
+func TestPolicyBlocksPrivateDestinations(t *testing.T) {
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("SECRET"))
+	}))
+	defer internal.Close()
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, Policy{})
+	req := httptest.NewRequest(http.MethodGet, internal.URL+"/", nil)
+	req.RequestURI = ""
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("got %d %q, want 403", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "SECRET") {
+		t.Fatal("internal response body reached the client")
+	}
+}
+
+func TestPolicyAllowPrivateOptsBackIn(t *testing.T) {
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("SECRET"))
+	}))
+	defer internal.Close()
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{AllowPrivate: true})
+	req := httptest.NewRequest(http.MethodGet, internal.URL+"/", nil)
+	req.RequestURI = ""
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), "SECRET") {
+		t.Fatalf("opt-in did not take effect: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// An unrestricted CONNECT is a general-purpose TCP relay, so the port list is
+// enforced before anything is dialled.
+func TestPolicyRestrictsConnectPorts(t *testing.T) {
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{AllowPrivate: true}) // default port list: 443 only
+
+	for _, tc := range []struct {
+		target string
+		want   int
+	}{
+		{"127.0.0.1:25", http.StatusForbidden},
+		{"127.0.0.1:22", http.StatusForbidden},
+		{"127.0.0.1:6379", http.StatusForbidden},
+	} {
+		req := httptest.NewRequest(http.MethodConnect, "http://"+tc.target, nil)
+		req.Host = tc.target
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("CONNECT %s: got %d, want %d", tc.target, rec.Code, tc.want)
+		}
+	}
+}
+
+// Per-client header rules are configured against an address an operator can
+// read off the UI, which never carries the ephemeral source port.
+func TestClientHeadersKeyedByIP(t *testing.T) {
+	var got http.Header
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}))
+	defer origin.Close()
+
+	lookups := []string{}
+	h := NewForward(newLogger(), func(client string) map[string]string {
+		lookups = append(lookups, client)
+		if client == "192.0.2.10" {
+			return map[string]string{"X-Team": "blue"}
+		}
+		return nil
+	}, testPolicy())
+
+	req := httptest.NewRequest(http.MethodGet, origin.URL+"/", nil)
+	req.RequestURI = ""
+	req.RemoteAddr = "192.0.2.10:54321"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got.Get("X-Team") != "blue" {
+		t.Fatalf("client header not applied; lookups were %v", lookups)
+	}
+}
+
+func TestClientIPStripsPort(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"192.0.2.10:54321", "192.0.2.10"},
+		{"[2001:db8::1]:443", "2001:db8::1"},
+		{"192.0.2.10", "192.0.2.10"},
+		{"", ""},
+	} {
+		if got := clientIP(tc.in); got != tc.want {
+			t.Errorf("clientIP(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The destination policy must apply to CONNECT as well as plain HTTP — an
+// allowed port to a loopback address is still a pivot into the proxy host.
+func TestPolicyBlocksPrivateConnectDestination(t *testing.T) {
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{ConnectPorts: []int{9111}}) // port allowed, address not
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Written in one shot and the connection held open: closing the write side
+	// would cancel the request context and abort the dial before the policy
+	// check could report anything.
+	fmt.Fprint(conn, "CONNECT 127.0.0.1:9111 HTTP/1.1\r\nHost: 127.0.0.1:9111\r\n\r\n")
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("no response: %v", err)
+	}
+	if !strings.Contains(line, "403") {
+		t.Fatalf("got %q, want 403 for a loopback CONNECT target", strings.TrimSpace(line))
 	}
 }

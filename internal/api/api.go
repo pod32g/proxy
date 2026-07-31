@@ -92,18 +92,39 @@ type logLevelReq struct {
 }
 
 type authReq struct {
-	Enabled  bool   `json:"enabled"`
+	// A pointer so an omitted field is distinguishable from an explicit false.
+	// Decoding into a plain bool meant any body that failed to parse — or simply
+	// left the field out — read as "disable authentication".
+	Enabled  *bool  `json:"enabled"`
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
 
 type statsReq struct {
-	Enabled bool `json:"enabled"`
+	Enabled *bool `json:"enabled"`
 }
 
 type identityReq struct {
 	Name string `json:"name"`
 	ID   string `json:"id"`
+}
+
+// maxBodyBytes caps request bodies. These are small config documents; anything
+// larger is a mistake or an attempt to make the proxy allocate.
+const maxBodyBytes = 64 << 10
+
+// decodeJSON reads the body into v, or writes a 400 and reports false.
+//
+// The error used to be discarded, which left the request struct at its zero
+// value and made the handler apply those zeros as though the caller had asked
+// for them — a garbled body turned authentication off and answered 204.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err := dec.Decode(v); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
@@ -120,7 +141,9 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 		})
 	case http.MethodPost:
 		var req headerReq
-		json.NewDecoder(r.Body).Decode(&req)
+		if !decodeJSON(w, r, &req) {
+			return
+		}
 		if req.Name != "" {
 			if req.Client == "" {
 				h.cfg.SetHeader(req.Name, req.Value)
@@ -137,7 +160,9 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodDelete:
 		var req headerReq
-		json.NewDecoder(r.Body).Decode(&req)
+		if !decodeJSON(w, r, &req) {
+			return
+		}
 		if req.Name != "" {
 			if req.Client == "" {
 				h.cfg.DeleteHeader(req.Name)
@@ -163,7 +188,9 @@ func (h *handler) logLevel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"level": config.LevelString(h.cfg.GetLogLevel())})
 	case http.MethodPost:
 		var req logLevelReq
-		json.NewDecoder(r.Body).Decode(&req)
+		if !decodeJSON(w, r, &req) {
+			return
+		}
 		// Reject a typo instead of silently dropping the caller to INFO.
 		lvl, err := config.ParseLogLevelStrict(req.Level)
 		if err != nil {
@@ -191,8 +218,14 @@ func (h *handler) auth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"enabled": enabled, "username": user})
 	case http.MethodPost:
 		var req authReq
-		json.NewDecoder(r.Body).Decode(&req)
-		h.cfg.SetAuth(req.Enabled, req.Username, req.Password)
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.Enabled == nil {
+			http.Error(w, `"enabled" is required`, http.StatusBadRequest)
+			return
+		}
+		h.cfg.SetAuth(*req.Enabled, req.Username, req.Password)
 		if h.logger != nil {
 			h.logger.Info("updated auth settings")
 		}
@@ -212,7 +245,9 @@ func (h *handler) identity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"name": name, "id": id})
 	case http.MethodPost:
 		var req identityReq
-		json.NewDecoder(r.Body).Decode(&req)
+		if !decodeJSON(w, r, &req) {
+			return
+		}
 		h.cfg.SetIdentity(req.Name, req.ID)
 		if h.logger != nil {
 			h.logger.Info("updated identity")
@@ -236,10 +271,16 @@ func (h *handler) statsHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, data)
 	case http.MethodPost:
 		var req statsReq
-		json.NewDecoder(r.Body).Decode(&req)
-		h.cfg.SetStatsEnabled(req.Enabled)
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.Enabled == nil {
+			http.Error(w, `"enabled" is required`, http.StatusBadRequest)
+			return
+		}
+		h.cfg.SetStatsEnabled(*req.Enabled)
 		if h.logger != nil {
-			h.logger.Info("Set stats enabled", req.Enabled)
+			h.logger.Info("Set stats enabled", *req.Enabled)
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)

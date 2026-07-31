@@ -2,4 +2,12 @@ scrape_configs:
   - job_name: 'proxy'
     metrics_path: /metrics
     static_configs:
+      # Matches the service name in docker-compose.yml.
       - targets: ['proxy:8080']
+    # /metrics sits behind the proxy's auth gate. The compose stack sets
+    # PROXY_METRICS_PUBLIC=true so this scrape works; if you enable auth and
+    # leave metrics gated instead, uncomment and fill this in, or every scrape
+    # will 401 and the target will silently go down.
+    # basic_auth:
+    #   username: admin
+    #   password: secret

@@ -35,6 +35,11 @@ go build -o proxy
 - `-log-level` – Logging level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`). Defaults to `INFO` or `PROXY_LOG_LEVEL`.
 - `-db` – Path to the SQLite database used to persist runtime settings. Defaults to `config.db` or `PROXY_DB_PATH`.
 - `-stats` – Enable analysis of top visited websites. Can be set with `PROXY_STATS_ENABLED`.
+- `-allow-private` – Permit proxying to loopback, private and link-local addresses. **Off by default.** Can be set with `PROXY_ALLOW_PRIVATE`.
+- `-connect-ports` – Comma-separated ports `CONNECT` may tunnel to. Defaults to `443` or `PROXY_CONNECT_PORTS`.
+- `-health-path` – Unauthenticated liveness path. Defaults to `/healthz` or `PROXY_HEALTH_PATH`; empty disables it.
+- `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
+- `-healthcheck` – Probe the local health endpoint and exit 0 or 1, instead of starting the proxy. Used by the container `HEALTHCHECK`.
 
 `-mode` and `-log-level` are validated at startup: an unrecognised value is an
 error rather than a silent fall back to `reverse` or `INFO`.
@@ -77,6 +82,17 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
   requests.
 - **Proxy credentials are not forwarded upstream.** `Proxy-Authorization` and
   the other hop-by-hop headers are stripped before a request leaves the proxy.
+- **Destinations are restricted by default.** A forward proxy takes destinations
+  from untrusted clients, so loopback, private and link-local addresses are
+  refused unless you pass `-allow-private`. The check runs on the resolved IP,
+  after DNS, so a hostname pointing at `127.0.0.1` does not get through either.
+- **`CONNECT` is limited to port 443** unless `-connect-ports` says otherwise.
+  An unrestricted `CONNECT` is a general-purpose TCP relay.
+- **Failed logins are logged and throttled.** Ten failures from one address
+  within a minute earn a `429` for the rest of that minute, and every failure
+  increments `proxy_auth_failures_total`.
+- **Proxied requests are challenged with `407`** and `Proxy-Authenticate`, as
+  RFC 7235 requires; requests addressed to the proxy itself get `401`.
 
 ## Health checks
 
@@ -84,6 +100,26 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
 liveness and readiness probes keep working with `-auth` enabled. Like the rest
 of the admin surface it is only served for requests addressed to the proxy
 directly.
+
+In **reverse** mode every request is origin-form, so this path shadows a backend
+that serves the same route. Move it with `-health-path` (the Kubernetes manifest
+uses `/_proxy/healthz`) or disable it with `-health-path ""`.
+
+## Web interfaces
+
+There are two, and `/ui` is the canonical one — server-rendered, CSRF-protected,
+and covering headers, analytics, identity and authentication.
+
+`web/` is a standalone browser client for the JSON API, served by
+`cmd/webserver` for development. It has no identity or authentication page.
+Point it at a running proxy:
+
+```sh
+go run ./cmd/webserver -api http://localhost:8080
+```
+
+Without `-api` it assumes the API is same-origin, which is only true behind a
+reverse proxy that routes `/api/` to the proxy itself.
 
 ## Testing
 

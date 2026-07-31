@@ -7,7 +7,7 @@ import (
 )
 
 func TestNewHandlerServesFiles(t *testing.T) {
-	h := newHandler("../../web")
+	h := newHandler("../../web", "")
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 

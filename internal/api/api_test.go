@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/pod32g/proxy/internal/config"
@@ -163,5 +164,70 @@ func TestLogLevelRejectsInvalid(t *testing.T) {
 	}
 	if cfg.GetLogLevel() != config.ParseLogLevel("ERROR") {
 		t.Fatal("invalid level changed the configured level")
+	}
+}
+
+// A body that fails to parse must not be applied as a set of zero values. This
+// used to turn authentication off and answer 204.
+func TestMalformedBodyIsRejected(t *testing.T) {
+	for _, path := range []string{"/auth", "/stats", "/headers", "/identity", "/loglevel"} {
+		t.Run(path, func(t *testing.T) {
+			cfg, h := newAPI()
+			cfg.SetAuth(true, "alice", "s3cret")
+			cfg.SetStatsEnabled(true)
+
+			req := httptest.NewRequest("POST", path, strings.NewReader("{ not json"))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("got %d, want 400", rec.Code)
+			}
+			if enabled, _, _ := cfg.GetAuth(); !enabled {
+				t.Error("a malformed body disabled authentication")
+			}
+			if !cfg.StatsEnabledState() {
+				t.Error("a malformed body disabled stats")
+			}
+		})
+	}
+}
+
+// An omitted boolean is not the same as an explicit false: absent means "say
+// what you mean", not "turn it off".
+func TestBooleanFieldsMustBePresent(t *testing.T) {
+	cfg, h := newAPI()
+	cfg.SetAuth(true, "alice", "s3cret")
+
+	rec := doReq(t, h, "POST", "/auth", map[string]string{"username": "bob"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+	if enabled, user, _ := cfg.GetAuth(); !enabled || user != "alice" {
+		t.Fatalf("request was partially applied: enabled=%v user=%q", enabled, user)
+	}
+
+	// Explicitly false still works.
+	rec2 := doReq(t, h, "POST", "/auth", map[string]interface{}{"enabled": false})
+	if rec2.Code != http.StatusNoContent {
+		t.Fatalf("explicit false: got %d", rec2.Code)
+	}
+	if enabled, _, _ := cfg.GetAuth(); enabled {
+		t.Error("explicit false was not applied")
+	}
+}
+
+// Bodies are capped so a config endpoint cannot be used to make the proxy
+// allocate without limit.
+func TestOversizedBodyIsRejected(t *testing.T) {
+	_, h := newAPI()
+	req := httptest.NewRequest("POST", "/headers",
+		strings.NewReader(`{"name":"X","value":"`+strings.Repeat("a", maxBodyBytes+1024)+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
 	}
 }

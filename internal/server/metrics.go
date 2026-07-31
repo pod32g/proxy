@@ -12,12 +12,17 @@ import (
 )
 
 type Metrics struct {
-	Requests *prometheus.CounterVec
-	Duration *prometheus.HistogramVec
-	Clients  prometheus.Gauge
+	Requests     *prometheus.CounterVec
+	Duration     *prometheus.HistogramVec
+	Clients      prometheus.Gauge
+	AuthFailures prometheus.Counter
 }
 
-func NewMetrics() *Metrics {
+// NewMetrics builds the collectors and registers them with reg. Taking a
+// registerer rather than reaching for the global default means a second
+// instance — a test, or two proxies in one process — gets its own registry
+// instead of panicking on duplicate registration.
+func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 	m := &Metrics{
 		Requests: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
@@ -40,9 +45,22 @@ func NewMetrics() *Metrics {
 				Help: "Number of active client connections",
 			},
 		),
+		AuthFailures: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "proxy_auth_failures_total",
+				Help: "Total number of rejected authentication attempts",
+			},
+		),
 	}
-	prometheus.MustRegister(m.Requests, m.Duration, m.Clients)
-	return m
+	if reg == nil {
+		reg = prometheus.DefaultRegisterer
+	}
+	for _, c := range []prometheus.Collector{m.Requests, m.Duration, m.Clients, m.AuthFailures} {
+		if err := reg.Register(c); err != nil {
+			return nil, err
+		}
+	}
+	return m, nil
 }
 
 // MetricsMiddleware records Prometheus metrics for requests.
@@ -52,12 +70,19 @@ func MetricsMiddleware(next http.Handler, m *Metrics) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		rec := &statusRecorder{ResponseWriter: w}
 		start := time.Now()
 		next.ServeHTTP(rec, r)
 		dur := time.Since(start).Seconds()
+		// status stays 0 when the handler neither wrote nor set a code — a
+		// hijacked CONNECT, for instance. That is a 200 as far as the client
+		// is concerned.
+		code := rec.status
+		if code == 0 {
+			code = http.StatusOK
+		}
 		m.Duration.WithLabelValues(r.Method).Observe(dur)
-		m.Requests.WithLabelValues(r.Method, strconv.Itoa(rec.status)).Inc()
+		m.Requests.WithLabelValues(r.Method, strconv.Itoa(code)).Inc()
 	})
 }
 
@@ -93,16 +118,6 @@ func (r *statusRecorder) Flush() {
 	if fl, ok := r.ResponseWriter.(http.Flusher); ok {
 		fl.Flush()
 	}
-}
-
-// CloseNotify lets callers be signaled when the client disconnects
-func (r *statusRecorder) CloseNotify() <-chan bool {
-	if cn, ok := r.ResponseWriter.(http.CloseNotifier); ok {
-		return cn.CloseNotify()
-	}
-	// if not supported, return a channel that never fires
-	ch := make(chan bool)
-	return ch
 }
 
 // Push enables HTTP/2 server push

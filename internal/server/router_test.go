@@ -133,10 +133,11 @@ func TestRouterAuthFailsClosed(t *testing.T) {
 // path collides with the admin surface.
 func TestAdminSurfaceNotReachableThroughProxy(t *testing.T) {
 	r := &Router{
-		Proxy:   okHandler("PROXIED"),
-		API:     okHandler("ADMIN-API"),
-		UI:      okHandler("ADMIN-UI"),
-		Metrics: okHandler("ADMIN-METRICS"),
+		Proxy:      okHandler("PROXIED"),
+		API:        okHandler("ADMIN-API"),
+		UI:         okHandler("ADMIN-UI"),
+		Metrics:    okHandler("ADMIN-METRICS"),
+		HealthPath: DefaultHealthPath,
 	}
 	for _, target := range []string{
 		"http://example.com/api/headers",
@@ -186,7 +187,7 @@ func TestAdminSurfaceReachableDirectly(t *testing.T) {
 
 // Probes must work without credentials; nothing else may.
 func TestHealthzBypassesAuth(t *testing.T) {
-	r := &Router{Proxy: okHandler("proxied"), Auth: staticAuth(true, "user", "pass")}
+	r := &Router{Proxy: okHandler("proxied"), Auth: staticAuth(true, "user", "pass"), HealthPath: DefaultHealthPath}
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -227,5 +228,145 @@ func TestProxyBasicAuthParsing(t *testing.T) {
 				t.Fatalf("got (%q, %q, %v), want (%q, %q, %v)", user, pass, ok, tc.user, tc.pass, tc.ok)
 			}
 		})
+	}
+}
+
+// A request the proxy was asked to forward needs 407, not 401: curl
+// --proxy-user and most HTTP libraries only retry with Proxy-Authorization
+// when they see 407.
+func TestProxiedRequestGets407(t *testing.T) {
+	r := &Router{Proxy: okHandler("proxied"), Auth: staticAuth(true, "u", "p")}
+
+	proxied := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, proxied)
+	if rec.Code != http.StatusProxyAuthRequired {
+		t.Errorf("proxied: got %d, want 407", rec.Code)
+	}
+	if rec.Header().Get("Proxy-Authenticate") == "" {
+		t.Error("proxied: missing Proxy-Authenticate")
+	}
+
+	// A request addressed to the proxy itself still gets the ordinary 401.
+	direct := httptest.NewRequest(http.MethodGet, "/ui/general", nil)
+	rec2 := httptest.NewRecorder()
+	r.ServeHTTP(rec2, direct)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Errorf("direct: got %d, want 401", rec2.Code)
+	}
+	if rec2.Header().Get("WWW-Authenticate") == "" {
+		t.Error("direct: missing WWW-Authenticate")
+	}
+}
+
+// Repeated wrong credentials from one source are throttled rather than
+// answered at line rate forever.
+func TestAuthFailuresAreThrottled(t *testing.T) {
+	r := &Router{Proxy: okHandler("proxied"), Auth: staticAuth(true, "u", "p")}
+	attempt := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.9:40000"
+		req.SetBasicAuth("u", "wrong")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+	for i := 0; i < authFailureLimit; i++ {
+		if got := attempt().Code; got != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: got %d, want 401", i+1, got)
+		}
+	}
+	rec := attempt()
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("after %d failures: got %d, want 429", authFailureLimit, rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("429 without Retry-After")
+	}
+
+	// A different source is unaffected — the limit is per-source, not global.
+	other := httptest.NewRequest(http.MethodGet, "/", nil)
+	other.RemoteAddr = "203.0.113.10:40000"
+	other.SetBasicAuth("u", "p")
+	rec2 := httptest.NewRecorder()
+	r.ServeHTTP(rec2, other)
+	if rec2.Code != http.StatusOK {
+		t.Errorf("unrelated source got %d, want 200", rec2.Code)
+	}
+}
+
+// A successful login clears the counter, so an operator who mistypes a few
+// times and then gets it right is not left locked out.
+func TestSuccessClearsAuthFailures(t *testing.T) {
+	r := &Router{Proxy: okHandler("proxied"), Auth: staticAuth(true, "u", "p")}
+	send := func(pass string) int {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.11:40000"
+		req.SetBasicAuth("u", pass)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for i := 0; i < authFailureLimit-1; i++ {
+		send("wrong")
+	}
+	if got := send("p"); got != http.StatusOK {
+		t.Fatalf("correct password rejected: %d", got)
+	}
+	for i := 0; i < authFailureLimit-1; i++ {
+		if got := send("wrong"); got != http.StatusUnauthorized {
+			t.Fatalf("counter was not reset: got %d on attempt %d", got, i+1)
+		}
+	}
+}
+
+// The health path is configurable so reverse mode can stop shadowing a backend
+// that serves the same route.
+func TestHealthPathConfigurable(t *testing.T) {
+	backend := okHandler("BACKEND-HEALTH")
+
+	off := &Router{Proxy: backend, HealthPath: ""}
+	rec := httptest.NewRecorder()
+	off.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Body.String() != "BACKEND-HEALTH" {
+		t.Errorf("disabled: got %q, want the backend's response", rec.Body.String())
+	}
+
+	moved := &Router{Proxy: backend, HealthPath: "/_proxy_health"}
+	rec2 := httptest.NewRecorder()
+	moved.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec2.Body.String() != "BACKEND-HEALTH" {
+		t.Errorf("moved: /healthz should reach the backend, got %q", rec2.Body.String())
+	}
+	rec3 := httptest.NewRecorder()
+	moved.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/_proxy_health", nil))
+	if rec3.Code != http.StatusOK || rec3.Body.String() != "ok\n" {
+		t.Errorf("moved: got %d %q", rec3.Code, rec3.Body.String())
+	}
+}
+
+// Scrapers send no credentials, so enabling auth must not silently take
+// monitoring down when the operator has opted into a public metrics endpoint.
+func TestMetricsPublicBypassesAuth(t *testing.T) {
+	gated := &Router{Proxy: okHandler("p"), Metrics: okHandler("# HELP"), Auth: staticAuth(true, "u", "p")}
+	rec := httptest.NewRecorder()
+	gated.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("default should stay gated, got %d", rec.Code)
+	}
+
+	public := &Router{Proxy: okHandler("p"), Metrics: okHandler("# HELP"),
+		Auth: staticAuth(true, "u", "p"), MetricsPublic: true}
+	rec2 := httptest.NewRecorder()
+	public.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec2.Code != http.StatusOK {
+		t.Errorf("metrics-public: got %d, want 200", rec2.Code)
+	}
+
+	// The exemption must not leak to anything else.
+	rec3 := httptest.NewRecorder()
+	public.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/ui/general", nil))
+	if rec3.Code != http.StatusUnauthorized {
+		t.Errorf("exemption leaked: got %d", rec3.Code)
 	}
 }

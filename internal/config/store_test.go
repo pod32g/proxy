@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	log "github.com/pod32g/simple-logger"
 )
@@ -195,4 +196,60 @@ func TestStoreSaveLoad(t *testing.T) {
 		t.Fatalf("id mismatch")
 	}
 	store.Close()
+}
+
+// Save runs on the request path, so it must not re-derive the scrypt key each
+// time. The parameters are deliberately expensive; the key is not.
+func TestSaveDoesNotRederiveKey(t *testing.T) {
+	store := newTestStore(t)
+	defer store.Close()
+
+	cfg := &Config{SecretKey: "s3kr1t"}
+	cfg.SetAuth(true, "alice", "s3cret")
+	if err := store.Save(cfg); err != nil { // warm: pays for the derivation once
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		if err := store.Save(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	per := time.Since(start) / 20
+	if per > 10*time.Millisecond {
+		t.Errorf("Save() costs %v per call; the key is being re-derived", per.Round(time.Millisecond))
+	}
+}
+
+// A secret that cannot open the stored credentials keeps the live ones — but
+// silently doing so leaves the operator with no idea it happened.
+func TestWrongSecretWarns(t *testing.T) {
+	store := newTestStore(t)
+	defer store.Close()
+
+	saved := &Config{SecretKey: "right"}
+	saved.SetAuth(true, "u", "p")
+	if err := store.Save(saved); err != nil {
+		t.Fatal(err)
+	}
+	store.Warnings() // drain anything from the save
+
+	loaded := &Config{SecretKey: "wrong"}
+	loaded.SetAuth(true, "flag-user", "flag-pass")
+	if err := store.Load(loaded); err != nil {
+		t.Fatal(err)
+	}
+	warnings := store.Warnings()
+	if len(warnings) == 0 {
+		t.Fatal("no warning emitted for undecryptable credentials")
+	}
+	joined := strings.Join(warnings, "\n")
+	if !strings.Contains(joined, "username") || !strings.Contains(joined, "password") {
+		t.Errorf("warnings do not name the affected settings: %q", joined)
+	}
+	// Warnings are drained once read, so a caller cannot log them twice.
+	if len(store.Warnings()) != 0 {
+		t.Error("warnings were not cleared after reading")
+	}
 }

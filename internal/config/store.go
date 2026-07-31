@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -8,9 +9,11 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/scrypt"
@@ -19,6 +22,89 @@ import (
 // Store provides persistence for Config using SQLite.
 type Store struct {
 	db *sql.DB
+
+	// Deriving the encryption key is deliberately expensive, and the inputs
+	// only change when the operator changes -secret or the database is
+	// replaced. Caching it keeps that cost at startup instead of on every
+	// configuration write, which Save is called from on the request path.
+	keyMu      sync.Mutex
+	cachedKey  []byte
+	cachedFor  string
+	cachedSalt []byte
+
+	// warnMu guards diagnostics collected before a logger exists. Load runs
+	// before the log level is known, so anything worth saying is buffered for
+	// the caller to emit once it can.
+	warnMu   sync.Mutex
+	warnings []string
+}
+
+func (s *Store) warn(format string, args ...interface{}) {
+	s.warnMu.Lock()
+	s.warnings = append(s.warnings, fmt.Sprintf(format, args...))
+	s.warnMu.Unlock()
+}
+
+// Warnings returns and clears diagnostics gathered since the last call.
+func (s *Store) Warnings() []string {
+	if s == nil {
+		return nil
+	}
+	s.warnMu.Lock()
+	defer s.warnMu.Unlock()
+	out := s.warnings
+	s.warnings = nil
+	return out
+}
+
+// key returns the AES key for secret and salt, deriving it at most once per
+// distinct pair.
+func (s *Store) key(secret string, salt []byte) ([]byte, error) {
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	if s.cachedKey != nil && s.cachedFor == secret && bytes.Equal(s.cachedSalt, salt) {
+		return s.cachedKey, nil
+	}
+	k, err := deriveKey(secret, salt)
+	if err != nil {
+		return nil, err
+	}
+	s.cachedKey, s.cachedFor = k, secret
+	s.cachedSalt = append([]byte(nil), salt...)
+	return k, nil
+}
+
+// sealCredential is encrypt using the cached key.
+func (s *Store) sealCredential(secret string, salt []byte, plain string) (string, error) {
+	if len(salt) == 0 {
+		return "", errors.New("missing kdf salt")
+	}
+	k, err := s.key(secret, salt)
+	if err != nil {
+		return "", err
+	}
+	out, err := seal(k, plain)
+	if err != nil {
+		return "", err
+	}
+	return cipherV2Prefix + out, nil
+}
+
+// openCredential is decrypt using the cached key, still falling back to the
+// legacy derivation for ciphertext written by older builds.
+func (s *Store) openCredential(secret string, salt []byte, cipherText string) (string, error) {
+	tagged, ok := strings.CutPrefix(cipherText, cipherV2Prefix)
+	if !ok {
+		return open(deriveKeyLegacy(secret), cipherText)
+	}
+	if len(salt) == 0 {
+		return "", errors.New("missing kdf salt")
+	}
+	k, err := s.key(secret, salt)
+	if err != nil {
+		return "", err
+	}
+	return open(k, tagged)
 }
 
 // Ciphertext written by this package is tagged so the key derivation can be
@@ -239,10 +325,10 @@ func (s *Store) Load(cfg *Config) error {
 
 	_, user, pass := cfg.GetAuth()
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='username'`).Scan(&val); err == nil {
-		user = s.plaintext(cfg.SecretKey, salt, val, user)
+		user = s.plaintext(cfg.SecretKey, salt, val, user, "username")
 	}
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='password'`).Scan(&val); err == nil {
-		pass = s.plaintext(cfg.SecretKey, salt, val, pass)
+		pass = s.plaintext(cfg.SecretKey, salt, val, pass, "password")
 	}
 	cfg.SetCredentials(user, pass)
 	return nil
@@ -251,12 +337,18 @@ func (s *Store) Load(cfg *Config) error {
 // plaintext decodes a stored credential, falling back to the value already in
 // the config when the secret cannot open it — a wrong -secret should not
 // silently blank out working credentials.
-func (s *Store) plaintext(secret string, salt []byte, stored, current string) string {
+func (s *Store) plaintext(secret string, salt []byte, stored, current, what string) string {
 	if secret == "" {
 		return stored
 	}
-	dec, err := decrypt(secret, salt, stored)
+	dec, err := s.openCredential(secret, salt, stored)
 	if err != nil {
+		// Keeping the live value is deliberate — a mistyped -secret must not
+		// blank working credentials — but doing it silently leaves the operator
+		// with no idea the stored value was unreadable, and the next Save
+		// re-seals under the new secret and orphans it for good.
+		s.warn("stored %s could not be decrypted with the configured -secret; "+
+			"keeping the value from flags/environment, and the next save will replace it", what)
 		return current
 	}
 	return dec
@@ -300,12 +392,12 @@ func (s *Store) Save(cfg *Config) error {
 		}
 		// Only substitute the ciphertext if sealing succeeded; writing the
 		// plaintext because encryption failed would be the worst outcome.
-		if enc, err := encrypt(cfg.SecretKey, salt, user); err == nil {
+		if enc, err := s.sealCredential(cfg.SecretKey, salt, user); err == nil {
 			user = enc
 		} else {
 			return err
 		}
-		if enc, err := encrypt(cfg.SecretKey, salt, pass); err == nil {
+		if enc, err := s.sealCredential(cfg.SecretKey, salt, pass); err == nil {
 			pass = enc
 		} else {
 			return err

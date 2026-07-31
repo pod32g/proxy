@@ -6,6 +6,11 @@
 # https://github.com/actions/labeler
 
 name: Labeler
+# pull_request_target runs with a read/write token against the base repository
+# and is triggered by anyone who can open a pull request. This workflow is only
+# safe because it never checks out the PR head and never runs code from it —
+# do not add actions/checkout, a build step, or any script here. If this job
+# ever needs the PR contents, split it into a pull_request workflow instead.
 on: [pull_request_target]
 
 jobs:

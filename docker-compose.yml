@@ -1,14 +1,40 @@
-version: '3'
+# Brings up the proxy together with its monitoring. The proxy service is what
+# prometheus.yml scrapes by hostname — without it the stack starts, Grafana
+# shows nothing, and the scrape target never resolves.
 services:
+  proxy:
+    build:
+      context: .
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    environment:
+      PROXY_MODE: forward
+      PROXY_LOG_LEVEL: INFO
+      PROXY_STATS_ENABLED: "true"
+      # Prometheus scrapes without credentials. Metrics are exposed on the same
+      # port as the proxy, so this is only appropriate because the port is not
+      # published to an untrusted network in this compose file.
+      PROXY_METRICS_PUBLIC: "true"
+      PROXY_DB_PATH: /var/lib/proxy/config.db
+    volumes:
+      - proxydata:/var/lib/proxy
+
   prometheus:
     image: prom/prometheus
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
+    depends_on:
+      - proxy
+
   grafana:
     image: grafana/grafana
     ports:
       - "3000:3000"
     depends_on:
       - prometheus
+
+volumes:
+  proxydata:
