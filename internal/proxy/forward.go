@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,6 +19,7 @@ import (
 	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/reqid"
+	"github.com/pod32g/proxy/internal/upstream"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -45,6 +48,12 @@ type Policy struct {
 	// request so edits take effect without a restart. Applied after the
 	// hop-by-hop strip, which they cannot precede or undo.
 	HeaderRules func(clientIP string) *header.RuleSet
+
+	// Upstream, when configured, is a parent proxy every request is forwarded
+	// through rather than dialling origins directly.
+	//
+	// It moves where the destination policy is enforced. See checkDestination.
+	Upstream *upstream.Proxy
 
 	// UpstreamTLS configures outbound TLS: an additional trust bundle, a client
 	// certificate, or both. Nil uses the system trust store.
@@ -260,6 +269,56 @@ func (p Policy) dialer() *net.Dialer {
 	}
 }
 
+// chained reports whether a destination goes through the parent proxy.
+func (p Policy) chained(hostport string) bool {
+	return p.Upstream.Configured() && !p.Upstream.Bypass(hostport)
+}
+
+// checkDestination evaluates the destination policy against the hostname the
+// client asked for, before any connection is made.
+//
+// This exists because a parent proxy moves the ground under the post-DNS check.
+// Normally the policy is enforced in ControlContext, on the address about to be
+// connected to, which is what closes DNS rebinding: a name that resolves to
+// 127.0.0.1 is caught because the check sees the resolved address.
+//
+// With a parent configured, the address about to be connected to is *the
+// parent* — the same address for every request. Evaluating the rules there
+// would match them against the parent's IP, so "allow domain example.com; deny
+// all" would stop meaning what it says and nothing in the logs would show it.
+// That is a silent, total bypass of every destination control, so with a parent
+// the check moves to the requested hostname.
+//
+// What that costs is worth naming rather than glossing: the rebinding
+// protection and the private-address default both concern where *this host*
+// connects, and with a parent it no longer resolves or reaches the destination
+// at all. Those are the parent's problem now, and the README says so.
+func (p Policy) checkDestination(client, hostport string) error {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	// Resolved once: ruleSet may be a function reading live configuration, and
+	// calling it twice could see two different sets mid-reload. It also returns
+	// nil when no rules are configured, which Match handles but a field read
+	// would not.
+	set := p.ruleSet(client)
+	decision, rule := set.Match(host, nil)
+	if decision == policy.Deny {
+		return &errDenied{
+			reason: fmt.Sprintf("destination %s is not permitted by policy (%s)", host, rule),
+			scope:  scopeDestination,
+		}
+	}
+	if decision == policy.Undecided && set != nil && set.Default == policy.Deny {
+		return &errDenied{
+			reason: fmt.Sprintf("destination %s is not permitted by policy (default deny)", host),
+			scope:  scopeDestination,
+		}
+	}
+	return nil
+}
+
 // dialContext wraps the dialer so the hostname reaches ControlContext, and so
 // an unambiguous denial can be answered without a DNS lookup or a dial.
 func (p Policy) dialContext(d *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
@@ -348,6 +407,17 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 	if pol.UpstreamTLS != nil {
 		transport.TLSClientConfig = pol.UpstreamTLS.Clone()
 	}
+	if pol.Upstream.Configured() {
+		// The transport handles the plain-HTTP path: it makes the request to
+		// the parent rather than the origin. CONNECT cannot use this, because
+		// the handler does its own dialling — see handleConnect.
+		transport.Proxy = func(r *http.Request) (*url.URL, error) {
+			if pol.Upstream.Bypass(r.URL.Host) {
+				return nil, nil
+			}
+			return pol.Upstream.URL, nil
+		}
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
@@ -388,6 +458,22 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// Set after the operator's headers so a stray -header cannot displace it.
 		setRequestID(outReq)
 		applyHeaderRules(pol, outReq.Header, header.Request, clientIP(r.RemoteAddr), r.URL.Host)
+
+		// With a parent the transport connects to it, not to the destination,
+		// so the destination check has to happen here instead of in the dialer.
+		if pol.chained(r.URL.Host) {
+			if err := pol.checkDestination(clientIP(r.RemoteAddr), r.URL.Host); err != nil {
+				logger.Warn("Refused destination",
+					log.String("host", r.URL.Host), log.String("client", clientIP(r.RemoteAddr)),
+					log.String("request_id", reqid.FromContext(r.Context())))
+				obs.denied(deniedScope(err))
+				http.Error(w, "Destination not permitted", http.StatusForbidden)
+				return
+			}
+			if auth := pol.Upstream.AuthHeader(); auth != "" {
+				outReq.Header.Set("Proxy-Authorization", auth)
+			}
+		}
 
 		// The span covers the round trip, matching the upstream histogram. The
 		// request comes back carrying the span context and whatever propagation
@@ -581,9 +667,26 @@ func handleUpgrade(
 
 func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, pol Policy, dialer *net.Dialer, obs Observer) {
 	logger.Debugf("CONNECT tunnel %s", r.Host)
+
+	dial := pol.dialContext(dialer)
+	if pol.chained(r.Host) {
+		// The policy is checked here rather than in the dialer, because the
+		// dialer is about to connect to the parent and would evaluate the rules
+		// against the parent's address rather than the destination's.
+		if err := pol.checkDestination(clientIP(r.RemoteAddr), r.Host); err != nil {
+			logger.Warn("Refused CONNECT destination",
+				log.String("host", r.Host), log.String("client", clientIP(r.RemoteAddr)),
+				log.String("request_id", reqid.FromContext(r.Context())))
+			obs.denied(deniedScope(err))
+			http.Error(w, "Destination not permitted", http.StatusForbidden)
+			return
+		}
+		dial = pol.dialThroughParent(dialer, logger)
+	}
+
 	// The same policy-aware dial the plain-HTTP path uses, so a tunnel cannot
 	// reach anywhere an ordinary request could not.
-	destConn, err := pol.dialContext(dialer)(r.Context(), "tcp", r.Host)
+	destConn, err := dial(r.Context(), "tcp", r.Host)
 	if err != nil {
 		if denied(err) {
 			logger.Warn("Refused CONNECT destination",
@@ -624,6 +727,76 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 	}
 	obs.tunnelOpened()
 	go transferPair(destConn, clientConn, obs.tunnelClosed)
+}
+
+// dialThroughParent connects to the parent proxy and issues a nested CONNECT
+// for the real destination, returning the tunnelled connection.
+//
+// The transport's Proxy hook cannot do this: CONNECT is served by hijacking and
+// splicing sockets, so the handler dials for itself and has to speak the parent
+// protocol directly. The parent's response is read and checked — a non-200 is a
+// refusal by the parent, and splicing regardless would hand the client a tunnel
+// that silently carries the parent's error page instead of the origin.
+func (p Policy) dialThroughParent(d *net.Dialer, logger *log.Logger) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		parent := p.Upstream.Addr()
+		conn, err := d.DialContext(ctx, network, parent)
+		if err != nil {
+			return nil, fmt.Errorf("dialling the upstream proxy %s: %w", parent, err)
+		}
+
+		req := &http.Request{
+			Method: http.MethodConnect,
+			URL:    &url.URL{Opaque: addr},
+			Host:   addr,
+			Header: make(http.Header),
+		}
+		if auth := p.Upstream.AuthHeader(); auth != "" {
+			req.Header.Set("Proxy-Authorization", auth)
+		}
+		if err := req.Write(conn); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("sending CONNECT to the upstream proxy: %w", err)
+		}
+
+		// The buffered reader must not read past the response, or bytes the
+		// tunnel owns would be swallowed here. A CONNECT response has no body,
+		// so ReadResponse stops at the blank line.
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, req)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("reading the upstream proxy's CONNECT response: %w", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			conn.Close()
+			return nil, fmt.Errorf("upstream proxy refused CONNECT to %s: %s", addr, resp.Status)
+		}
+		if n := br.Buffered(); n > 0 {
+			// The parent sent tunnel bytes in the same read. Dropping them
+			// would corrupt the very first thing the client sees, which for TLS
+			// is the ServerHello.
+			pending, _ := br.Peek(n)
+			return &prefixedConn{Conn: conn, pending: pending}, nil
+		}
+		return conn, nil
+	}
+}
+
+// prefixedConn replays bytes already read from the socket before reading more.
+type prefixedConn struct {
+	net.Conn
+	pending []byte
+}
+
+func (c *prefixedConn) Read(b []byte) (int, error) {
+	if len(c.pending) > 0 {
+		n := copy(b, c.pending)
+		c.pending = c.pending[n:]
+		return n, nil
+	}
+	return c.Conn.Read(b)
 }
 
 func transfer(dst io.WriteCloser, src io.ReadCloser) {

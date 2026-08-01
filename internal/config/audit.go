@@ -69,8 +69,10 @@ func auditValue(v string) string {
 // an operator who set -secret specifically to keep credentials out of a
 // readable database would not expect the audit table to hand one back.
 var redactedSettings = map[string]bool{
-	"username": true,
-	"password": true,
+	"username":                true,
+	"password":                true,
+	"upstream_proxy_user":     true,
+	"upstream_proxy_password": true,
 }
 
 func initAuditSchema(db *sql.DB) error {

@@ -10,6 +10,7 @@ import (
 	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/quota"
+	"github.com/pod32g/proxy/internal/upstream"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -51,6 +52,9 @@ type Config struct {
 	// Quotas: how much a client may push through, globally and per client.
 	quotaText string
 	quotaSet  *quota.Set
+
+	// Parent proxy, if outbound traffic must pass through one.
+	upstreamProxy *upstream.Proxy
 
 	// Conditional header rules. The unconditional Headers map above remains
 	// the UI's editing surface and is folded into the applied set, so the two
@@ -359,6 +363,67 @@ func (c *Config) ClientRulesText() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.clientText
+}
+
+// SetUpstreamProxy parses and installs the parent proxy.
+func (c *Config) SetUpstreamProxy(rawURL, noProxy string) error {
+	p, err := upstream.Parse(rawURL, noProxy)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Credentials already set are kept when the URL carries none, so changing
+	// the address does not silently drop the password.
+	if p.Configured() && p.Username == "" && c.upstreamProxy != nil {
+		p.SetCredentials(c.upstreamProxy.Username, c.upstreamProxy.Password)
+	}
+	c.upstreamProxy = p
+	return nil
+}
+
+// SetUpstreamProxyCredentials replaces the parent's credentials, for the
+// persistence path where they arrive separately from the URL.
+func (c *Config) SetUpstreamProxyCredentials(user, pass string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.upstreamProxy == nil {
+		c.upstreamProxy = &upstream.Proxy{}
+	}
+	c.upstreamProxy.SetCredentials(user, pass)
+}
+
+// UpstreamProxy returns the configured parent, or nil.
+func (c *Config) UpstreamProxy() *upstream.Proxy {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.upstreamProxy
+}
+
+// UpstreamProxyURL returns the parent without credentials, for logs and the
+// store. The credentials are persisted separately and sealed like the proxy's
+// own, so this value is safe to write anywhere the URL belongs.
+func (c *Config) UpstreamProxyURL() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.upstreamProxy.String()
+}
+
+// UpstreamProxyBypass returns the bypass list as written.
+func (c *Config) UpstreamProxyBypass() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.upstreamProxy.BypassList()
+}
+
+// UpstreamProxyCredentials returns the parent's credentials.
+func (c *Config) UpstreamProxyCredentials() (string, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.upstreamProxy == nil {
+		return "", ""
+	}
+	return c.upstreamProxy.Username, c.upstreamProxy.Password
 }
 
 // SetHeaderRules parses and installs the conditional header rules.

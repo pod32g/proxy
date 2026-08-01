@@ -58,6 +58,8 @@ go build -o proxy
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
 - `-admin-cert` / `-admin-key` – TLS material for the admin listener. `PROXY_ADMIN_CERT_FILE`, `PROXY_ADMIN_KEY_FILE`.
+- `-upstream-proxy` – Parent proxy all outbound traffic passes through. `PROXY_UPSTREAM_PROXY`.
+- `-no-proxy` – Hosts, domain suffixes and CIDRs reached directly instead. `PROXY_NO_PROXY`, defaults to `NO_PROXY`.
 - `-upstream-ca` – Additional CA bundle trusted for upstream TLS, added to the system roots. `PROXY_UPSTREAM_CA`.
 - `-upstream-cert` / `-upstream-key` – Client certificate presented to upstreams that ask for one. `PROXY_UPSTREAM_CERT`, `PROXY_UPSTREAM_KEY`.
 - `-config` – YAML configuration file. SIGHUP re-reads it. See below. `PROXY_CONFIG`.
@@ -554,6 +556,58 @@ reach a span. The only headers read are the propagation ones — `Authorization`
 Spans are flushed on shutdown. A batching exporter holds them in memory, so
 without that the last seconds of traces are lost on every restart — exactly the
 window around a deployment that anyone wants to see.
+
+## Chaining through a parent proxy
+
+In an egress-controlled network all outbound traffic has to pass through a
+parent. Without this the proxy talks to origins directly, which does not make it
+differently configured — it makes it unusable.
+
+```sh
+./proxy -upstream-proxy http://user:pass@proxy.corp:3128         -no-proxy "internal.example.com,10.0.0.0/8"
+```
+
+Both request paths honour it. Plain HTTP goes through the transport; `CONNECT`
+cannot, because it is served by hijacking and splicing sockets, so the proxy
+dials the parent and issues a **nested `CONNECT`** for the real destination. The
+parent's response is read and checked — a non-200 is a `502`, not a tunnel that
+silently carries the parent's error page instead of the origin.
+
+`-no-proxy` takes the `NO_PROXY` forms: exact hosts, domain suffixes with or
+without a leading dot, CIDRs, and `*` to disable the parent entirely. It
+defaults to the `NO_PROXY` environment variable.
+
+Credentials may be given in the URL, which is what people paste from an existing
+`http_proxy` setting, but they are lifted out of it immediately. The URL is
+logged and persisted; a credential left in it would travel everywhere it goes.
+They are sealed by `-secret` on the same path as the proxy's own, so one setting
+covers both rather than protecting one and leaving the other in the clear.
+
+### What chaining changes about the destination policy
+
+**The policy still applies to the destination the client asked for, not to the
+parent** — but this is worth stating because it is not automatic and getting it
+wrong would be silent.
+
+Normally the destination check runs in the dialer, against the address about to
+be connected to. That is what closes DNS rebinding: a name resolving to
+`127.0.0.1` is caught because the check sees the resolved address. With a parent
+configured, the address about to be connected to *is the parent* — the same one
+for every request — so evaluating the rules there would match them against the
+parent's IP and `deny domain blocked.test` would quietly stop meaning anything.
+
+So with a parent, the check moves to the requested hostname, before any
+connection is made. Two consequences follow, and both are the parent's
+responsibility now rather than this proxy's:
+
+- **DNS rebinding protection no longer applies**, because this proxy does not
+  resolve the destination at all.
+- **`-allow-private` no longer governs the destination**, because this proxy
+  does not reach it. It still governs the parent itself.
+
+Everything else holds unchanged: `-connect-ports`, the client access table and
+quotas are all about what the client asked for, and a parent does not make an
+arbitrary TCP relay acceptable.
 
 ## Upstream TLS
 

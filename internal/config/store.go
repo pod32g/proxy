@@ -350,6 +350,21 @@ func (s *Store) Load(cfg *Config) error {
 		}
 	}
 
+	// The parent's URL and bypass list are plaintext; its credentials come back
+	// through the same sealed path as the proxy's own, below.
+	var upURL, upBypass string
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='upstream_proxy'`).Scan(&val); err == nil {
+		upURL = val
+	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='upstream_proxy_bypass'`).Scan(&val); err == nil {
+		upBypass = val
+	}
+	if upURL != "" {
+		if err := cfg.SetUpstreamProxy(upURL, upBypass); err != nil {
+			s.warn("stored upstream proxy is invalid and was ignored: %v", err)
+		}
+	}
+
 	_, user, pass := cfg.GetAuth()
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='username'`).Scan(&val); err == nil {
 		user = s.plaintext(cfg.SecretKey, salt, val, user, "username")
@@ -358,6 +373,17 @@ func (s *Store) Load(cfg *Config) error {
 		pass = s.plaintext(cfg.SecretKey, salt, val, pass, "password")
 	}
 	cfg.SetCredentials(user, pass)
+
+	upUser, upPass := cfg.UpstreamProxyCredentials()
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='upstream_proxy_user'`).Scan(&val); err == nil {
+		upUser = s.plaintext(cfg.SecretKey, salt, val, upUser, "upstream proxy username")
+	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='upstream_proxy_password'`).Scan(&val); err == nil {
+		upPass = s.plaintext(cfg.SecretKey, salt, val, upPass, "upstream proxy password")
+	}
+	if upUser != "" || upPass != "" {
+		cfg.SetUpstreamProxyCredentials(upUser, upPass)
+	}
 	return nil
 }
 
@@ -423,10 +449,18 @@ func (s *Store) Save(cfg *Config, by Actor) error {
 		{"client_rules", cfg.ClientRulesText()},
 		{"quota_rules", cfg.QuotaText()},
 		{"header_rules", cfg.HeaderRulesText()},
+		{"upstream_proxy", cfg.UpstreamProxyURL()},
+		{"upstream_proxy_bypass", cfg.UpstreamProxyBypass()},
 	}
+
+	// The parent proxy's credentials are sealed on the same path as the proxy's
+	// own, so -secret covers both rather than protecting one and leaving the
+	// other in the clear.
+	upUser, upPass := cfg.UpstreamProxyCredentials()
 
 	// Keep the plaintext for the audit diff before sealing replaces them.
 	userPlain, passPlain := user, pass
+	upUserPlain, upPassPlain := upUser, upPass
 
 	if cfg.SecretKey != "" {
 		salt, err := ensureSalt(tx)
@@ -445,6 +479,20 @@ func (s *Store) Save(cfg *Config, by Actor) error {
 		} else {
 			return err
 		}
+		if upUser != "" {
+			if enc, err := s.sealCredential(cfg.SecretKey, salt, upUser); err == nil {
+				upUser = enc
+			} else {
+				return err
+			}
+		}
+		if upPass != "" {
+			if enc, err := s.sealCredential(cfg.SecretKey, salt, upPass); err == nil {
+				upPass = enc
+			} else {
+				return err
+			}
+		}
 	}
 	// Diff before writing, and diff the credentials on their plaintext.
 	//
@@ -453,13 +501,20 @@ func (s *Store) Save(cfg *Config, by Actor) error {
 	// would therefore record a credential change on every single write — an
 	// audit that cries wolf is worse than no audit, because it trains whoever
 	// reads it to ignore exactly the entry that matters.
-	plainCreds := map[string]string{"username": userPlain, "password": passPlain}
+	plainCreds := map[string]string{
+		"username":                userPlain,
+		"password":                passPlain,
+		"upstream_proxy_user":     upUserPlain,
+		"upstream_proxy_password": upPassPlain,
+	}
 	changes, err := s.diff(tx, cfg, settings, plainCreds)
 	if err != nil {
 		return err
 	}
 
-	settings = append(settings, [2]string{"username", user}, [2]string{"password", pass})
+	settings = append(settings,
+		[2]string{"username", user}, [2]string{"password", pass},
+		[2]string{"upstream_proxy_user", upUser}, [2]string{"upstream_proxy_password", upPass})
 
 	for _, kv := range settings {
 		if _, err := tx.Exec(`INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)`, kv[0], kv[1]); err != nil {

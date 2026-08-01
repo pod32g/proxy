@@ -86,6 +86,21 @@ header_rules: |
 
 # secret_file: /run/secrets/proxy-secret   # encrypts credentials at rest (restart)
 
+# --- live: parent proxy ------------------------------------------------------
+#
+# All outbound traffic passes through this. Credentials may be in the URL and
+# are lifted out of it — the URL is logged and stored, so nothing secret stays
+# in it — and are sealed by secret_file like the proxy's own.
+#
+# Note: with a parent configured the destination policy is evaluated against the
+# requested hostname rather than the resolved address, because this proxy no
+# longer resolves or reaches the destination. See the README.
+# upstream_proxy:
+#   url: http://proxy.corp:3128
+#   username: proxyuser
+#   password: ""                 # prefer setting this through the API or UI
+#   no_proxy: "internal.example.com,10.0.0.0/8"
+
 # --- restart: TLS the proxy uses when connecting OUTWARD ---------------------
 #
 # Distinct from cert/key above, which is what the proxy presents to its own

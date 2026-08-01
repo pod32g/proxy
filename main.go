@@ -177,6 +177,10 @@ func main() {
 		"export per-destination request counts, sampled from the bounded top-N table at scrape time; off by default because hostnames are client-controlled")
 	topDestinations := flag.Int("destination-metrics-top", server.DefaultTopDestinations,
 		"how many destinations -destination-metrics reports; this is the series count, so keep it small")
+	upstreamProxy := flag.String("upstream-proxy", env.get("PROXY_UPSTREAM_PROXY", ""),
+		"parent proxy all outbound traffic passes through, e.g. http://user:pass@proxy.corp:3128")
+	noProxy := flag.String("no-proxy", env.get("PROXY_NO_PROXY", os.Getenv("NO_PROXY")),
+		"comma-separated hosts, domain suffixes and CIDRs reached directly rather than through -upstream-proxy")
 	upstreamCA := flag.String("upstream-ca", env.get("PROXY_UPSTREAM_CA", ""),
 		"additional CA bundle trusted for upstream TLS; added to the system roots rather than replacing them")
 	upstreamCert := flag.String("upstream-cert", env.get("PROXY_UPSTREAM_CERT", ""),
@@ -348,6 +352,12 @@ func main() {
 		}
 		setFlagsExtra["quota-rule"] = true
 	}
+	if *upstreamProxy != "" {
+		if err := cfg.SetUpstreamProxy(*upstreamProxy, *noProxy); err != nil {
+			fatalf("-upstream-proxy: %v", err)
+		}
+		setFlagsExtra["upstream-proxy"] = true
+	}
 	if len(headerRules) > 0 {
 		if err := cfg.SetHeaderRules(strings.Join(headerRules, "\n")); err != nil {
 			fatalf("invalid header rules: %v", err)
@@ -472,6 +482,14 @@ func main() {
 	if !globalUpstream.Empty() {
 		logger.Info("Upstream TLS configured", log.String("using", globalUpstream.Describe()))
 	}
+	if p := cfg.UpstreamProxy(); p.Configured() {
+		// Logged without credentials: String() renders the URL with userinfo
+		// already stripped, which is why they are held apart from it.
+		logger.Info("Forwarding through a parent proxy",
+			log.String("upstream", p.String()),
+			log.String("bypass", p.BypassList()),
+			log.Bool("authenticated", p.AuthHeader() != ""))
+	}
 
 	metrics, err := server.NewMetrics(prometheus.DefaultRegisterer)
 	if err != nil {
@@ -538,6 +556,7 @@ func main() {
 			// Read per request so rules edited through the UI, the API or a
 			// reload take effect without a restart.
 			HeaderRules: cfg.HeaderRules,
+			Upstream:    cfg.UpstreamProxy(),
 		}
 
 		var handler http.Handler

@@ -9,6 +9,7 @@ import (
 	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/quota"
+	"github.com/pod32g/proxy/internal/upstream"
 	"gopkg.in/yaml.v3"
 )
 
@@ -90,6 +91,14 @@ type File struct {
 	Policy  *string `yaml:"policy"`
 	Clients *string `yaml:"clients"`
 	Quotas  *string `yaml:"quotas"`
+
+	// UpstreamProxy is a parent proxy all outbound traffic passes through.
+	UpstreamProxy *struct {
+		URL      *string `yaml:"url"`
+		Username *string `yaml:"username"`
+		Password *string `yaml:"password"`
+		NoProxy  *string `yaml:"no_proxy"`
+	} `yaml:"upstream_proxy"`
 
 	// HeaderRules are the conditional form. The headers map above is the
 	// unconditional one and keeps working; both are applied, map first.
@@ -184,6 +193,15 @@ func (f *File) validate() error {
 	if f.HeaderRules != nil {
 		if _, err := header.Parse(*f.HeaderRules); err != nil {
 			return fmt.Errorf("header_rules: %w", err)
+		}
+	}
+	if f.UpstreamProxy != nil && f.UpstreamProxy.URL != nil {
+		no := ""
+		if f.UpstreamProxy.NoProxy != nil {
+			no = *f.UpstreamProxy.NoProxy
+		}
+		if _, err := upstream.Parse(*f.UpstreamProxy.URL, no); err != nil {
+			return fmt.Errorf("upstream_proxy: %w", err)
 		}
 	}
 	for _, p := range f.ConnectPorts {
@@ -417,6 +435,29 @@ func (f *File) ApplyTo(cfg *Config) ([]string, error) {
 		if !sameHeaders(cfg.GetHeaders(), f.Headers) {
 			cfg.ReplaceHeaders(f.Headers)
 			note("headers")
+		}
+	}
+	if f.UpstreamProxy != nil && f.UpstreamProxy.URL != nil {
+		no := ""
+		if f.UpstreamProxy.NoProxy != nil {
+			no = *f.UpstreamProxy.NoProxy
+		}
+		if *f.UpstreamProxy.URL != cfg.UpstreamProxyURL() || no != cfg.UpstreamProxyBypass() {
+			if err := cfg.SetUpstreamProxy(*f.UpstreamProxy.URL, no); err != nil {
+				return changed, err
+			}
+			note("upstream_proxy")
+		}
+		if f.UpstreamProxy.Username != nil || f.UpstreamProxy.Password != nil {
+			user, pass := cfg.UpstreamProxyCredentials()
+			if f.UpstreamProxy.Username != nil {
+				user = *f.UpstreamProxy.Username
+			}
+			if f.UpstreamProxy.Password != nil {
+				pass = *f.UpstreamProxy.Password
+			}
+			cfg.SetUpstreamProxyCredentials(user, pass)
+			note("upstream_proxy.credentials")
 		}
 	}
 	if f.HeaderRules != nil && *f.HeaderRules != cfg.HeaderRulesText() {
