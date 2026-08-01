@@ -53,6 +53,10 @@ type Router struct {
 	// admits every client.
 	ClientAllowed func(ip string) (bool, string)
 
+	// Quota admits one request against the client's remaining allowance,
+	// reporting how long to wait and which allowance ran out. Nil is unlimited.
+	Quota func(ip string) (ok bool, retryAfter time.Duration, scope string)
+
 	// Logger and AuthFailures are optional.
 	Logger       *log.Logger
 	AuthFailures prometheus.Counter
@@ -95,21 +99,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// Client access is about proxying, not about the admin surface: an operator
-	// reaching the UI from a workstation is not a proxy client, and locking
-	// them out of the controls that fix the rules would be its own trap.
-	if proxied && r.ClientAllowed != nil {
-		source := hostOnly(req.RemoteAddr)
-		if ok, rule := r.ClientAllowed(source); !ok {
-			if r.Logger != nil {
-				r.Logger.Warn("Refused client",
-					log.String("source", source), log.String("rule", rule))
-			}
-			http.Error(w, "Client not permitted", http.StatusForbidden)
-			return
-		}
-	}
-
+	// The admin surface answers before the client gates below. An operator
+	// reaching the UI from a workstation is not a proxy client, and locking them
+	// out of the controls that fix a bad rule — or that raise an exhausted
+	// quota — would be its own trap.
 	if direct {
 		if metricsRequest {
 			r.Metrics.ServeHTTP(w, req)
@@ -133,11 +126,46 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	if r.Proxy != nil {
-		r.Proxy.ServeHTTP(w, req)
-	} else {
+	if r.Proxy == nil {
 		http.NotFound(w, req)
+		return
 	}
+
+	// Everything still here is about to be forwarded, which is what the client
+	// gates are for. They sit at the dispatch rather than beside the auth check
+	// because "is this request in proxy form" is not the same question as "is
+	// this request going upstream": in reverse mode every request is
+	// origin-form, so gating on the form alone would leave a reverse proxy with
+	// no client access control and no quotas at all.
+	source := hostOnly(req.RemoteAddr)
+	if r.ClientAllowed != nil {
+		if ok, rule := r.ClientAllowed(source); !ok {
+			if r.Logger != nil {
+				r.Logger.Warn("Refused client",
+					log.String("source", source), log.String("rule", rule))
+			}
+			http.Error(w, "Client not permitted", http.StatusForbidden)
+			return
+		}
+	}
+	// Quotas come last of the three gates, so the order reads: who are you, may
+	// you use this proxy, how much may you use it, and only then where may you
+	// go. Charging an unauthenticated or barred client against a quota would let
+	// strangers exhaust a legitimate client's allowance.
+	if r.Quota != nil {
+		if ok, retryAfter, scope := r.Quota(source); !ok {
+			if r.Logger != nil {
+				r.Logger.Warn("Refused over quota",
+					log.String("source", source), log.String("quota", scope),
+					log.String("retry_after", retryAfter.Round(time.Second).String()))
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+			http.Error(w, "Quota exceeded ("+scope+")", http.StatusTooManyRequests)
+			return
+		}
+	}
+
+	r.Proxy.ServeHTTP(w, req)
 }
 
 // denyAuth writes the challenge. A request the proxy was asked to *forward*

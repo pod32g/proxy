@@ -11,6 +11,7 @@ import (
 
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/policy"
+	"github.com/pod32g/proxy/internal/quota"
 	"github.com/pod32g/proxy/internal/server"
 	log "github.com/pod32g/simple-logger"
 )
@@ -62,6 +63,7 @@ type pageData struct {
 
 	DestinationRules string
 	ClientRules      string
+	Quotas           string
 	PolicyError      string
 	TestResult       string
 }
@@ -292,12 +294,20 @@ var policyPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "co
 <code>default deny</code><br>A client may carry its own destination rules:
 <code>allow 10.0.0.0/8 { allow domain example.com; deny all }</code></p>
 
+<h2>Quotas</h2>
+<p>Unlimited unless set. <code>global requests 500/s burst 1000</code> &middot;
+<code>client bytes 10MB/s</code> &middot; <code>client 10.0.0.0/8 requests 200/s</code><br>
+Request quotas refuse before the request runs. Byte quotas are charged as traffic
+flows, so an over-budget client is refused on its <em>next</em> request rather
+than mid-transfer.</p>
+
 {{if .PolicyError}}<p><strong>Not applied:</strong> {{.PolicyError}}</p>{{end}}
 
 <form method="POST" action="set-policy">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <label>Destinations:<br><textarea name="destinations" rows="8" cols="60">{{.DestinationRules}}</textarea></label><br>
     <label>Clients:<br><textarea name="clients" rows="6" cols="60">{{.ClientRules}}</textarea></label><br>
+    <label>Quotas:<br><textarea name="quotas" rows="6" cols="60">{{.Quotas}}</textarea></label><br>
     <button type="submit">Save</button>
 </form>
 
@@ -354,6 +364,7 @@ func (h *handler) makeData(w http.ResponseWriter, r *http.Request) pageData {
 		CSRFToken:        h.issueCSRF(w, r),
 		DestinationRules: h.cfg.PolicyRulesText(),
 		ClientRules:      h.cfg.ClientRulesText(),
+		Quotas:           h.cfg.QuotaText(),
 	}
 	if h.clients != nil {
 		data.ClientCount = h.clients.Count()
@@ -423,12 +434,13 @@ func (h *handler) setPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	destinations := r.FormValue("destinations")
 	clients := r.FormValue("clients")
+	quotas := r.FormValue("quotas")
 
-	// Validate both before applying either, and re-render with the error rather
+	// Validate all three before applying any, and re-render with the error rather
 	// than redirecting: losing what the operator typed because line 7 was wrong
 	// is how people stop using a form.
 	data := h.makeData(w, r)
-	data.DestinationRules, data.ClientRules = destinations, clients
+	data.DestinationRules, data.ClientRules, data.Quotas = destinations, clients, quotas
 	if _, err := policy.Parse(destinations); err != nil {
 		data.PolicyError = "destinations: " + err.Error()
 		policyPage.Execute(w, data)
@@ -439,8 +451,14 @@ func (h *handler) setPolicy(w http.ResponseWriter, r *http.Request) {
 		policyPage.Execute(w, data)
 		return
 	}
+	if _, err := quota.Parse(quotas); err != nil {
+		data.PolicyError = "quotas: " + err.Error()
+		policyPage.Execute(w, data)
+		return
+	}
 	_ = h.cfg.SetPolicyRules(destinations)
 	_ = h.cfg.SetClientRules(clients)
+	_ = h.cfg.SetQuotas(quotas)
 	if h.logger != nil {
 		h.logger.Info("Updated policy")
 	}

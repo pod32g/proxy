@@ -16,6 +16,18 @@ type Metrics struct {
 	Duration     *prometheus.HistogramVec
 	Clients      prometheus.Gauge
 	AuthFailures prometheus.Counter
+
+	// QuotaRejected is labelled by which allowance ran out, so a single noisy
+	// client is distinguishable from a proxy at its global ceiling. Without the
+	// label the first thing anyone would ask on seeing the counter rise is
+	// exactly the thing it could not answer.
+	QuotaRejected *prometheus.CounterVec
+	// RelayedBytes is what the byte quota is charged against, exported so
+	// exhaustion is visible before anyone hits it.
+	RelayedBytes prometheus.Counter
+	// QuotaClients is the size of the per-client bucket table, which is bounded
+	// and therefore worth watching for eviction pressure.
+	QuotaClients prometheus.Gauge
 }
 
 // NewMetrics builds the collectors and registers them with reg. Taking a
@@ -51,11 +63,33 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 				Help: "Total number of rejected authentication attempts",
 			},
 		),
+		QuotaRejected: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "proxy_quota_rejected_total",
+				Help: "Total number of requests refused for exceeding a quota",
+			},
+			[]string{"scope"},
+		),
+		RelayedBytes: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "proxy_relayed_bytes_total",
+				Help: "Total bytes relayed on behalf of clients, in both directions",
+			},
+		),
+		QuotaClients: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "proxy_quota_tracked_clients",
+				Help: "Number of clients with live quota buckets",
+			},
+		),
 	}
 	if reg == nil {
 		reg = prometheus.DefaultRegisterer
 	}
-	for _, c := range []prometheus.Collector{m.Requests, m.Duration, m.Clients, m.AuthFailures} {
+	for _, c := range []prometheus.Collector{
+		m.Requests, m.Duration, m.Clients, m.AuthFailures,
+		m.QuotaRejected, m.RelayedBytes, m.QuotaClients,
+	} {
 		if err := reg.Register(c); err != nil {
 			return nil, err
 		}

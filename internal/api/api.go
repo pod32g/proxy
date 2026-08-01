@@ -8,6 +8,7 @@ import (
 
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/policy"
+	"github.com/pod32g/proxy/internal/quota"
 	"github.com/pod32g/proxy/internal/server"
 	log "github.com/pod32g/simple-logger"
 )
@@ -113,6 +114,7 @@ type policyReq struct {
 	// REST verb. Pointers so an omitted set is left alone rather than cleared.
 	Destinations *string `json:"destinations"`
 	Clients      *string `json:"clients"`
+	Quotas       *string `json:"quotas"`
 }
 
 type policyTestReq struct {
@@ -286,6 +288,7 @@ func (h *handler) policy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{
 			"destinations": h.cfg.PolicyRulesText(),
 			"clients":      h.cfg.ClientRulesText(),
+			"quotas":       h.cfg.QuotaText(),
 		})
 	case http.MethodPut, http.MethodPost:
 		var req policyReq
@@ -306,11 +309,20 @@ func (h *handler) policy(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if req.Quotas != nil {
+			if _, err := quota.Parse(*req.Quotas); err != nil {
+				http.Error(w, "quotas: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
 		if req.Destinations != nil {
 			_ = h.cfg.SetPolicyRules(*req.Destinations)
 		}
 		if req.Clients != nil {
 			_ = h.cfg.SetClientRules(*req.Clients)
+		}
+		if req.Quotas != nil {
+			_ = h.cfg.SetQuotas(*req.Quotas)
 		}
 		if h.logger != nil {
 			h.logger.Info("Updated policy")

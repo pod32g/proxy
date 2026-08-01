@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func staticAuth(enabled bool, user, pass string) func() (bool, string, string) {
@@ -432,5 +433,168 @@ func TestClientACLAppliesToConnect(t *testing.T) {
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("got %d, want 403", rec.Code)
+	}
+}
+
+// In reverse mode every request is origin-form, so a gate keyed on "is this
+// request in proxy form" would leave a reverse proxy with no client access
+// control at all. The gate belongs at the dispatch to the proxy handler.
+func TestClientACLAppliesInReverseMode(t *testing.T) {
+	r := &Router{
+		Proxy:         okHandler("BACKEND"),
+		UI:            okHandler("ADMIN-UI"),
+		ClientAllowed: func(string) (bool, string) { return false, "default deny" },
+	}
+	// An ordinary origin-form request, exactly what a reverse proxy serves.
+	req := httptest.NewRequest(http.MethodGet, "/some/backend/path", nil)
+	req.RemoteAddr = "203.0.113.9:5000"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("got %d, want 403 for a denied client in reverse mode", rec.Code)
+	}
+
+	// The admin surface is still reachable from that address.
+	admin := httptest.NewRequest(http.MethodGet, "/ui/general", nil)
+	admin.RemoteAddr = "203.0.113.9:5000"
+	rec2 := httptest.NewRecorder()
+	r.ServeHTTP(rec2, admin)
+	if rec2.Body.String() != "ADMIN-UI" {
+		t.Errorf("admin from a denied client: got %q", rec2.Body.String())
+	}
+}
+
+func TestQuotaRefusalIs429WithRetryAfter(t *testing.T) {
+	r := &Router{
+		Proxy: okHandler("PROXIED"),
+		Quota: func(string) (bool, time.Duration, string) {
+			return false, 2500 * time.Millisecond, "client-requests"
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("got %d, want 429", rec.Code)
+	}
+	// Retry-After is whole seconds and must round up: telling a client to retry
+	// in 2s when 2.5s of the wait remains just produces a second refusal.
+	if got := rec.Header().Get("Retry-After"); got != "3" {
+		t.Errorf("Retry-After = %q, want %q", got, "3")
+	}
+	// The body names which allowance ran out; "429" alone is not actionable.
+	if !strings.Contains(rec.Body.String(), "client-requests") {
+		t.Errorf("body does not name the exhausted quota: %q", rec.Body.String())
+	}
+}
+
+// Quotas govern proxying. Locking an operator out of the page that raises an
+// exhausted quota would be a trap with no way out.
+func TestQuotaDoesNotGateTheAdminSurface(t *testing.T) {
+	var asked int
+	r := &Router{
+		Proxy:   okHandler("PROXIED"),
+		UI:      okHandler("ADMIN-UI"),
+		Metrics: okHandler("METRICS"),
+		Quota: func(string) (bool, time.Duration, string) {
+			asked++
+			return false, time.Second, "global-requests"
+		},
+	}
+	for _, path := range []string{"/ui/general", "/metrics"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = "10.1.2.3:5000"
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code == http.StatusTooManyRequests {
+			t.Errorf("%s was quota-gated", path)
+		}
+	}
+	if asked != 0 {
+		t.Errorf("quota consulted %d times for admin requests, want 0", asked)
+	}
+}
+
+// An unauthenticated or barred client must not be able to spend a legitimate
+// client's allowance, so the quota is charged last of the three gates.
+func TestQuotaIsNotChargedForRejectedRequests(t *testing.T) {
+	var charged int
+	r := &Router{
+		Proxy:         okHandler("PROXIED"),
+		Auth:          func() (bool, string, string) { return true, "u", "p" },
+		ClientAllowed: func(ip string) (bool, string) { return ip != "203.0.113.9", "deny" },
+		Quota: func(string) (bool, time.Duration, string) {
+			charged++
+			return true, 0, ""
+		},
+	}
+
+	// No credentials: refused before the quota is consulted.
+	noAuth := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	noAuth.RemoteAddr = "10.1.2.3:5000"
+	r.ServeHTTP(httptest.NewRecorder(), noAuth)
+
+	// Correct credentials but a barred address: still refused before the quota.
+	barred := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	barred.RemoteAddr = "203.0.113.9:5000"
+	barred.SetBasicAuth("u", "p")
+	r.ServeHTTP(httptest.NewRecorder(), barred)
+
+	if charged != 0 {
+		t.Errorf("quota charged %d times for refused requests, want 0", charged)
+	}
+
+	ok := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	ok.RemoteAddr = "10.1.2.3:5000"
+	ok.SetBasicAuth("u", "p")
+	r.ServeHTTP(httptest.NewRecorder(), ok)
+	if charged != 1 {
+		t.Errorf("quota charged %d times for an admitted request, want 1", charged)
+	}
+}
+
+// CONNECT is one request but arbitrary traffic, so it must be admitted through
+// the same gate rather than slipping past it.
+func TestQuotaAppliesToConnect(t *testing.T) {
+	var asked int
+	r := &Router{
+		Proxy: okHandler("PROXIED"),
+		Quota: func(string) (bool, time.Duration, string) {
+			asked++
+			return false, time.Second, "client-requests"
+		},
+	}
+	req := httptest.NewRequest(http.MethodConnect, "http://example.com:443", nil)
+	req.Host = "example.com:443"
+	req.RemoteAddr = "10.1.2.3:5000"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("CONNECT got %d, want 429", rec.Code)
+	}
+	if asked != 1 {
+		t.Errorf("quota consulted %d times, want 1", asked)
+	}
+}
+
+// The health endpoint is a liveness probe, not proxied traffic. Letting a quota
+// refuse it would have an orchestrator restart the proxy precisely when it is
+// busiest.
+func TestQuotaDoesNotGateHealth(t *testing.T) {
+	r := &Router{
+		Proxy:      okHandler("PROXIED"),
+		HealthPath: DefaultHealthPath,
+		Quota: func(string) (bool, time.Duration, string) {
+			return false, time.Second, "global-requests"
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, DefaultHealthPath, nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("health probe got %d, want 200", rec.Code)
 	}
 }

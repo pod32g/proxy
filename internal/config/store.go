@@ -335,6 +335,11 @@ func (s *Store) Load(cfg *Config) error {
 			s.warn("stored policy rules are invalid and were ignored: %v", err)
 		}
 	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='quota_rules'`).Scan(&val); err == nil {
+		if err := cfg.SetQuotas(val); err != nil {
+			s.warn("stored quota rules are invalid and were ignored: %v", err)
+		}
+	}
 
 	_, user, pass := cfg.GetAuth()
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='username'`).Scan(&val); err == nil {
@@ -398,6 +403,7 @@ func (s *Store) Save(cfg *Config) error {
 		{"proxy_id", proxyID},
 		{"policy_rules", cfg.PolicyRulesText()},
 		{"client_rules", cfg.ClientRulesText()},
+		{"quota_rules", cfg.QuotaText()},
 	}
 
 	if cfg.SecretKey != "" {

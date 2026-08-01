@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/pod32g/proxy/internal/policy"
+	"github.com/pod32g/proxy/internal/quota"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -45,6 +46,10 @@ type Config struct {
 	// destination rule set scoped to them.
 	clientText  string
 	clientRules *policy.ClientSet
+
+	// Quotas: how much a client may push through, globally and per client.
+	quotaText string
+	quotaSet  *quota.Set
 
 	mu sync.RWMutex
 }
@@ -347,6 +352,34 @@ func (c *Config) ClientRulesText() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.clientText
+}
+
+// SetQuotas parses and installs the quota configuration.
+func (c *Config) SetQuotas(text string) error {
+	set, err := quota.Parse(text)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.quotaText = text
+	c.quotaSet = set
+	return nil
+}
+
+// QuotaSet returns the active quotas. Safe to call per request: the pointer is
+// replaced wholesale rather than mutated.
+func (c *Config) QuotaSet() *quota.Set {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.quotaSet
+}
+
+// QuotaText returns the quotas as written.
+func (c *Config) QuotaText() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.quotaText
 }
 
 // ClientAllowed reports whether an address may use the proxy, naming the rule

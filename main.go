@@ -14,6 +14,7 @@ import (
 	"github.com/pod32g/proxy/internal/api"
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/proxy"
+	"github.com/pod32g/proxy/internal/quota"
 	"github.com/pod32g/proxy/internal/server"
 	"github.com/pod32g/proxy/internal/ui"
 	log "github.com/pod32g/simple-logger"
@@ -149,6 +150,11 @@ func main() {
 		"client access rule (e.g. \"allow 10.0.0.0/8\", \"deny 10.1.2.3\", \"default deny\"); repeatable, longest prefix wins")
 	clientFile := flag.String("client-file", env.get("PROXY_CLIENT_FILE", ""),
 		"file of client access rules, one per line")
+	var quotaRules policyFlags
+	flag.Var(&quotaRules, "quota-rule",
+		"quota rule (e.g. \"global requests 500/s burst 1000\", \"client bytes 10MB/s\", \"client 10.0.0.0/8 requests 200/s\"); repeatable, unlimited by default")
+	quotaFile := flag.String("quota-file", env.get("PROXY_QUOTA_FILE", ""),
+		"file of quota rules, one per line")
 	connectPorts := flag.String("connect-ports", env.get("PROXY_CONNECT_PORTS", "443"),
 		"comma-separated ports CONNECT may tunnel to")
 	healthPath := flag.String("health-path", env.get("PROXY_HEALTH_PATH", server.DefaultHealthPath),
@@ -254,6 +260,20 @@ func main() {
 		setFlagsExtra["client-rule"] = true
 	}
 
+	if *quotaFile != "" {
+		data, err := os.ReadFile(*quotaFile)
+		if err != nil {
+			fatalf("-quota-file: %v", err)
+		}
+		quotaRules = append(quotaRules, strings.Split(string(data), "\n")...)
+	}
+	if len(quotaRules) > 0 {
+		if err := cfg.SetQuotas(strings.Join(quotaRules, "\n")); err != nil {
+			fatalf("invalid quota rules: %v", err)
+		}
+		setFlagsExtra["quota-rule"] = true
+	}
+
 	pol := proxy.Policy{
 		AllowPrivate: *allowPrivate,
 		ConnectPorts: ports,
@@ -331,6 +351,16 @@ func main() {
 	tracker.SetGauge(metrics.Clients)
 	stats := server.NewDomainStats()
 
+	// Read through a function so quotas changed in the UI or API take effect
+	// without a restart, the same way credentials and policy rules do.
+	limiter := quota.NewLimiter(cfg.QuotaSet)
+	limiter.Rejected = func(s quota.Scope) { metrics.QuotaRejected.WithLabelValues(string(s)).Inc() }
+	limiter.Metered = func(n int64) { metrics.RelayedBytes.Add(float64(n)) }
+	limiter.Tracked = func(n int) { metrics.QuotaClients.Set(float64(n)) }
+	if set := cfg.QuotaSet(); !set.Empty() {
+		logger.Info("Quotas active", log.String("rules", strings.ReplaceAll(set.String(), "\n", "; ")))
+	}
+
 	var handler http.Handler
 	if cfg.Mode == "forward" {
 		if !*allowPrivate {
@@ -349,6 +379,10 @@ func main() {
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string { return target.Host })
 	}
 	handler = server.MetricsMiddleware(handler, metrics)
+	// Metering wraps outermost so it sees the connection before anything else
+	// hijacks it: a CONNECT tunnel and a WebSocket upgrade both bypass the
+	// ResponseWriter entirely, and they are the traffic a byte quota exists for.
+	handler = server.MeterMiddleware(handler, limiter.Charge)
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	apiHandler := api.New(cfg, store, logger, stats)
 	// One Router serves whatever it is given: with no Proxy it 404s unmatched
@@ -370,6 +404,15 @@ func main() {
 			HealthPath:    *healthPath,
 			MetricsPublic: *metricsPublic,
 			AuthFailures:  metrics.AuthFailures,
+			// Both consulted per request, so a rule or quota changed at runtime
+			// applies to the next request rather than the next restart.
+			ClientAllowed: cfg.ClientAllowed,
+			// Adapted rather than passed directly so the server package does not
+			// have to know the quota package exists.
+			Quota: func(ip string) (bool, time.Duration, string) {
+				ok, retryAfter, scope := limiter.Allow(ip)
+				return ok, retryAfter, string(scope)
+			},
 		}
 	}
 
