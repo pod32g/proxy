@@ -14,6 +14,7 @@ import (
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/reqid"
 	log "github.com/pod32g/simple-logger"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // exchanges collects completion records from every goroutine that produces one.
@@ -372,4 +373,75 @@ func TestTunnelRecordCarriesTheRequestID(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Error("tunnel was never recorded")
+}
+
+// The accounting layer carries the served flag through to the completion
+// record, including for tunnels, whose record is produced from the close path.
+func TestExchangeCarriesServed(t *testing.T) {
+	var got exchanges
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.(interface{ SetServed() }).SetServed()
+	}), Accounting{Completed: got.add})
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:1"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if !got.all()[0].Served {
+		t.Error("Served was not carried into the record")
+	}
+}
+
+func TestExchangeDefaultsToNotServed(t *testing.T) {
+	var got exchanges
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A handler that refuses writes a status and never forwards.
+		w.WriteHeader(http.StatusForbidden)
+	}), Accounting{Completed: got.add})
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:1"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got.all()[0].Served {
+		t.Error("a refusal was recorded as served; the default must be false")
+	}
+}
+
+// The signal has to survive the whole assembled stack, not just the accounting
+// wrapper. The first version of this feature passed its unit tests against a
+// bare writer while the real chain — accounting outside, metrics recorder in
+// between — silently swallowed it, because the recorder did not forward the
+// call. Every wrapper between the handler and the layer that cares has to.
+func TestServedSurvivesTheAssembledMiddlewareStack(t *testing.T) {
+	var got exchanges
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s, ok := w.(interface{ SetServed() })
+		if !ok {
+			t.Fatal("the handler cannot signal Served through this stack")
+		}
+		s.SetServed()
+		w.Write([]byte("ok"))
+	})
+
+	metrics, err := NewMetrics(prometheus.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewMetrics: %v", err)
+	}
+	// Exactly the order main assembles: accounting outermost, metrics inside.
+	h := AccountingMiddleware(MetricsMiddleware(inner, metrics),
+		Accounting{Completed: got.add})
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:1"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	all := got.all()
+	if len(all) != 1 {
+		t.Fatalf("got %d records", len(all))
+	}
+	if !all[0].Served {
+		t.Error("Served was swallowed between the handler and the accounting layer")
+	}
 }

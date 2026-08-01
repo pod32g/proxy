@@ -25,6 +25,12 @@ type Exchange struct {
 	Duration time.Duration
 	// RequestID identifies this exchange across the hop.
 	RequestID string
+	// Served reports whether the proxy actually forwarded this request to a
+	// destination. A request the proxy itself refused — by policy, by the client
+	// table, by the CONNECT port list, by a quota — never reached one, and
+	// counting it as traffic to that host would let a client put entries in the
+	// "busiest destinations" view using requests that never succeeded.
+	Served bool
 	// Tunnel marks an exchange that was hijacked — a CONNECT tunnel or a
 	// protocol upgrade. Its record arrives when the connection closes, not when
 	// it was established, so the byte counts mean something.
@@ -156,6 +162,7 @@ type accountedWriter struct {
 	pendingOut atomic.Int64
 	status     atomic.Int32
 	hijacked   atomic.Bool
+	served     atomic.Bool
 
 	start     time.Time
 	exchange  Exchange
@@ -176,6 +183,18 @@ func (m *accountedWriter) Write(b []byte) (int, error) {
 func (m *accountedWriter) WriteHeader(code int) {
 	m.status.Store(int32(code))
 	m.ResponseWriter.WriteHeader(code)
+}
+
+// SetServed marks the exchange as having reached a destination. Only the proxy
+// handler knows this, and it knows it exactly: after a successful round trip,
+// after a successful CONNECT dial, after an upgrade is established. Inferring
+// it from the status code instead would misread an origin's own 403 as a
+// refusal we made.
+func (m *accountedWriter) SetServed() {
+	m.served.Store(true)
+	if s, ok := m.ResponseWriter.(interface{ SetServed() }); ok {
+		s.SetServed()
+	}
 }
 
 // SetStatus records a status the handler could not write through WriteHeader,
@@ -254,6 +273,7 @@ func (m *accountedWriter) finish() {
 	e.BytesOut = m.out.Load()
 	e.Duration = time.Since(m.start)
 	e.Tunnel = m.hijacked.Load()
+	e.Served = m.served.Load()
 	m.completed(e)
 }
 

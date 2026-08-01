@@ -175,6 +175,19 @@ type statusRecorder struct {
 // this the exchange would be counted as a 200 like any other.
 func (r *statusRecorder) SetStatus(code int) { r.status = code }
 
+// SetServed passes the handler's "this reached a destination" signal down to
+// the accounting layer, which is what consumes it.
+//
+// Every wrapper between the handler and the layer that cares has to forward
+// this, or the signal is silently swallowed by whichever one does not — which
+// is exactly what happened here the first time: the unit tests passed against a
+// bare writer while the assembled stack dropped it.
+func (r *statusRecorder) SetServed() {
+	if s, ok := r.ResponseWriter.(interface{ SetServed() }); ok {
+		s.SetServed()
+	}
+}
+
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)

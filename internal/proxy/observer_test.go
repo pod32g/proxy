@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
@@ -417,5 +418,123 @@ func BenchmarkObserverTraceDisabled(b *testing.B) {
 		out, end := obs.trace(req, "example.com", "/a")
 		_ = out
 		end(200, nil)
+	}
+}
+
+// servedRecorder stands in for the accounting layer, which is the only thing
+// that consumes this signal in production.
+type servedRecorder struct {
+	http.ResponseWriter
+	served bool
+}
+
+func (s *servedRecorder) SetServed() { s.served = true }
+
+func (s *servedRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := s.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+// A request the proxy refused never reached a destination, so it must not be
+// counted as traffic to the host it was refused from. The status alone cannot
+// carry this: an origin can answer 403 exactly as a policy refusal does.
+func TestRefusedRequestsAreNotMarkedServed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pol    Policy
+		method string
+		target string
+	}{
+		{"destination rule", Policy{AllowPrivate: true, Rules: rules(t, "deny all")},
+			http.MethodGet, "http://example.com/"},
+		{"private address default", Policy{}, http.MethodGet, "http://127.0.0.1:9/"},
+		{"connect port", Policy{AllowPrivate: true}, http.MethodConnect, "example.com:25"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewForward(newLogger(), func(string) map[string]string { return nil }, tc.pol)
+			req := httptest.NewRequest(tc.method, tc.target, nil)
+			if tc.method == http.MethodConnect {
+				req.Host = tc.target
+			}
+			req.RemoteAddr = "10.1.2.3:5000"
+
+			rec := &servedRecorder{ResponseWriter: httptest.NewRecorder()}
+			h.ServeHTTP(rec, req)
+
+			if rec.served {
+				t.Error("a refused request was marked as having reached a destination")
+			}
+		})
+	}
+}
+
+// And a request that did reach an origin must be marked, whatever the origin
+// answered — a 403 from the origin is still a destination the proxy served.
+func TestServedIsMarkedEvenWhenTheOriginRefuses(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer backend.Close()
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, testPolicy())
+	u, _ := url.Parse(backend.URL)
+	req := httptest.NewRequest(http.MethodGet, backend.URL+"/x", nil)
+	req.URL = u.JoinPath("/x")
+	req.RemoteAddr = "10.1.2.3:5000"
+
+	rec := &servedRecorder{ResponseWriter: httptest.NewRecorder()}
+	h.ServeHTTP(rec, req)
+
+	if !rec.served {
+		t.Error("an origin's own 403 was mistaken for a refusal we made")
+	}
+}
+
+// A CONNECT tunnel reaches its destination at the dial, before any byte flows.
+func TestConnectMarksServedOnceTheTunnelIsUp(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	portNum := 0
+	fmt.Sscanf(port, "%d", &portNum)
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{AllowPrivate: true, ConnectPorts: []int{portNum}})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &servedRecorder{ResponseWriter: w}
+		h.ServeHTTP(rec, r)
+		if !rec.served {
+			t.Error("an established tunnel was not marked as served")
+		}
+	}))
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", ln.Addr(), ln.Addr())
+	head := make([]byte, 0, 128)
+	buf := make([]byte, 1)
+	for !hasHeaderEnd(head) {
+		if _, err := conn.Read(buf); err != nil {
+			break
+		}
+		head = append(head, buf[0])
 	}
 }

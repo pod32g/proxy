@@ -378,6 +378,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			return
 		}
 		endSpan(resp.StatusCode, nil)
+		markServed(w)
 		defer resp.Body.Close()
 		removeHopByHop(resp.Header)
 		copyHeader(w.Header(), resp.Header)
@@ -407,6 +408,18 @@ func headerHasToken(h http.Header, name, token string) bool {
 		}
 	}
 	return false
+}
+
+// servedSetter lets a handler report that a request actually reached a
+// destination. The accounting layer cannot tell that from the status alone: an
+// origin can answer 403 just as a policy refusal does.
+type servedSetter interface{ SetServed() }
+
+// markServed records that this exchange reached a destination.
+func markServed(w http.ResponseWriter) {
+	if s, ok := w.(servedSetter); ok {
+		s.SetServed()
+	}
 }
 
 // statusSetter lets a handler report a status it could not write through
@@ -453,6 +466,8 @@ func handleUpgrade(
 		http.Error(w, "Bad gateway", http.StatusBadGateway)
 		return
 	}
+
+	markServed(w)
 
 	// The origin is entitled to decline. Anything but 101 is an ordinary
 	// response and must be relayed as one rather than hijacked.
@@ -543,6 +558,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 		http.Error(w, "Bad gateway", http.StatusBadGateway)
 		return
 	}
+	markServed(w)
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)

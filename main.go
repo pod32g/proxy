@@ -434,11 +434,13 @@ func main() {
 	}
 
 	var handler http.Handler
+	var forwardMode bool
 	if cfg.Mode == "forward" {
 		if !*allowPrivate {
 			logger.Info("Refusing to proxy to loopback/private addresses; pass -allow-private to permit them")
 		}
 		logger.Infof("CONNECT allowed to ports %s", *connectPorts)
+		forwardMode = true
 		h := proxy.NewForward(logger, cfg.GetHeadersForClient, pol, proxy.Observer{
 			Upstream: func(method string, d time.Duration) {
 				metrics.UpstreamDuration.WithLabelValues(method).Observe(d.Seconds())
@@ -449,21 +451,37 @@ func main() {
 			// nil when tracing is off, which is what makes it free.
 			Trace: tracer.Hook(),
 		})
-		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string {
-			if r.Method == http.MethodConnect {
-				return r.Host
-			}
-			return r.URL.Host
-		})
+		handler = h
 	} else {
-		h := proxy.New(target, logger, cfg.GetHeadersForClient)
-		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string { return target.Host })
+		handler = proxy.New(target, logger, cfg.GetHeadersForClient)
 	}
 	handler = server.MetricsMiddleware(handler, metrics)
 	// Accounting wraps outermost so it sees the connection before anything else
 	// hijacks it: a CONNECT tunnel and a WebSocket upgrade both bypass the
 	// ResponseWriter entirely, and they are the traffic both the byte quota and
 	// the access log care about most. One pass feeds both.
+	// Destinations are recorded from the completion record rather than at
+	// request entry, so a request the proxy refused is not counted as traffic to
+	// the host it was refused from. Recording on the way in let a client put
+	// entries in the "busiest destinations" view using requests that never
+	// succeeded, and let a malformed CONNECT target land a nonsense host there.
+	//
+	// Reverse mode is different and deliberately unchanged: the key is always
+	// the configured target, a constant nothing can inject, so every request to
+	// it is worth counting whether the backend answered or not.
+	recordDestination := func(e server.Exchange) {
+		if !cfg.StatsEnabledState() {
+			return
+		}
+		if !forwardMode {
+			stats.Record(server.HostOnly(target.Host))
+			return
+		}
+		if e.Served {
+			stats.Record(server.HostOnly(e.Host))
+		}
+	}
+
 	handler = server.AccountingMiddleware(handler, server.Accounting{
 		Charge: func(client string, in, out int64) {
 			// The quota is charged the total — bytes cost the same whichever
@@ -478,7 +496,12 @@ func main() {
 				metrics.RelayedBytes.WithLabelValues("out").Add(float64(out))
 			}
 		},
-		Completed: accessLog,
+		Completed: func(e server.Exchange) {
+			recordDestination(e)
+			if accessLog != nil {
+				accessLog(e)
+			}
+		},
 	})
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	apiHandler := api.New(cfg, store, logger, stats)

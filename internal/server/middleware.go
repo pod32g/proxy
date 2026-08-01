@@ -1,9 +1,6 @@
 package server
 
-import (
-	"net"
-	"net/http"
-)
+import "net"
 
 // hostOnly strips a trailing port. Splitting on the last colon by hand looks
 // equivalent and is not: a bare IPv6 literal is all colons, so `2001:db8::1`
@@ -25,15 +22,8 @@ func hostOnly(host string) string {
 // it or the same client looks like several.
 func HostOnly(host string) string { return hostOnly(host) }
 
-// StatsMiddleware records hosts for incoming requests using DomainStats.
-func StatsMiddleware(next http.Handler, stats *DomainStats, enabled func() bool, hostGetter func(*http.Request) string) http.Handler {
-	if next == nil || stats == nil {
-		return next
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if enabled == nil || enabled() {
-			stats.Record(hostOnly(hostGetter(r)))
-		}
-		next.ServeHTTP(w, r)
-	})
-}
+// Destinations used to be recorded here, on the way in. They are now recorded
+// from the completion record, because recording before the handler runs counts
+// requests the proxy went on to refuse — which let a client put entries in the
+// "busiest destinations" view using requests that never succeeded. The
+// middleware is gone rather than left unused so nobody wires it back.

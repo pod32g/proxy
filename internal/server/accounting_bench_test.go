@@ -98,3 +98,13 @@ func BenchmarkAccessLogCombined(b *testing.B) {
 		Completed: NewAccessLog("combined", nil, io.Discard),
 	}))
 }
+
+// The completion hook is now always installed, because destination stats can be
+// switched on at runtime. This is what that costs when nothing is logged: the
+// record is built and handed to a hook that does nothing with it.
+func BenchmarkAccountingRecordOnly(b *testing.B) {
+	runBench(b, AccountingMiddleware(benchHandler(benchBody), Accounting{
+		Charge:    func(string, int64, int64) {},
+		Completed: func(Exchange) {},
+	}))
+}
