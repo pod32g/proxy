@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/pod32g/proxy/internal/reqid"
 	log "github.com/pod32g/simple-logger"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // exchanges collects completion records from every goroutine that produces one.
@@ -443,5 +445,183 @@ func TestServedSurvivesTheAssembledMiddlewareStack(t *testing.T) {
 	}
 	if !all[0].Served {
 		t.Error("Served was swallowed between the handler and the accounting layer")
+	}
+}
+
+// instrumented assembles the stack in the same order main does: accounting
+// outermost, then metrics, then the Router. The order is the point of PROXY-63
+// — with the Router outside, everything it refused produced no record at all.
+func instrumented(t *testing.T, r *Router, got *exchanges) (http.Handler, *Metrics) {
+	t.Helper()
+	m, err := NewMetrics(prometheus.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewMetrics: %v", err)
+	}
+	return AccountingMiddleware(MetricsMiddleware(r, m), Accounting{Completed: got.add}), m
+}
+
+// The bug: a request the Router refuses is proxy traffic and has to appear in
+// both surfaces. Previously it appeared in neither, so the access log silently
+// omitted exactly the requests an operator goes looking for.
+func TestRouterRefusalsAreRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		router func() *Router
+		status int
+	}{
+		{
+			name: "client table",
+			router: func() *Router {
+				return &Router{
+					Proxy:         okHandler("PROXIED"),
+					ClientAllowed: func(string) (bool, string) { return false, "default deny" },
+				}
+			},
+			status: http.StatusForbidden,
+		},
+		{
+			name: "quota",
+			router: func() *Router {
+				return &Router{
+					Proxy: okHandler("PROXIED"),
+					Quota: func(string) (bool, time.Duration, string) {
+						return false, time.Second, "client-requests"
+					},
+				}
+			},
+			status: http.StatusTooManyRequests,
+		},
+		{
+			name: "authentication",
+			router: func() *Router {
+				return &Router{
+					Proxy: okHandler("PROXIED"),
+					Auth:  func() (bool, string, string) { return true, "u", "p" },
+				}
+			},
+			status: http.StatusProxyAuthRequired,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got exchanges
+			h, m := instrumented(t, tc.router(), &got)
+
+			req := httptest.NewRequest("GET", "http://example.com/", nil)
+			req.RemoteAddr = "10.1.2.3:5000"
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.status)
+			}
+			all := got.all()
+			if len(all) != 1 {
+				t.Fatalf("got %d access records, want exactly 1", len(all))
+			}
+			if all[0].Status != tc.status {
+				t.Errorf("record status = %d, want %d", all[0].Status, tc.status)
+			}
+			// A refusal never reached a destination, so it must not be counted
+			// as traffic to the host it was refused from.
+			if all[0].Served {
+				t.Error("a refused request was recorded as served")
+			}
+			if v := testutil.ToFloat64(
+				m.Requests.WithLabelValues("GET", strconv.Itoa(tc.status), "")); v != 1 {
+				t.Errorf("request counter = %v, want 1", v)
+			}
+		})
+	}
+}
+
+// A refusal has to be attributable to the listener that refused it, or a
+// multi-listener deployment cannot tell which policy did the refusing.
+func TestRefusalsCarryTheListenerName(t *testing.T) {
+	var got exchanges
+	r := &Router{
+		Proxy:         okHandler("PROXIED"),
+		ClientAllowed: func(string) (bool, string) { return false, "deny" },
+	}
+	h, _ := instrumented(t, r, &got)
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	WithListener(h, "external").ServeHTTP(httptest.NewRecorder(), req)
+
+	all := got.all()
+	if len(all) != 1 {
+		t.Fatalf("got %d records", len(all))
+	}
+	if all[0].Listener != "external" {
+		t.Errorf("listener = %q, want the refusing listener", all[0].Listener)
+	}
+}
+
+// Health probes arrive every few seconds forever. Logging them would swamp the
+// access log and counting them would put a constant floor under every
+// request-rate graph.
+func TestHealthProbesAreNotRecorded(t *testing.T) {
+	var got exchanges
+	r := &Router{Proxy: okHandler("PROXIED"), HealthPath: DefaultHealthPath}
+	h, m := instrumented(t, r, &got)
+
+	req := httptest.NewRequest("GET", DefaultHealthPath, nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health probe got %d", rec.Code)
+	}
+	if n := len(got.all()); n != 0 {
+		t.Errorf("%d access records for a health probe, want 0", n)
+	}
+	if v := testutil.CollectAndCount(m.Requests); v != 0 {
+		t.Errorf("%d request series for a health probe, want 0", v)
+	}
+}
+
+// An operator with a browser open is not proxy traffic. Counting the admin
+// surface would make "requests to the proxy" mean two different things.
+func TestAdminSurfaceIsNotRecordedAsProxyTraffic(t *testing.T) {
+	for _, path := range []string{"/ui/general", "/api/policy", "/metrics"} {
+		t.Run(path, func(t *testing.T) {
+			var got exchanges
+			r := &Router{
+				Proxy: okHandler("PROXIED"), UI: okHandler("UI"),
+				API: okHandler("API"), Metrics: okHandler("METRICS"),
+			}
+			h, m := instrumented(t, r, &got)
+
+			req := httptest.NewRequest("GET", path, nil)
+			req.RemoteAddr = "10.1.2.3:5000"
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			if n := len(got.all()); n != 0 {
+				t.Errorf("%d access records for %s, want 0", n, path)
+			}
+			if v := testutil.CollectAndCount(m.Requests); v != 0 {
+				t.Errorf("%d request series for %s, want 0", v, path)
+			}
+		})
+	}
+}
+
+// A duplicated record would be worse than the missing one: it would silently
+// double every rate computed from the log.
+func TestProxiedRequestProducesExactlyOneRecord(t *testing.T) {
+	var got exchanges
+	r := &Router{Proxy: okHandler("PROXIED")}
+	h, m := instrumented(t, r, &got)
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if n := len(got.all()); n != 1 {
+		t.Errorf("got %d access records, want exactly 1", n)
+	}
+	if v := testutil.ToFloat64(m.Requests.WithLabelValues("GET", "200", "")); v != 1 {
+		t.Errorf("request counter = %v, want exactly 1", v)
 	}
 }

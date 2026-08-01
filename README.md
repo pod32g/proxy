@@ -423,6 +423,17 @@ reason, and no header is ever written to this log.
 counts in both directions — logged at establishment they would report zero
 bytes and no duration.
 
+**Refusals are logged too.** A request turned away by authentication, the client
+table or a quota is proxy traffic and appears in the log and in
+`proxy_http_requests_total` like any other, with the listener that refused it.
+Omitting them would leave the log silent about exactly the requests an operator
+goes looking for.
+
+**Liveness probes and the admin surface are not.** A probe arrives every few
+seconds forever and would swamp the log and put a constant floor under every
+request-rate graph; an operator with a browser open is not a proxy client. They
+are excluded deliberately rather than by accident of ordering.
+
 ## Request IDs
 
 Every request gets an identifier, so one exchange can be followed from the

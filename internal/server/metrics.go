@@ -155,6 +155,13 @@ func MetricsMiddleware(next http.Handler, m *Metrics) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w}
 		start := time.Now()
 		next.ServeHTTP(rec, r)
+
+		// Liveness probes and the admin surface are not proxy traffic, and
+		// counting them would put a constant floor under every request-rate
+		// graph and make "requests to the proxy" mean two different things.
+		if s, ok := w.(interface{ Skipped() bool }); ok && s.Skipped() {
+			return
+		}
 		dur := time.Since(start).Seconds()
 		// status stays 0 when the handler neither wrote nor set a code — a
 		// hijacked CONNECT, for instance. That is a 200 as far as the client
@@ -178,6 +185,13 @@ type statusRecorder struct {
 // A protocol switch is written directly to a hijacked connection, so without
 // this the exchange would be counted as a 200 like any other.
 func (r *statusRecorder) SetStatus(code int) { r.status = code }
+
+// SkipAccounting passes the exclusion signal down to the accounting layer.
+func (r *statusRecorder) SkipAccounting() {
+	if s, ok := r.ResponseWriter.(interface{ SkipAccounting() }); ok {
+		s.SkipAccounting()
+	}
+}
 
 // SetServed passes the handler's "this reached a destination" signal down to
 // the accounting layer, which is what consumes it.

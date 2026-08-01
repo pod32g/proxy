@@ -190,6 +190,7 @@ type accountedWriter struct {
 	status     atomic.Int32
 	hijacked   atomic.Bool
 	served     atomic.Bool
+	skipped    atomic.Bool
 
 	start     time.Time
 	exchange  Exchange
@@ -211,6 +212,27 @@ func (m *accountedWriter) WriteHeader(code int) {
 	m.status.Store(int32(code))
 	m.ResponseWriter.WriteHeader(code)
 }
+
+// SkipAccounting excludes an exchange from the access log and the request
+// counter entirely.
+//
+// This is for traffic that is not proxying at all: liveness probes, which an
+// orchestrator sends every few seconds forever and which would swamp the log
+// and put a constant floor under every request-rate graph, and the admin
+// surface, where an operator with a browser open is not a proxy client.
+//
+// It is deliberately a third category rather than a variant of "refused". A
+// refused request *is* proxy traffic and belongs in both surfaces; a UI page
+// view is not proxy traffic at all.
+func (m *accountedWriter) SkipAccounting() {
+	m.skipped.Store(true)
+	if s, ok := m.ResponseWriter.(interface{ SkipAccounting() }); ok {
+		s.SkipAccounting()
+	}
+}
+
+// Skipped reports whether this exchange was excluded.
+func (m *accountedWriter) Skipped() bool { return m.skipped.Load() }
 
 // SetServed marks the exchange as having reached a destination. Only the proxy
 // handler knows this, and it knows it exactly: after a successful round trip,
@@ -250,7 +272,7 @@ func (m *accountedWriter) Push(target string, opts *http.PushOptions) error {
 // mutex acquisition on every packet; waiting for the exchange to end would let a
 // long-running transfer escape the quota it feeds.
 func (m *accountedWriter) chargedIn(n int64) {
-	if n <= 0 || m.charge == nil {
+	if n <= 0 || m.charge == nil || m.skipped.Load() {
 		return
 	}
 	if total := m.pendingIn.Add(n); total >= chargeChunk {
@@ -259,7 +281,7 @@ func (m *accountedWriter) chargedIn(n int64) {
 }
 
 func (m *accountedWriter) chargedOut(n int64) {
-	if n <= 0 || m.charge == nil {
+	if n <= 0 || m.charge == nil || m.skipped.Load() {
 		return
 	}
 	if total := m.pendingOut.Add(n); total >= chargeChunk {
@@ -286,7 +308,7 @@ func (m *accountedWriter) finish() {
 		return
 	}
 	m.flushCharge()
-	if m.completed == nil {
+	if m.completed == nil || m.skipped.Load() {
 		return
 	}
 	e := m.exchange

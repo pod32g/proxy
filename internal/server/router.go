@@ -72,6 +72,17 @@ type authFailure struct {
 	first time.Time
 }
 
+// skipAccounting excludes a response from the access log and the request
+// counter. The Router calls it for everything that is not proxy traffic —
+// liveness probes and the admin surface — so that moving the accounting
+// middleware outside the Router does not turn a UI page view into a proxied
+// request or bury the log under health checks.
+func skipAccounting(w http.ResponseWriter) {
+	if s, ok := w.(interface{ SkipAccounting() }); ok {
+		s.SkipAccounting()
+	}
+}
+
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// An absolute request URI means the client is asking the proxy to fetch a
 	// remote resource; only origin-form requests are addressed to the proxy
@@ -85,6 +96,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// credentials are set, and report only liveness.
 	healthPath := r.HealthPath
 	if direct && healthPath != "" && req.URL.Path == healthPath {
+		skipAccounting(w)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -105,20 +117,24 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// quota — would be its own trap.
 	if direct {
 		if metricsRequest {
+			skipAccounting(w)
 			r.Metrics.ServeHTTP(w, req)
 			return
 		}
 		if r.API != nil && strings.HasPrefix(req.URL.Path, "/api/") {
+			skipAccounting(w)
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api")
 			r.API.ServeHTTP(w, req)
 			return
 		}
 		if r.UI != nil {
 			if req.URL.Path == "/ui" {
+				skipAccounting(w)
 				http.Redirect(w, req, "/ui/", http.StatusMovedPermanently)
 				return
 			}
 			if strings.HasPrefix(req.URL.Path, "/ui/") {
+				skipAccounting(w)
 				req.URL.Path = strings.TrimPrefix(req.URL.Path, "/ui")
 				r.UI.ServeHTTP(w, req)
 				return

@@ -473,8 +473,17 @@ func main() {
 	// the flag-configured listeners, a config.Listener for the extra ones — so a
 	// listener with its own policy is a different set of closures rather than a
 	// conditional threaded through the request path.
+	// buildChain returns the proxy handler for a listener and the instrumentation
+	// that wraps whatever serves it.
+	//
+	// The two are separate because the Router has to sit *inside* the
+	// instrumentation: a request the Router refuses — bad credentials, a client
+	// the table bars, an exhausted quota — is proxy traffic and belongs in the
+	// access log and the request counter. With the Router outside, those
+	// refusals produced no record at all, so the log silently omitted exactly
+	// the requests an operator goes looking for.
 	buildChain := func(name string, scope proxyScope, mode, targetURL string,
-		allowPrivate bool, ports []int, lim *quota.Limiter) (http.Handler, error) {
+		allowPrivate bool, ports []int, lim *quota.Limiter) (http.Handler, func(http.Handler) http.Handler, error) {
 
 		listenerPol := proxy.Policy{
 			AllowPrivate: allowPrivate,
@@ -499,12 +508,12 @@ func main() {
 		} else {
 			u, err := url.Parse(targetURL)
 			if err != nil {
-				return nil, fmt.Errorf("listener %q: invalid target %q: %v", name, targetURL, err)
+				return nil, nil, fmt.Errorf("listener %q: invalid target %q: %v", name, targetURL, err)
 			}
 			reverseTarget = u
 			handler = proxy.New(u, logger, cfg.GetHeadersForClient)
 		}
-		handler = server.MetricsMiddleware(handler, metrics)
+		inner := handler
 		// Accounting wraps outermost so it sees the connection before anything else
 		// hijacks it: a CONNECT tunnel and a WebSocket upgrade both bypass the
 		// ResponseWriter entirely, and they are the traffic both the byte quota and
@@ -531,28 +540,30 @@ func main() {
 			}
 		}
 
-		handler = server.AccountingMiddleware(handler, server.Accounting{
-			Charge: func(client string, in, out int64) {
-				// The quota is charged the total — bytes cost the same
-				// whichever way they went — while the metric keeps them apart,
-				// because "which direction is saturated" is a question the
-				// total cannot answer.
-				lim.Charge(client, in+out)
-				if in > 0 {
-					metrics.RelayedBytes.WithLabelValues("in").Add(float64(in))
-				}
-				if out > 0 {
-					metrics.RelayedBytes.WithLabelValues("out").Add(float64(out))
-				}
-			},
-			Completed: func(e server.Exchange) {
-				recordDestination(e)
-				if accessLog != nil {
-					accessLog(e)
-				}
-			},
-		})
-		return handler, nil
+		instrument := func(h http.Handler) http.Handler {
+			return server.AccountingMiddleware(server.MetricsMiddleware(h, metrics), server.Accounting{
+				Charge: func(client string, in, out int64) {
+					// The quota is charged the total — bytes cost the same
+					// whichever way they went — while the metric keeps them
+					// apart, because "which direction is saturated" is a
+					// question the total cannot answer.
+					lim.Charge(client, in+out)
+					if in > 0 {
+						metrics.RelayedBytes.WithLabelValues("in").Add(float64(in))
+					}
+					if out > 0 {
+						metrics.RelayedBytes.WithLabelValues("out").Add(float64(out))
+					}
+				},
+				Completed: func(e server.Exchange) {
+					recordDestination(e)
+					if accessLog != nil {
+						accessLog(e)
+					}
+				},
+			})
+		}
+		return inner, instrument, nil
 	}
 
 	if cfg.Mode == "forward" {
@@ -561,7 +572,7 @@ func main() {
 		}
 		logger.Infof("CONNECT allowed to ports %s", *connectPorts)
 	}
-	handler, err := buildChain("http", cfg, cfg.Mode, cfg.TargetURL, *allowPrivate, ports, limiter)
+	handler, instrument, err := buildChain("http", cfg, cfg.Mode, cfg.TargetURL, *allowPrivate, ports, limiter)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -622,7 +633,7 @@ func main() {
 			if l.HasQuotaOverride() {
 				lim = newLimiter(l.QuotaSet, metrics)
 			}
-			chain, err := buildChain(l.Name, l, l.ResolvedMode(), l.ResolvedTarget(),
+			chain, instrumentListener, err := buildChain(l.Name, l, l.ResolvedMode(), l.ResolvedTarget(),
 				l.AllowPrivate, l.ConnectPorts, lim)
 			if err != nil {
 				fatalf("%v", err)
@@ -637,7 +648,7 @@ func main() {
 				Addr:     l.Addr,
 				CertFile: l.Cert,
 				KeyFile:  l.Key,
-				Handler:  server.WithListener(r, l.Name),
+				Handler:  server.WithListener(instrumentListener(r), l.Name),
 			})
 			logger.Info("Listener configured",
 				log.String("listener", l.Name),
@@ -653,13 +664,13 @@ func main() {
 		HTTPSAddr: cfg.HTTPSAddr,
 		CertFile:  cfg.CertFile,
 		KeyFile:   cfg.KeyFile,
-		Handler:   server.WithListener(mux, "http"),
+		Handler:   server.WithListener(instrument(mux), "http"),
 		Logger:    logger,
 		Clients:   tracker,
 	}
 	if adminMux != nil {
 		srv.AdminAddr = *adminAddr
-		srv.AdminHandler = server.WithListener(adminMux, "admin")
+		srv.AdminHandler = server.WithListener(instrument(adminMux), "admin")
 		srv.AdminCertFile = *adminCert
 		srv.AdminKeyFile = *adminKey
 	}
