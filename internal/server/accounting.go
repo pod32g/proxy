@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/pod32g/proxy/internal/reqid"
 )
 
 // Exchange is the record of one completed request, as the access log wants it.
@@ -21,6 +23,8 @@ type Exchange struct {
 	BytesIn  int64
 	BytesOut int64
 	Duration time.Duration
+	// RequestID identifies this exchange across the hop.
+	RequestID string
 	// Tunnel marks an exchange that was hijacked — a CONNECT tunnel or a
 	// protocol upgrade. Its record arrives when the connection closes, not when
 	// it was established, so the byte counts mean something.
@@ -63,6 +67,19 @@ func AccountingMiddleware(next http.Handler, acct Accounting) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		client := hostOnly(r.RemoteAddr)
 		start := time.Now()
+
+		// Assigned here, at the outermost layer, so that everything downstream —
+		// the access log, the proxy handler's own warnings, the header sent
+		// upstream — refers to the same exchange by the same name.
+		id := reqid.FromRequestOrNew(r.Header.Get(reqid.Header))
+		if id != "" {
+			r = r.WithContext(reqid.WithID(r.Context(), id))
+			// Echoed to the caller so they can correlate without reading our
+			// logs, and set before the handler runs because a hijacked
+			// connection never writes headers at all.
+			w.Header().Set(reqid.Header, id)
+		}
+
 		m := &accountedWriter{
 			ResponseWriter: w,
 			client:         client,
@@ -73,7 +90,7 @@ func AccountingMiddleware(next http.Handler, acct Accounting) http.Handler {
 		}
 
 		host, path := destination(r)
-		m.exchange = Exchange{Client: client, Method: r.Method, Host: host, Path: path}
+		m.exchange = Exchange{Client: client, Method: r.Method, Host: host, Path: path, RequestID: id}
 		m.completed = acct.Completed
 		m.start = start
 

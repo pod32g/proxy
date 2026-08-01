@@ -74,6 +74,9 @@ func logStructured(logger *log.Logger, e Exchange) {
 	if e.Path != "" {
 		fields = append(fields, log.String("path", e.Path))
 	}
+	if e.RequestID != "" {
+		fields = append(fields, log.String("request_id", e.RequestID))
+	}
 	if e.Tunnel {
 		fields = append(fields, log.Bool("tunnel", true))
 	}

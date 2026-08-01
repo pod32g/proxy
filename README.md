@@ -291,6 +291,28 @@ reason, and no header is ever written to this log.
 counts in both directions — logged at establishment they would report zero
 bytes and no duration.
 
+## Request IDs
+
+Every request gets an identifier, so one exchange can be followed from the
+client's logs through ours to the origin's. It appears in the access log as
+`request_id`, in the proxy's own warnings about that request, on the outbound
+request as `X-Request-Id`, and in the response back to the caller.
+
+An inbound `X-Request-Id` is **honoured**, not replaced — that is the point, and
+replacing it would break correlation with whatever assigned it upstream.
+
+It is not honoured *verbatim*, though. The value is attacker-controlled and is
+about to be written into every log line for the request, so an inbound ID is
+accepted only when it is plausibly an ID: printable ASCII, no spaces or quotes,
+at most 128 characters. Anything else is replaced with a generated one. A
+newline in that header would otherwise let a client forge log records, and a
+64KB value would bloat every entry. Honouring garbage is not the same as
+honouring the caller.
+
+Generated IDs are 16 random bytes, hex — deliberately the shape of a W3C
+trace-id, so that the request ID and a trace ID can be the same value rather
+than two identifiers somebody has to join.
+
 ## Audit trail
 
 Every configuration change that reaches the store is recorded: when, which

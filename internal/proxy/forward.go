@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pod32g/proxy/internal/policy"
+	"github.com/pod32g/proxy/internal/reqid"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -239,6 +240,16 @@ func (p Policy) dialContext(d *net.Dialer) func(context.Context, string, string)
 	}
 }
 
+// setRequestID puts the exchange's identifier on an outbound request, so the
+// origin's logs and ours name the same exchange. A client that supplied its own
+// usable id sees that one propagate; anything unusable was replaced upstream of
+// here, so what goes out is always sanitised.
+func setRequestID(out *http.Request) {
+	if id := reqid.FromContext(out.Context()); id != "" {
+		out.Header.Set(reqid.Header, id)
+	}
+}
+
 // withClient tags a request context with the client address so the dialer can
 // resolve that client's rules.
 func withClient(r *http.Request) *http.Request {
@@ -307,6 +318,9 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		for k, v := range headers(clientIP(r.RemoteAddr)) {
 			outReq.Header.Set(k, v)
 		}
+		// Carried to the origin so the exchange can be followed across the hop.
+		// Set after the operator's headers so a stray -header cannot displace it.
+		setRequestID(outReq)
 		// Timed around the round trip alone, which is the origin's contribution
 		// and nothing else. The middleware histogram already covers the total.
 		upstreamStart := time.Now()
@@ -319,7 +333,8 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			// failures.
 			if denied(err) {
 				logger.Warn("Refused destination",
-					log.String("host", r.URL.Host), log.String("client", clientIP(r.RemoteAddr)))
+					log.String("host", r.URL.Host), log.String("client", clientIP(r.RemoteAddr)),
+					log.String("request_id", reqid.FromContext(r.Context())))
 				obs.denied(deniedScope(err))
 				http.Error(w, "Destination not permitted", http.StatusForbidden)
 				return
@@ -386,13 +401,15 @@ func handleUpgrade(
 	for k, v := range headers(clientIP(r.RemoteAddr)) {
 		outReq.Header.Set(k, v)
 	}
+	setRequestID(outReq)
 
 	upstreamStart := time.Now()
 	resp, err := transport.RoundTrip(outReq)
 	obs.upstream(r.Method, time.Since(upstreamStart))
 	if err != nil {
 		if denied(err) {
-			logger.Warn("Refused upgrade destination", log.String("host", r.URL.Host))
+			logger.Warn("Refused upgrade destination", log.String("host", r.URL.Host),
+				log.String("request_id", reqid.FromContext(r.Context())))
 			obs.denied(deniedScope(err))
 			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return
@@ -476,7 +493,8 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 	if err != nil {
 		if denied(err) {
 			logger.Warn("Refused CONNECT destination",
-				log.String("host", r.Host), log.String("client", clientIP(r.RemoteAddr)))
+				log.String("host", r.Host), log.String("client", clientIP(r.RemoteAddr)),
+				log.String("request_id", reqid.FromContext(r.Context())))
 			obs.denied(deniedScope(err))
 			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return

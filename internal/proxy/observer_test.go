@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pod32g/proxy/internal/reqid"
 )
 
 // recorder collects observations from every goroutine that makes one — a tunnel
@@ -254,4 +256,71 @@ func proxyClient(t *testing.T, proxyAddr string) *http.Client {
 		t.Fatalf("proxy url: %v", err)
 	}
 	return &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u)}}
+}
+
+// The identifier has to reach the origin, or the hop it exists to bridge is
+// exactly where the trail stops.
+func TestRequestIDReachesTheOrigin(t *testing.T) {
+	received := make(chan string, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Get(reqid.Header)
+	}))
+	defer backend.Close()
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, testPolicy())
+	// Stand in for the middleware that assigns the id in production.
+	tagged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r.WithContext(reqid.WithID(r.Context(), "known-id")))
+	})
+	srv := httptest.NewServer(tagged)
+	defer srv.Close()
+
+	resp, err := proxyClient(t, srv.URL).Get(backend.URL)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case got := <-received:
+		if got != "known-id" {
+			t.Errorf("origin saw %q, want the exchange's id", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("origin never received the request")
+	}
+}
+
+// An operator's -header must not be able to displace the identifier, or the
+// correlation silently stops working for whoever configured that header.
+func TestOperatorHeaderCannotDisplaceTheRequestID(t *testing.T) {
+	received := make(chan string, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Get(reqid.Header)
+	}))
+	defer backend.Close()
+
+	h := NewForward(newLogger(), func(string) map[string]string {
+		return map[string]string{reqid.Header: "operator-supplied"}
+	}, testPolicy())
+	tagged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r.WithContext(reqid.WithID(r.Context(), "the-real-id")))
+	})
+	srv := httptest.NewServer(tagged)
+	defer srv.Close()
+
+	resp, err := proxyClient(t, srv.URL).Get(backend.URL)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case got := <-received:
+		if got != "the-real-id" {
+			t.Errorf("origin saw %q, want the exchange's id to win", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("origin never received the request")
+	}
 }

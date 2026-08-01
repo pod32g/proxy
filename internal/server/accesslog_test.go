@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pod32g/proxy/internal/config"
+	"github.com/pod32g/proxy/internal/reqid"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -261,4 +262,114 @@ func TestCombinedAccessLogNeutralisesInjection(t *testing.T) {
 	if strings.Contains(out, `/a" 200`) {
 		t.Errorf("injected quote was not escaped: %q", out)
 	}
+}
+
+// A caller that supplies its own identifier gets it back, propagates it, and
+// sees it in the record. Replacing it would break correlation with whatever
+// system upstream of us assigned it.
+func TestInboundRequestIDIsHonouredEndToEnd(t *testing.T) {
+	var got exchanges
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
+		Accounting{Completed: got.add})
+
+	const supplied = "0af7651916cd43dd8448eb211c80319c"
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:1"
+	req.Header.Set(reqid.Header, supplied)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if id := got.all()[0].RequestID; id != supplied {
+		t.Errorf("record id = %q, want the caller's %q", id, supplied)
+	}
+	// Echoed back so the caller can correlate without reading our logs.
+	if v := rec.Header().Get(reqid.Header); v != supplied {
+		t.Errorf("response header = %q, want %q", v, supplied)
+	}
+}
+
+func TestRequestIDIsGeneratedWhenAbsent(t *testing.T) {
+	var got exchanges
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
+		Accounting{Completed: got.add})
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:1"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	id := got.all()[0].RequestID
+	if len(id) != 32 {
+		t.Fatalf("id = %q, want a generated one", id)
+	}
+	if v := rec.Header().Get(reqid.Header); v != id {
+		t.Errorf("response header = %q, want the same id %q", v, id)
+	}
+}
+
+// A log line is a parser's input, and the id comes off a header. An id that
+// could forge a record must never reach the log.
+func TestUnusableRequestIDNeverReachesTheLog(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := config.NewLogger(&buf, log.INFO, "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got exchanges
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
+		Accounting{Completed: func(e Exchange) {
+			got.add(e)
+			NewAccessLog("structured", logger, nil)(e)
+		}})
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:1"
+	// net/http will not let a forged header through Set, so plant it directly.
+	req.Header[reqid.Header] = []string{"abc\nlevel=INFO message=forged"}
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if strings.Contains(buf.String(), "forged") {
+		t.Errorf("a forged id reached the log: %q", buf.String())
+	}
+	if id := got.all()[0].RequestID; len(id) != 32 {
+		t.Errorf("id = %q, want it replaced with a generated one", id)
+	}
+}
+
+// The tunnel record arrives from the close path, long after the handler
+// returned, so the id has to survive that far.
+func TestTunnelRecordCarriesTheRequestID(t *testing.T) {
+	var got exchanges
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		conn.Write([]byte("x"))
+		conn.Close()
+	}), Accounting{Completed: got.add})
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	io.WriteString(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"+
+		reqid.Header+": my-tunnel-id\r\n\r\n")
+	io.Copy(io.Discard, conn)
+	conn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if all := got.all(); len(all) > 0 {
+			if all[0].RequestID != "my-tunnel-id" {
+				t.Errorf("tunnel record id = %q, want the caller's", all[0].RequestID)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("tunnel was never recorded")
 }
