@@ -57,18 +57,84 @@ go build -o proxy
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
 - `-admin-cert` / `-admin-key` – TLS material for the admin listener. `PROXY_ADMIN_CERT_FILE`, `PROXY_ADMIN_KEY_FILE`.
+- `-config` – YAML configuration file. SIGHUP re-reads it. See below. `PROXY_CONFIG`.
 - `-healthcheck` – Probe the local health endpoint and exit 0 or 1, instead of starting the proxy. Used by the container `HEALTHCHECK`.
 
 `-mode`, `-log-level` and `-log-format` are validated at startup: an unrecognised
 value is an error rather than a silent fall back to `reverse`, `INFO` or `text`.
 
+### Configuration file
+
+`-config proxy.yaml` supplies anything the flags do. See
+[`proxy.example.yaml`](proxy.example.yaml) for the full shape.
+
+```yaml
+http: ":8080"
+allow_private: false
+log:
+  level: INFO
+  format: json
+policy: |
+  deny domain internal.example.com
+  allow all
+quotas: |
+  client requests 50/s burst 100
+```
+
+The rule sets take the same text the flags and the UI take, rather than a YAML
+transliteration of an ordered list — the ordering is the semantics, and encoding
+it as YAML structure would make it an accident of how the file happens to be
+written.
+
+Every field is optional, and **an absent setting is not the same as `false`**. A
+file that says nothing about authentication leaves it alone; it does not turn it
+off. An unknown key is a startup error, because a misspelled setting that
+silently does nothing is worse than one that refuses to start — the operator
+believes it took effect.
+
+### Reloading
+
+`SIGHUP` re-reads the file. It is validated in full before anything is applied,
+so **a bad file leaves the running configuration exactly as it was** and says
+which setting and line are wrong:
+
+```
+ERROR Reload rejected, keeping the running configuration:
+      proxy.yaml: policy: line 1: rule "allow bogus x": unknown matcher "bogus"
+```
+
+A good one reports what it changed, and — importantly — what it could not:
+
+```
+INFO  Configuration applied settings="log.level, policy, proxy_name, quotas"
+WARN  Setting requires a restart and is NOT in effect
+      setting=http running=127.0.0.1:8080 in_file=127.0.0.1:9999
+```
+
+That warning is the point. Silently ignoring the half of a file that needs a
+restart produces a proxy whose configuration says one thing and whose behaviour
+says another, and nobody finds out until a restart applies changes nobody
+remembers making, at a moment nobody chose.
+
+**Applied live:** `policy`, `clients`, `quotas`, `headers`, `stats`,
+`proxy_name`, `proxy_id`, `log.level`, and the `auth` block.
+
+**Requires a restart:** `mode`, `target`, `http`, `https`, `cert`, `key`, `db`,
+the `admin` block, `allow_private`, `connect_ports`, `health_path`,
+`metrics_public`, `log.format`, the `access_log` block, the `tracing` block, the
+`destination_metrics` block, and `secret` / `secret_file`.
+
+Reloading is safe under traffic: everything in the live set is read through
+locked accessors on each request, and a reload replaces values wholesale rather
+than mutating them in place.
+
 ### Configuration precedence
 
-Settings are resolved **flag > environment > stored > default**. Anything you
-pass explicitly wins over the value in the SQLite database, so a flag or
-environment variable in a deployment manifest is always the effective setting.
-Values you do *not* supply come from the database, which is how changes made
-through the UI survive a restart.
+Settings are resolved **flag > environment > file > stored > default**. Anything
+you pass explicitly wins over the file, the file wins over the value in the
+SQLite database, and the database is how changes made through the UI survive a
+restart. A flag or environment variable in a deployment manifest is always the
+effective setting.
 
 ### Web UI
 

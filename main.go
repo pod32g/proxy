@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pod32g/proxy/internal/api"
@@ -197,7 +199,47 @@ func main() {
 	var headers headerFlags
 	flag.Var(&headers, "header", "Custom header to add to upstream requests (format Name=Value, can be repeated)")
 	dbPath := flag.String("db", env.get("PROXY_DB_PATH", "config.db"), "sqlite database path")
+	configPath := flag.String("config", env.get("PROXY_CONFIG", ""),
+		"YAML configuration file; SIGHUP re-reads it and applies what can change live")
 	flag.Parse()
+
+	// Which settings the operator gave explicitly, computed here rather than
+	// later, because the file tier has to be applied before any of these values
+	// is read — and "was this set explicitly" is the only thing that
+	// distinguishes a file value from a built-in default.
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	explicit := overrides{flags: setFlags, envs: env.set}
+
+	// Parsed and fully validated before anything else touches it, so a bad file
+	// is a startup error naming the setting rather than a proxy that came up in
+	// a configuration nobody wrote.
+	var cfgFile *config.File
+	if *configPath != "" {
+		var err error
+		cfgFile, err = config.LoadFile(*configPath)
+		if err != nil {
+			fatalf("-config: %v", err)
+		}
+	}
+
+	// The file supplies everything the operator did not give explicitly. This
+	// runs before any of these values is consumed — building the logger,
+	// opening listeners, starting the tracer — because a setting applied after
+	// it has been read is a setting that quietly did nothing.
+	if cfgFile != nil {
+		applyStartupFile(cfgFile, explicit, &startupFlags{
+			cfg: cfg, dbPath: dbPath, allowPrivate: allowPrivate,
+			connectPorts: connectPorts, healthPath: healthPath,
+			metricsPublic: metricsPublic, adminAddr: adminAddr,
+			adminCert: adminCert, adminKey: adminKey,
+			logLevel: &logLevelStr, logFormat: &logFormatStr,
+			accessLog: accessLogStr, accessLogFile: accessLogFile,
+			otelEndpoint: otelEndpoint, otelInsecure: otelInsecure, otelSample: otelSample,
+			destMetrics: destinationMetrics, destTop: topDestinations,
+			secretFile: secretFile,
+		})
+	}
 
 	if *healthcheck {
 		os.Exit(runHealthcheck(cfg.HTTPAddr, *healthPath))
@@ -307,8 +349,6 @@ func main() {
 	cfg.Headers = headers
 	cfg.LogLevel = logLevel
 
-	setFlags := map[string]bool{}
-	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 	for k := range setFlagsExtra {
 		setFlags[k] = true
 	}
@@ -333,6 +373,13 @@ func main() {
 		defer store.Close()
 		if err := store.Load(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		}
+		// flag > env > file > stored > default. The file lands between the
+		// database and the explicit settings: it outranks what a previous UI
+		// edit persisted, and is outranked by anything the operator passed on
+		// this invocation.
+		if _, err := cfgFile.ApplyTo(cfg); err != nil {
+			fatalf("-config: %v", err)
 		}
 		reapply(cfg, cli, set)
 	}
@@ -564,6 +611,12 @@ func main() {
 		srv.AdminKeyFile = *adminKey
 	}
 
+	if *configPath != "" {
+		go watchReloads(*configPath, cfgFile, cfg, store, logger, set, cli)
+		logger.Info("Configuration file loaded; send SIGHUP to reload",
+			log.String("path", *configPath))
+	}
+
 	if err := srv.Start(); err != nil {
 		logger.Fatalf("Server failed: %v", err)
 	}
@@ -710,4 +763,156 @@ func (p *policyFlags) String() string { return strings.Join(*p, "; ") }
 func (p *policyFlags) Set(value string) error {
 	*p = append(*p, value)
 	return nil
+}
+
+// startupFlags collects the settings a configuration file can supply that only
+// take effect at startup. They are pointers because the file tier writes
+// through them before anything reads them.
+type startupFlags struct {
+	cfg           *config.Config
+	dbPath        *string
+	allowPrivate  *bool
+	connectPorts  *string
+	healthPath    *string
+	metricsPublic *bool
+	adminAddr     *string
+	adminCert     *string
+	adminKey      *string
+	logLevel      *string
+	logFormat     *string
+	accessLog     *string
+	accessLogFile *string
+	otelEndpoint  *string
+	otelInsecure  *bool
+	otelSample    *float64
+	destMetrics   *bool
+	destTop       *int
+	secretFile    *string
+}
+
+// applyStartupFile writes file values into the startup settings, skipping any
+// the operator supplied explicitly.
+//
+// The skip is the whole point of the precedence rule: a flag or environment
+// variable in a deployment manifest has to keep winning over the file, and
+// "supplied explicitly" is a fact only flag.Visit and the environment record
+// can answer — a value equal to the default is indistinguishable otherwise.
+func applyStartupFile(f *config.File, set overrides, s *startupFlags) {
+	str := func(flagName, envName string, target *string, v *string) {
+		if v != nil && !set.has(flagName, envName) {
+			*target = *v
+		}
+	}
+	boolean := func(flagName, envName string, target *bool, v *bool) {
+		if v != nil && !set.has(flagName, envName) {
+			*target = *v
+		}
+	}
+
+	str("mode", "PROXY_MODE", &s.cfg.Mode, f.Mode)
+	str("target", "PROXY_TARGET", &s.cfg.TargetURL, f.Target)
+	str("http", "PROXY_HTTP_ADDR", &s.cfg.HTTPAddr, f.HTTP)
+	str("https", "PROXY_HTTPS_ADDR", &s.cfg.HTTPSAddr, f.HTTPS)
+	str("cert", "PROXY_CERT_FILE", &s.cfg.CertFile, f.Cert)
+	str("key", "PROXY_KEY_FILE", &s.cfg.KeyFile, f.Key)
+	str("db", "PROXY_DB_PATH", s.dbPath, f.DB)
+	str("health-path", "PROXY_HEALTH_PATH", s.healthPath, f.HealthPath)
+	str("secret-file", "PROXY_SECRET_FILE", s.secretFile, f.SecretFile)
+	str("secret", "PROXY_SECRET_KEY", &s.cfg.SecretKey, f.Secret)
+	boolean("allow-private", "PROXY_ALLOW_PRIVATE", s.allowPrivate, f.AllowPrivate)
+	boolean("metrics-public", "PROXY_METRICS_PUBLIC", s.metricsPublic, f.MetricsPublic)
+
+	if len(f.ConnectPorts) > 0 && !set.has("connect-ports", "PROXY_CONNECT_PORTS") {
+		parts := make([]string, len(f.ConnectPorts))
+		for i, p := range f.ConnectPorts {
+			parts[i] = strconv.Itoa(p)
+		}
+		*s.connectPorts = strings.Join(parts, ",")
+	}
+	if f.Admin != nil {
+		str("admin-http", "PROXY_ADMIN_ADDR", s.adminAddr, f.Admin.HTTP)
+		str("admin-cert", "PROXY_ADMIN_CERT_FILE", s.adminCert, f.Admin.Cert)
+		str("admin-key", "PROXY_ADMIN_KEY_FILE", s.adminKey, f.Admin.Key)
+	}
+	if f.Log != nil {
+		str("log-level", "PROXY_LOG_LEVEL", s.logLevel, f.Log.Level)
+		str("log-format", "PROXY_LOG_FORMAT", s.logFormat, f.Log.Format)
+	}
+	if f.AccessLog != nil {
+		str("access-log", "PROXY_ACCESS_LOG", s.accessLog, f.AccessLog.Format)
+		str("access-log-file", "PROXY_ACCESS_LOG_FILE", s.accessLogFile, f.AccessLog.File)
+	}
+	if f.Tracing != nil {
+		str("otel-endpoint", "PROXY_OTEL_ENDPOINT", s.otelEndpoint, f.Tracing.Endpoint)
+		boolean("otel-insecure", "PROXY_OTEL_INSECURE", s.otelInsecure, f.Tracing.Insecure)
+		if f.Tracing.Sample != nil && !set.has("otel-sample", "") {
+			*s.otelSample = *f.Tracing.Sample
+		}
+	}
+	if f.DestinationMetrics != nil {
+		boolean("destination-metrics", "PROXY_DESTINATION_METRICS", s.destMetrics, f.DestinationMetrics.Enabled)
+		if f.DestinationMetrics.Top != nil && !set.has("destination-metrics-top", "") {
+			*s.destTop = *f.DestinationMetrics.Top
+		}
+	}
+}
+
+// watchReloads re-reads the configuration file on SIGHUP.
+//
+// A reload applies what can change under live traffic and reports what cannot,
+// naming the setting and both values. Silently ignoring the half of a file that
+// needs a restart is how a configuration file becomes a lie: the file says one
+// thing, the process does another, and nobody finds out until a restart applies
+// changes nobody remembers making, at a moment nobody chose.
+func watchReloads(path string, current *config.File, cfg *config.Config,
+	store *config.Store, logger *log.Logger, set overrides, cli startupValues) {
+
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+
+	for range hup {
+		logger.Info("Reloading configuration", log.String("path", path))
+
+		// Parsed and validated in full before anything is installed, so a bad
+		// file leaves the running configuration exactly as it was.
+		next, err := config.LoadFile(path)
+		if err != nil {
+			logger.Errorf("Reload rejected, keeping the running configuration: %v", err)
+			continue
+		}
+
+		changed, err := next.ApplyTo(cfg)
+		if err != nil {
+			// ApplyTo validated the same values LoadFile did, so reaching here
+			// means something outside the file failed — an unreadable password
+			// file, most likely. Say so rather than reporting a partial success.
+			logger.Errorf("Reload partially applied then failed: %v", err)
+		}
+
+		// Explicit settings still outrank the file after a reload, exactly as
+		// they do at startup. Without this, editing the file would let it win
+		// over a flag the operator passed on this invocation.
+		reapply(cfg, cli, set)
+
+		if len(changed) > 0 {
+			logger.Info("Configuration applied", log.String("settings", strings.Join(changed, ", ")))
+			logger.SetLevel(cfg.GetLogLevel())
+			if store != nil {
+				if err := store.Save(cfg, config.Actor{Via: config.ViaStartup, Source: path}); err != nil {
+					logger.Errorf("Failed to persist reloaded config: %v", err)
+				}
+			}
+		} else {
+			logger.Info("Configuration reloaded with no live changes")
+		}
+
+		for _, c := range next.RestartRequired(current) {
+			logger.Warn("Setting requires a restart and is NOT in effect",
+				log.String("setting", c.Setting),
+				log.String("running", c.From),
+				log.String("in_file", c.To))
+		}
+		current = next
+	}
 }

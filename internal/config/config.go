@@ -465,3 +465,18 @@ func (c *Config) EvaluatePolicy(clientIP, host, ip string) PolicyDecision {
 	}
 	return out
 }
+
+// ReplaceHeaders swaps the global header set wholesale.
+//
+// A config file describes the headers that should exist, not a patch to apply,
+// so merging would make a header impossible to remove by editing the file — the
+// deleted entry would simply persist from the previous state.
+func (c *Config) ReplaceHeaders(h map[string]string) {
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		out[k] = v
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Headers = out
+}

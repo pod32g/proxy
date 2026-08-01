@@ -1,0 +1,90 @@
+# Example configuration for the proxy.
+#
+#   ./proxy -config proxy.yaml
+#
+# Precedence is flag > environment > file > stored > default: anything you pass
+# explicitly beats this file, and this file beats what a previous UI or API edit
+# persisted to the database.
+#
+# Every setting is optional. A setting this file omits is left to the tiers
+# below it — an absent section is *not* the same as setting it to false.
+#
+# SIGHUP re-reads this file. Settings marked "restart" below cannot be applied
+# to a running process; a reload reports them at WARN rather than pretending
+# they took effect.
+
+# --- restart: how and where the proxy listens -------------------------------
+mode: forward                  # forward | reverse
+# target: http://localhost:9000  # reverse mode only
+http: ":8080"
+# https: ":8443"
+# cert: /etc/proxy/tls.crt
+# key: /etc/proxy/tls.key
+# db: /var/lib/proxy/config.db
+
+# The admin surface on its own listener, so it can be firewalled separately
+# from the port clients proxy through.
+# admin:
+#   http: 127.0.0.1:9000
+#   cert: /etc/proxy/admin.crt
+#   key: /etc/proxy/admin.key
+
+# --- restart: destination defaults ------------------------------------------
+allow_private: false           # loopback/private/link-local destinations
+connect_ports: [443]           # ports CONNECT may tunnel to
+health_path: /healthz
+metrics_public: false
+
+# --- restart: output ---------------------------------------------------------
+log:
+  level: INFO                  # DEBUG INFO WARN ERROR FATAL   (level is live)
+  format: json                 # text | json | console          (restart)
+
+access_log:
+  format: structured           # structured | combined | off
+  # file: /var/log/proxy/access.log
+
+# tracing:
+#   endpoint: localhost:4318
+#   insecure: true
+#   sample: 0.1
+
+# Per-destination metrics are off by default: hostnames are client-controlled,
+# and even the bounded top-N is information some sites do not want in a metrics
+# store. Needs stats on to populate the table.
+# destination_metrics:
+#   enabled: false
+#   top: 20
+
+# --- live: reloadable under traffic -----------------------------------------
+stats: true
+proxy_name: edge-1
+proxy_id: ""
+
+headers:
+  X-Proxy: "1"
+
+# Credentials. Prefer password_file: a password here is readable by anything
+# that can read this file, and this file usually lives in version control.
+# auth:
+#   enabled: true
+#   username: admin
+#   password_file: /run/secrets/proxy-password
+
+# secret_file: /run/secrets/proxy-secret   # encrypts credentials at rest (restart)
+
+# Destination rules: ordered, first match wins.
+policy: |
+  # deny domain internal.example.com
+  allow all
+
+# Client access: longest prefix wins.
+clients: |
+  # allow 10.0.0.0/8
+  # default deny
+
+# Quotas: unlimited unless set. Request quotas refuse up front; byte quotas are
+# charged as traffic flows and refuse the *next* request.
+quotas: |
+  # global requests 500/s burst 1000
+  # client bytes 10MB/s
