@@ -128,6 +128,69 @@ Reloading is safe under traffic: everything in the live set is read through
 locked accessors on each request, and a reload replaces values wholesale rather
 than mutating them in place.
 
+### Multiple listeners
+
+The `listeners:` list adds bound addresses beyond `http`/`https`, each with its
+own TLS material, mode, target and rule sets:
+
+```yaml
+http: ":8080"          # the global listener, named "http"
+policy: |
+  deny all
+
+listeners:
+  - name: internal
+    address: "10.0.0.5:8080"
+    allow_private: true
+    policy: |
+      allow all
+  - name: external
+    address: "0.0.0.0:8443"
+    cert: /etc/proxy/external.crt
+    key: /etc/proxy/external.key
+    clients: |
+      allow 203.0.113.0/24
+      default deny
+```
+
+Anything a listener does not set falls back to the global configuration, so a
+deployment wanting one policy everywhere writes no listener entries at all.
+
+**Every socket is bound before any of them starts serving.** A listener that
+cannot bind is a startup error that served nothing:
+
+```
+FATAL Server failed: binding the external listener on 0.0.0.0:8443:
+      listen tcp 0.0.0.0:8443: bind: address already in use
+```
+
+Binding inside the serving goroutines would mean the working listeners had
+already been accepting traffic for however long the broken one took to fail —
+a process that served real requests under a configuration nobody chose. Two
+listeners on the same address are rejected for the same reason: one would win
+the bind and the other's rules would silently never apply.
+
+**The listener name identifies traffic** in `proxy_http_requests_total`,
+`proxy_http_request_duration_seconds` and every access log record:
+
+```
+proxy_http_requests_total{code="403",listener="locked-down",method="GET"} 1
+INFO access client=10.1.2.3 ... listener=internal
+```
+
+The label is bounded by the number of configured listeners, so it carries no
+cardinality risk. Names are validated as unique, because two listeners sharing
+one would merge their traffic into a single series under a name that no longer
+identifies anything.
+
+**Quotas:** listeners without their own share the process-wide limiter, so a
+global ceiling stays genuinely global rather than becoming that ceiling *per
+listener*. A listener that sets `quotas:` gets its own buckets.
+
+**Scope:** per-listener rule sets come from the file and change on `SIGHUP`. The
+UI and API edit the global sets, which govern every listener with no override.
+The admin surface is served only where you put it, not on every listener.
+
 ### Configuration precedence
 
 Settings are resolved **flag > environment > file > stored > default**. Anything

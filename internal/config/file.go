@@ -80,6 +80,30 @@ type File struct {
 	Policy  *string `yaml:"policy"`
 	Clients *string `yaml:"clients"`
 	Quotas  *string `yaml:"quotas"`
+
+	// Listeners are additional bound addresses, each with its own TLS material,
+	// mode and rule sets. The top-level http/https settings remain exactly what
+	// they were; these are in addition to them.
+	Listeners []ListenerFile `yaml:"listeners"`
+}
+
+// ListenerFile is one entry in the listeners list. Anything it does not set
+// falls back to the top-level configuration, so an entry that differs only in
+// address and policy says only that.
+type ListenerFile struct {
+	Name string `yaml:"name"`
+	Addr string `yaml:"address"`
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
+
+	Mode   *string `yaml:"mode"`
+	Target *string `yaml:"target"`
+
+	AllowPrivate *bool   `yaml:"allow_private"`
+	ConnectPorts []int   `yaml:"connect_ports"`
+	Policy       *string `yaml:"policy"`
+	Clients      *string `yaml:"clients"`
+	Quotas       *string `yaml:"quotas"`
 }
 
 // LoadFile reads and fully validates a configuration file.
@@ -151,7 +175,96 @@ func (f *File) validate() error {
 	if f.Auth != nil && f.Auth.Password != nil && f.Auth.PasswordFile != nil {
 		return fmt.Errorf("auth: set password or password_file, not both")
 	}
+
+	names := map[string]bool{"http": true, "https": true, "admin": true}
+	for i, l := range f.Listeners {
+		where := fmt.Sprintf("listeners[%d]", i)
+		if l.Name == "" || l.Addr == "" {
+			return fmt.Errorf("%s: name and address are both required", where)
+		}
+		// Names appear in metrics labels and log fields, so a duplicate would
+		// merge two listeners' traffic into one series under a name that no
+		// longer identifies anything.
+		if names[l.Name] {
+			return fmt.Errorf("%s: listener name %q is already used", where, l.Name)
+		}
+		names[l.Name] = true
+		if (l.Cert == "") != (l.Key == "") {
+			return fmt.Errorf("%s: cert and key must be given together", where)
+		}
+		if l.Mode != nil && *l.Mode != "forward" && *l.Mode != "reverse" {
+			return fmt.Errorf("%s: mode %q: want \"forward\" or \"reverse\"", where, *l.Mode)
+		}
+		if l.Mode != nil && *l.Mode == "reverse" && l.Target == nil && f.Target == nil {
+			return fmt.Errorf("%s: reverse mode needs a target, here or at the top level", where)
+		}
+		for _, p := range l.ConnectPorts {
+			if p < 1 || p > 65535 {
+				return fmt.Errorf("%s: connect_ports: %d is not a valid port", where, p)
+			}
+		}
+		if l.Policy != nil {
+			if _, err := policy.Parse(*l.Policy); err != nil {
+				return fmt.Errorf("%s: policy: %w", where, err)
+			}
+		}
+		if l.Clients != nil {
+			if _, err := policy.ParseClients(*l.Clients); err != nil {
+				return fmt.Errorf("%s: clients: %w", where, err)
+			}
+		}
+		if l.Quotas != nil {
+			if _, err := quota.Parse(*l.Quotas); err != nil {
+				return fmt.Errorf("%s: quotas: %w", where, err)
+			}
+		}
+	}
 	return nil
+}
+
+// BuildListeners resolves the file's listener entries against the global
+// configuration. Validation has already run, so nothing here can fail on a
+// value the file supplied.
+func (f *File) BuildListeners(cfg *Config, defaultAllowPrivate bool, defaultPorts []int) ([]*Listener, error) {
+	if f == nil {
+		return nil, nil
+	}
+	out := make([]*Listener, 0, len(f.Listeners))
+	for _, lf := range f.Listeners {
+		l := NewListener(lf.Name, lf.Addr, cfg)
+		l.Cert, l.Key = lf.Cert, lf.Key
+		if lf.Mode != nil {
+			l.Mode = *lf.Mode
+		}
+		if lf.Target != nil {
+			l.Target = *lf.Target
+		}
+		l.AllowPrivate = defaultAllowPrivate
+		if lf.AllowPrivate != nil {
+			l.AllowPrivate = *lf.AllowPrivate
+		}
+		l.ConnectPorts = defaultPorts
+		if len(lf.ConnectPorts) > 0 {
+			l.ConnectPorts = lf.ConnectPorts
+		}
+		if lf.Policy != nil {
+			if err := l.SetPolicyRules(*lf.Policy); err != nil {
+				return nil, err
+			}
+		}
+		if lf.Clients != nil {
+			if err := l.SetClientRules(*lf.Clients); err != nil {
+				return nil, err
+			}
+		}
+		if lf.Quotas != nil {
+			if err := l.SetQuotas(*lf.Quotas); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, l)
+	}
+	return out, nil
 }
 
 // Password resolves the configured credential, reading the file when one is

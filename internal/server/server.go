@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,8 +31,22 @@ type Server struct {
 	AdminKeyFile  string
 	AdminHandler  http.Handler
 
+	// Extra are additional listeners beyond the flag-configured ones, each with
+	// its own handler and TLS material. The single-listener flags above remain
+	// exactly what they were and become the listener named "http" (and "https").
+	Extra []Listener
+
 	Logger  *log.Logger
 	Clients *ClientTracker
+}
+
+// Listener is one additional bound address and what it serves.
+type Listener struct {
+	Name     string
+	Addr     string
+	Handler  http.Handler
+	CertFile string
+	KeyFile  string
 }
 
 // A proxy must not bound how long a transfer takes: it has no idea whether the
@@ -96,6 +111,24 @@ func (s *Server) listeners() ([]listener, error) {
 		})
 	}
 
+	for _, e := range s.Extra {
+		if e.Name == "" || e.Addr == "" {
+			return nil, fmt.Errorf("every listener needs a name and an address")
+		}
+		if e.Handler == nil {
+			return nil, fmt.Errorf("listener %q has no handler", e.Name)
+		}
+		// Same all-or-nothing rule as everywhere else: half-configured TLS
+		// would serve in the clear on a port the operator believes is secured.
+		if (e.CertFile == "") != (e.KeyFile == "") {
+			return nil, fmt.Errorf("listener %q: cert and key must be given together", e.Name)
+		}
+		out = append(out, listener{
+			name: e.Name, addr: e.Addr, handler: e.Handler,
+			certFile: e.CertFile, keyFile: e.KeyFile, track: true,
+		})
+	}
+
 	if s.AdminAddr != "" {
 		if s.AdminHandler == nil {
 			return nil, fmt.Errorf("-admin-http %s requires an admin handler", s.AdminAddr)
@@ -113,12 +146,44 @@ func (s *Server) listeners() ([]listener, error) {
 
 	// Load every keypair up front so a bad certificate fails at startup rather
 	// than on the first request to reach it.
+	seen := make(map[string]string, len(out))
 	for _, l := range out {
 		if l.tls() {
 			if _, err := tls.LoadX509KeyPair(l.certFile, l.keyFile); err != nil {
 				return nil, fmt.Errorf("loading TLS keypair for the %s listener: %w", l.name, err)
 			}
 		}
+		// Two listeners on one address is not a configuration anyone means. One
+		// of them would win the bind and the other's rules would silently never
+		// apply — the worst kind of misconfiguration, because it looks like it
+		// worked.
+		if prev, dup := seen[l.addr]; dup {
+			return nil, fmt.Errorf("listeners %q and %q both bind %s", prev, l.name, l.addr)
+		}
+		seen[l.addr] = l.name
+	}
+	return out, nil
+}
+
+// bind opens every listening socket before anything starts serving.
+//
+// Binding inside the serving goroutines, as this used to, means a listener
+// whose port is taken fails only after the others have been accepting traffic
+// for however long it took to find out — a process that served real requests
+// under a configuration the operator never got. Binding first makes a failure
+// here a startup error that served nothing, and closes the sockets already
+// opened rather than leaking them.
+func bind(specs []listener) ([]net.Listener, error) {
+	out := make([]net.Listener, 0, len(specs))
+	for _, spec := range specs {
+		ln, err := net.Listen("tcp", spec.addr)
+		if err != nil {
+			for _, open := range out {
+				open.Close()
+			}
+			return nil, fmt.Errorf("binding the %s listener on %s: %w", spec.name, spec.addr, err)
+		}
+		out = append(out, ln)
 	}
 	return out, nil
 }
@@ -135,6 +200,13 @@ func (s *Server) Start() error {
 		return err
 	}
 
+	// Every socket is bound before any of them starts serving, so a bind
+	// failure is a startup error rather than a partial start.
+	sockets, err := bind(specs)
+	if err != nil {
+		return err
+	}
+
 	servers := make([]*http.Server, len(specs))
 	// Buffered so a failing listener never blocks on a send nobody reads.
 	errCh := make(chan error, len(specs))
@@ -142,7 +214,7 @@ func (s *Server) Start() error {
 	for i, spec := range specs {
 		srv := s.newHTTPServer(spec)
 		servers[i] = srv
-		go func(spec listener, srv *http.Server) {
+		go func(spec listener, srv *http.Server, sock net.Listener) {
 			scheme := "HTTP"
 			if spec.tls() {
 				scheme = "HTTPS"
@@ -150,13 +222,13 @@ func (s *Server) Start() error {
 			s.Logger.Info("Listening",
 				log.String("listener", spec.name),
 				log.String("scheme", scheme),
-				log.String("addr", spec.addr))
+				log.String("addr", sock.Addr().String()))
 
 			var err error
 			if spec.tls() {
-				err = srv.ListenAndServeTLS(spec.certFile, spec.keyFile)
+				err = srv.ServeTLS(sock, spec.certFile, spec.keyFile)
 			} else {
-				err = srv.ListenAndServe()
+				err = srv.Serve(sock)
 			}
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				// A dead listener used to be logged and ignored, leaving a
@@ -164,7 +236,7 @@ func (s *Server) Start() error {
 				// connect to is gone.
 				errCh <- fmt.Errorf("%s listener failed: %w", spec.name, err)
 			}
-		}(spec, srv)
+		}(spec, srv, sockets[i])
 	}
 
 	stop := make(chan os.Signal, 1)

@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -25,6 +26,10 @@ type Exchange struct {
 	Duration time.Duration
 	// RequestID identifies this exchange across the hop.
 	RequestID string
+	// Listener names the bound address this arrived on, so a deployment with
+	// several listeners can tell which one served a request without inferring
+	// it from the destination.
+	Listener string
 	// Served reports whether the proxy actually forwarded this request to a
 	// destination. A request the proxy itself refused — by policy, by the client
 	// table, by the CONNECT port list, by a quota — never reached one, and
@@ -96,7 +101,10 @@ func AccountingMiddleware(next http.Handler, acct Accounting) http.Handler {
 		}
 
 		host, path := destination(r)
-		m.exchange = Exchange{Client: client, Method: r.Method, Host: host, Path: path, RequestID: id}
+		m.exchange = Exchange{
+			Client: client, Method: r.Method, Host: host, Path: path,
+			RequestID: id, Listener: ListenerName(r.Context()),
+		}
 		m.completed = acct.Completed
 		m.start = start
 
@@ -107,6 +115,25 @@ func AccountingMiddleware(next http.Handler, acct Accounting) http.Handler {
 			m.finish()
 		}
 	})
+}
+
+// listenerKey carries the name of the listener a request arrived on.
+type listenerKey struct{}
+
+// WithListener tags a request context with the listener serving it.
+func WithListener(next http.Handler, name string) http.Handler {
+	if next == nil || name == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), listenerKey{}, name)))
+	})
+}
+
+// ListenerName returns the listener a request arrived on, or "".
+func ListenerName(ctx context.Context) string {
+	name, _ := ctx.Value(listenerKey{}).(string)
+	return name
 }
 
 // destination reports where a request was headed, with anything credential-ish

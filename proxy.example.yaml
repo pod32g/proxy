@@ -88,3 +88,33 @@ clients: |
 quotas: |
   # global requests 500/s burst 1000
   # client bytes 10MB/s
+
+# --- restart: additional listeners -------------------------------------------
+#
+# Each entry is a bound address with its own TLS material, mode, target and rule
+# sets. Anything an entry does not set falls back to the settings above, so an
+# entry that differs only in address and policy says only that.
+#
+# The listener name appears in the `listener` metrics label and in every access
+# log record, so it should mean something to whoever reads them.
+#
+# Note: per-listener rule sets come from this file and change on SIGHUP. The UI
+# and API edit the *global* sets above, which govern every listener that has no
+# override of its own.
+#
+# listeners:
+#   - name: internal
+#     address: "10.0.0.5:8080"
+#     allow_private: true          # this interface may reach internal hosts
+#     policy: |
+#       allow all
+#
+#   - name: external
+#     address: "0.0.0.0:8443"
+#     cert: /etc/proxy/external.crt
+#     key: /etc/proxy/external.key
+#     clients: |
+#       allow 203.0.113.0/24
+#       default deny
+#     quotas: |
+#       client requests 20/s burst 40

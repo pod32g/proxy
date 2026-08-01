@@ -63,7 +63,10 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 				Name: "proxy_http_requests_total",
 				Help: "Total number of HTTP requests processed",
 			},
-			[]string{"method", "code"},
+			// The listener label is bounded by the number of configured
+			// listeners, so it carries no cardinality risk, and it is the only
+			// way to tell which interface served a request when several are up.
+			[]string{"method", "code", "listener"},
 		),
 		Duration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -71,7 +74,7 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 				Help:    "Duration of HTTP requests",
 				Buckets: prometheus.DefBuckets,
 			},
-			[]string{"method"},
+			[]string{"method", "listener"},
 		),
 		Clients: prometheus.NewGauge(
 			prometheus.GaugeOpts{
@@ -160,8 +163,9 @@ func MetricsMiddleware(next http.Handler, m *Metrics) http.Handler {
 		if code == 0 {
 			code = http.StatusOK
 		}
-		m.Duration.WithLabelValues(r.Method).Observe(dur)
-		m.Requests.WithLabelValues(r.Method, strconv.Itoa(code)).Inc()
+		name := ListenerName(r.Context())
+		m.Duration.WithLabelValues(r.Method, name).Observe(dur)
+		m.Requests.WithLabelValues(r.Method, strconv.Itoa(code), name).Inc()
 	})
 }
 

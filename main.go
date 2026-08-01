@@ -18,6 +18,7 @@ import (
 
 	"github.com/pod32g/proxy/internal/api"
 	"github.com/pod32g/proxy/internal/config"
+	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/proxy"
 	"github.com/pod32g/proxy/internal/quota"
 	"github.com/pod32g/proxy/internal/server"
@@ -263,10 +264,8 @@ func main() {
 	if err != nil {
 		fatalf("invalid -access-log: %v", err)
 	}
-	var target *url.URL
 	if cfg.Mode == "reverse" {
-		target, err = url.Parse(cfg.TargetURL)
-		if err != nil {
+		if _, err := url.Parse(cfg.TargetURL); err != nil {
 			fatalf("invalid -target %q: %v", cfg.TargetURL, err)
 		}
 	}
@@ -336,14 +335,6 @@ func main() {
 			fatalf("invalid quota rules: %v", err)
 		}
 		setFlagsExtra["quota-rule"] = true
-	}
-
-	pol := proxy.Policy{
-		AllowPrivate: *allowPrivate,
-		ConnectPorts: ports,
-		// Read per request so rules changed at runtime take effect without a
-		// restart, the same way credentials do.
-		Rules: cfg.DestinationRulesFor,
 	}
 
 	cfg.Headers = headers
@@ -473,83 +464,107 @@ func main() {
 
 	// Read through a function so quotas changed in the UI or API take effect
 	// without a restart, the same way credentials and policy rules do.
-	limiter := quota.NewLimiter(cfg.QuotaSet)
-	limiter.Rejected = func(s quota.Scope) { metrics.QuotaRejected.WithLabelValues(string(s)).Inc() }
-	limiter.Tracked = func(n int) { metrics.QuotaClients.Set(float64(n)) }
+	limiter := newLimiter(cfg.QuotaSet, metrics)
 	if set := cfg.QuotaSet(); !set.Empty() {
 		logger.Info("Quotas active", log.String("rules", strings.ReplaceAll(set.String(), "\n", "; ")))
 	}
 
-	var handler http.Handler
-	var forwardMode bool
+	// One chain per listener. Each reads its own scope — the global Config for
+	// the flag-configured listeners, a config.Listener for the extra ones — so a
+	// listener with its own policy is a different set of closures rather than a
+	// conditional threaded through the request path.
+	buildChain := func(name string, scope proxyScope, mode, targetURL string,
+		allowPrivate bool, ports []int, lim *quota.Limiter) (http.Handler, error) {
+
+		listenerPol := proxy.Policy{
+			AllowPrivate: allowPrivate,
+			ConnectPorts: ports,
+			Rules:        scope.DestinationRulesFor,
+		}
+
+		var handler http.Handler
+		forwardMode := mode == "forward"
+		var reverseTarget *url.URL
+		if forwardMode {
+			handler = proxy.NewForward(logger, cfg.GetHeadersForClient, listenerPol, proxy.Observer{
+				Upstream: func(method string, d time.Duration) {
+					metrics.UpstreamDuration.WithLabelValues(method).Observe(d.Seconds())
+				},
+				TunnelOpened: func() { metrics.ActiveTunnels.Inc() },
+				TunnelClosed: func() { metrics.ActiveTunnels.Dec() },
+				Denied:       func(s string) { metrics.PolicyDecisions.WithLabelValues(s).Inc() },
+				// nil when tracing is off, which is what makes it free.
+				Trace: tracer.Hook(),
+			})
+		} else {
+			u, err := url.Parse(targetURL)
+			if err != nil {
+				return nil, fmt.Errorf("listener %q: invalid target %q: %v", name, targetURL, err)
+			}
+			reverseTarget = u
+			handler = proxy.New(u, logger, cfg.GetHeadersForClient)
+		}
+		handler = server.MetricsMiddleware(handler, metrics)
+		// Accounting wraps outermost so it sees the connection before anything else
+		// hijacks it: a CONNECT tunnel and a WebSocket upgrade both bypass the
+		// ResponseWriter entirely, and they are the traffic both the byte quota and
+		// the access log care about most. One pass feeds both.
+		// Destinations are recorded from the completion record rather than at
+		// request entry, so a request the proxy refused is not counted as traffic to
+		// the host it was refused from. Recording on the way in let a client put
+		// entries in the "busiest destinations" view using requests that never
+		// succeeded, and let a malformed CONNECT target land a nonsense host there.
+		//
+		// Reverse mode is different and deliberately unchanged: the key is always
+		// the configured target, a constant nothing can inject, so every request to
+		// it is worth counting whether the backend answered or not.
+		recordDestination := func(e server.Exchange) {
+			if !cfg.StatsEnabledState() {
+				return
+			}
+			if !forwardMode {
+				stats.Record(server.HostOnly(reverseTarget.Host))
+				return
+			}
+			if e.Served {
+				stats.Record(server.HostOnly(e.Host))
+			}
+		}
+
+		handler = server.AccountingMiddleware(handler, server.Accounting{
+			Charge: func(client string, in, out int64) {
+				// The quota is charged the total — bytes cost the same
+				// whichever way they went — while the metric keeps them apart,
+				// because "which direction is saturated" is a question the
+				// total cannot answer.
+				lim.Charge(client, in+out)
+				if in > 0 {
+					metrics.RelayedBytes.WithLabelValues("in").Add(float64(in))
+				}
+				if out > 0 {
+					metrics.RelayedBytes.WithLabelValues("out").Add(float64(out))
+				}
+			},
+			Completed: func(e server.Exchange) {
+				recordDestination(e)
+				if accessLog != nil {
+					accessLog(e)
+				}
+			},
+		})
+		return handler, nil
+	}
+
 	if cfg.Mode == "forward" {
 		if !*allowPrivate {
 			logger.Info("Refusing to proxy to loopback/private addresses; pass -allow-private to permit them")
 		}
 		logger.Infof("CONNECT allowed to ports %s", *connectPorts)
-		forwardMode = true
-		h := proxy.NewForward(logger, cfg.GetHeadersForClient, pol, proxy.Observer{
-			Upstream: func(method string, d time.Duration) {
-				metrics.UpstreamDuration.WithLabelValues(method).Observe(d.Seconds())
-			},
-			TunnelOpened: func() { metrics.ActiveTunnels.Inc() },
-			TunnelClosed: func() { metrics.ActiveTunnels.Dec() },
-			Denied:       func(scope string) { metrics.PolicyDecisions.WithLabelValues(scope).Inc() },
-			// nil when tracing is off, which is what makes it free.
-			Trace: tracer.Hook(),
-		})
-		handler = h
-	} else {
-		handler = proxy.New(target, logger, cfg.GetHeadersForClient)
 	}
-	handler = server.MetricsMiddleware(handler, metrics)
-	// Accounting wraps outermost so it sees the connection before anything else
-	// hijacks it: a CONNECT tunnel and a WebSocket upgrade both bypass the
-	// ResponseWriter entirely, and they are the traffic both the byte quota and
-	// the access log care about most. One pass feeds both.
-	// Destinations are recorded from the completion record rather than at
-	// request entry, so a request the proxy refused is not counted as traffic to
-	// the host it was refused from. Recording on the way in let a client put
-	// entries in the "busiest destinations" view using requests that never
-	// succeeded, and let a malformed CONNECT target land a nonsense host there.
-	//
-	// Reverse mode is different and deliberately unchanged: the key is always
-	// the configured target, a constant nothing can inject, so every request to
-	// it is worth counting whether the backend answered or not.
-	recordDestination := func(e server.Exchange) {
-		if !cfg.StatsEnabledState() {
-			return
-		}
-		if !forwardMode {
-			stats.Record(server.HostOnly(target.Host))
-			return
-		}
-		if e.Served {
-			stats.Record(server.HostOnly(e.Host))
-		}
+	handler, err := buildChain("http", cfg, cfg.Mode, cfg.TargetURL, *allowPrivate, ports, limiter)
+	if err != nil {
+		fatalf("%v", err)
 	}
-
-	handler = server.AccountingMiddleware(handler, server.Accounting{
-		Charge: func(client string, in, out int64) {
-			// The quota is charged the total — bytes cost the same whichever
-			// way they went — while the metric keeps them apart, because
-			// "which direction is saturated" is a question the total cannot
-			// answer.
-			limiter.Charge(client, in+out)
-			if in > 0 {
-				metrics.RelayedBytes.WithLabelValues("in").Add(float64(in))
-			}
-			if out > 0 {
-				metrics.RelayedBytes.WithLabelValues("out").Add(float64(out))
-			}
-		},
-		Completed: func(e server.Exchange) {
-			recordDestination(e)
-			if accessLog != nil {
-				accessLog(e)
-			}
-		},
-	})
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	apiHandler := api.New(cfg, store, logger, stats)
 	// One Router serves whatever it is given: with no Proxy it 404s unmatched
@@ -576,10 +591,7 @@ func main() {
 			ClientAllowed: cfg.ClientAllowed,
 			// Adapted rather than passed directly so the server package does not
 			// have to know the quota package exists.
-			Quota: func(ip string) (bool, time.Duration, string) {
-				ok, retryAfter, scope := limiter.Allow(ip)
-				return ok, retryAfter, string(scope)
-			},
+			Quota: quotaGate(limiter),
 		}
 	}
 
@@ -595,18 +607,59 @@ func main() {
 		mux = newRouter(handler, uiHandler, apiHandler, promhttp.Handler())
 	}
 
+	// Extra listeners from the config file. Each gets its own chain built from
+	// its own scope, its own router — so client rules and quotas apply per
+	// listener — and a name-tagging wrapper so metrics and the access log can
+	// say which one served a request.
+	var extras []server.Listener
+	if cfgFile != nil {
+		defined, err := cfgFile.BuildListeners(cfg, *allowPrivate, ports)
+		if err != nil {
+			fatalf("-config listeners: %v", err)
+		}
+		for _, l := range defined {
+			lim := limiter
+			if l.HasQuotaOverride() {
+				lim = newLimiter(l.QuotaSet, metrics)
+			}
+			chain, err := buildChain(l.Name, l, l.ResolvedMode(), l.ResolvedTarget(),
+				l.AllowPrivate, l.ConnectPorts, lim)
+			if err != nil {
+				fatalf("%v", err)
+			}
+			// No UI, API or metrics: the admin surface belongs on the listener
+			// the operator chose for it, not on every port that happens to exist.
+			r := newRouter(chain, nil, nil, nil)
+			r.ClientAllowed = l.ClientAllowed
+			r.Quota = quotaGate(lim)
+			extras = append(extras, server.Listener{
+				Name:     l.Name,
+				Addr:     l.Addr,
+				CertFile: l.Cert,
+				KeyFile:  l.Key,
+				Handler:  server.WithListener(r, l.Name),
+			})
+			logger.Info("Listener configured",
+				log.String("listener", l.Name),
+				log.String("addr", l.Addr),
+				log.String("mode", l.ResolvedMode()),
+				log.String("policy", overrideNote(l.HasPolicyOverride())))
+		}
+	}
+
 	srv := server.Server{
+		Extra:     extras,
 		HTTPAddr:  cfg.HTTPAddr,
 		HTTPSAddr: cfg.HTTPSAddr,
 		CertFile:  cfg.CertFile,
 		KeyFile:   cfg.KeyFile,
-		Handler:   mux,
+		Handler:   server.WithListener(mux, "http"),
 		Logger:    logger,
 		Clients:   tracker,
 	}
 	if adminMux != nil {
 		srv.AdminAddr = *adminAddr
-		srv.AdminHandler = adminMux
+		srv.AdminHandler = server.WithListener(adminMux, "admin")
 		srv.AdminCertFile = *adminCert
 		srv.AdminKeyFile = *adminKey
 	}
@@ -915,4 +968,48 @@ func watchReloads(path string, current *config.File, cfg *config.Config,
 		}
 		current = next
 	}
+}
+
+// proxyScope is the configuration one listener's handler chain reads.
+//
+// Both *config.Config and *config.Listener satisfy it, which is what lets a
+// listener with its own policy be a different set of closures rather than a
+// conditional threaded through the request path. The methods are the same three
+// the request path already called on Config, so nothing new is on the hot path.
+type proxyScope interface {
+	DestinationRulesFor(clientIP string) *policy.RuleSet
+	ClientAllowed(ip string) (bool, string)
+	QuotaSet() *quota.Set
+}
+
+// newLimiter builds a quota limiter wired to the metrics.
+//
+// Listeners without their own quotas share the process-wide limiter, so a
+// global ceiling stays genuinely global rather than becoming that ceiling per
+// listener. One that overrides them gets its own buckets, which is the only
+// thing "different quotas here" can mean.
+func newLimiter(set func() *quota.Set, metrics *server.Metrics) *quota.Limiter {
+	l := quota.NewLimiter(set)
+	l.Rejected = func(s quota.Scope) { metrics.QuotaRejected.WithLabelValues(string(s)).Inc() }
+	l.Tracked = func(n int) { metrics.QuotaClients.Set(float64(n)) }
+	return l
+}
+
+// quotaGate adapts a limiter to the Router's hook, so the server package does
+// not have to know the quota package exists.
+func quotaGate(l *quota.Limiter) func(string) (bool, time.Duration, string) {
+	return func(ip string) (bool, time.Duration, string) {
+		ok, retryAfter, scope := l.Allow(ip)
+		return ok, retryAfter, string(scope)
+	}
+}
+
+// overrideNote renders whether a listener overrides a setting, for the startup
+// log — so "this listener has its own policy" is visible at boot rather than
+// inferred from behaviour later.
+func overrideNote(has bool) string {
+	if has {
+		return "listener-specific"
+	}
+	return "global"
 }

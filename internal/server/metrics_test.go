@@ -19,8 +19,29 @@ func TestMetricsMiddleware(t *testing.T) {
 	if code := rw.Result().StatusCode; code != 201 {
 		t.Fatalf("status %d", code)
 	}
-	if v := testutil.ToFloat64(metrics.Requests.WithLabelValues("POST", "201")); v != 1 {
+	// The listener label is empty when nothing tagged the request, which is what
+	// a single-listener deployment produces.
+	if v := testutil.ToFloat64(metrics.Requests.WithLabelValues("POST", "201", "")); v != 1 {
 		t.Fatalf("requests metric %f", v)
+	}
+}
+
+// With several listeners up, the metric has to say which one served a request;
+// otherwise the first question anyone asks of a multi-listener deployment is the
+// one the metric cannot answer.
+func TestMetricsRecordTheListener(t *testing.T) {
+	metrics := mustMetrics(t)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	handler := WithListener(MetricsMiddleware(inner, metrics), "internal")
+
+	req := httptest.NewRequest("GET", "http://host/", nil)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if v := testutil.ToFloat64(metrics.Requests.WithLabelValues("GET", "200", "internal")); v != 1 {
+		t.Errorf("requests{listener=\"internal\"} = %f, want 1", v)
+	}
+	if v := testutil.ToFloat64(metrics.Requests.WithLabelValues("GET", "200", "")); v != 0 {
+		t.Errorf("the request was also counted with no listener label: %f", v)
 	}
 }
 
@@ -46,10 +67,10 @@ func TestMetricsRecordsProtocolSwitch(t *testing.T) {
 
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
 
-	if got := testutil.ToFloat64(m.Requests.WithLabelValues("GET", "101")); got != 1 {
+	if got := testutil.ToFloat64(m.Requests.WithLabelValues("GET", "101", "")); got != 1 {
 		t.Errorf("101 not recorded: got %v", got)
 	}
-	if got := testutil.ToFloat64(m.Requests.WithLabelValues("GET", "200")); got != 0 {
+	if got := testutil.ToFloat64(m.Requests.WithLabelValues("GET", "200", "")); got != 0 {
 		t.Errorf("switch was counted as a 200: got %v", got)
 	}
 }
@@ -60,7 +81,7 @@ func TestMetricsDefaultsToOK(t *testing.T) {
 	m := mustMetrics(t)
 	h := MetricsMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), m)
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
-	if got := testutil.ToFloat64(m.Requests.WithLabelValues("GET", "200")); got != 1 {
+	if got := testutil.ToFloat64(m.Requests.WithLabelValues("GET", "200", "")); got != 1 {
 		t.Errorf("got %v, want 1", got)
 	}
 }
