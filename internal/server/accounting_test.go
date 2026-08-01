@@ -33,12 +33,12 @@ func (m *meterRecorder) read() (int64, string) {
 	return m.total, m.last
 }
 
-func TestMeterCountsResponseBytes(t *testing.T) {
+func TestAccountingCountsResponseBytes(t *testing.T) {
 	var rec meterRecorder
 	body := strings.Repeat("x", 4096)
-	h := MeterMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, body)
-	}), rec.meter)
+	}), Accounting{Charge: rec.meter})
 
 	req := httptest.NewRequest("GET", "http://example.com/", nil)
 	req.RemoteAddr = "10.1.2.3:54321"
@@ -56,12 +56,12 @@ func TestMeterCountsResponseBytes(t *testing.T) {
 
 // An upload costs the operator the same as a download, and a quota that counted
 // only responses would be sidestepped by a large POST.
-func TestMeterCountsRequestBody(t *testing.T) {
+func TestAccountingCountsRequestBody(t *testing.T) {
 	var rec meterRecorder
 	body := strings.Repeat("y", 2048)
-	h := MeterMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
-	}), rec.meter)
+	}), Accounting{Charge: rec.meter})
 
 	req := httptest.NewRequest("POST", "http://example.com/", strings.NewReader(body))
 	req.RemoteAddr = "10.1.2.3:1"
@@ -75,11 +75,11 @@ func TestMeterCountsRequestBody(t *testing.T) {
 // The case the middleware exists for: once a connection is hijacked nothing
 // passes through the ResponseWriter, so a handler-level counter would report
 // zero for every CONNECT tunnel and every WebSocket.
-func TestMeterCountsHijackedTunnelTraffic(t *testing.T) {
+func TestAccountingCountsHijackedTunnelTraffic(t *testing.T) {
 	var rec meterRecorder
 	done := make(chan struct{})
 
-	h := MeterMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(done)
 		conn, _, err := w.(http.Hijacker).Hijack()
 		if err != nil {
@@ -89,7 +89,7 @@ func TestMeterCountsHijackedTunnelTraffic(t *testing.T) {
 		// Enough to cross the reporting chunk more than once.
 		conn.Write([]byte(strings.Repeat("z", 200<<10)))
 		conn.Close()
-	}), rec.meter)
+	}), Accounting{Charge: rec.meter})
 
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -117,18 +117,18 @@ func TestMeterCountsHijackedTunnelTraffic(t *testing.T) {
 
 // A long-lived tunnel must not bank its whole cost until it closes, or a
 // download that runs for an hour escapes the quota it is supposed to feed.
-func TestMeterReportsTunnelTrafficBeforeClose(t *testing.T) {
+func TestAccountingReportsTunnelTrafficBeforeClose(t *testing.T) {
 	var rec meterRecorder
 	released := make(chan struct{})
 	finished := make(chan struct{})
 
-	h := MeterMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(finished)
 		conn, _, _ := w.(http.Hijacker).Hijack()
-		conn.Write([]byte(strings.Repeat("q", meterChunk+1)))
+		conn.Write([]byte(strings.Repeat("q", chargeChunk+1)))
 		<-released // still open
 		conn.Close()
-	}), rec.meter)
+	}), Accounting{Charge: rec.meter})
 
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -143,7 +143,7 @@ func TestMeterReportsTunnelTrafficBeforeClose(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	reported := false
 	for time.Now().Before(deadline) {
-		if total, _ := rec.read(); total >= meterChunk {
+		if total, _ := rec.read(); total >= chargeChunk {
 			reported = true
 			break
 		}
@@ -158,7 +158,7 @@ func TestMeterReportsTunnelTrafficBeforeClose(t *testing.T) {
 
 // The middleware sits outside the metrics recorder, so the interfaces the proxy
 // handlers reach for have to survive the extra layer.
-func TestMeterPreservesResponseWriterInterfaces(t *testing.T) {
+func TestAccountingPreservesResponseWriterInterfaces(t *testing.T) {
 	var rec meterRecorder
 	var gotStatus int
 
@@ -179,7 +179,7 @@ func TestMeterPreservesResponseWriterInterfaces(t *testing.T) {
 	// Stand in for the metrics recorder underneath.
 	probe := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r2 := &statusRecorder{ResponseWriter: w}
-		MeterMiddleware(inner, rec.meter).ServeHTTP(r2, r)
+		AccountingMiddleware(inner, Accounting{Charge: rec.meter}).ServeHTTP(r2, r)
 		gotStatus = r2.status
 	})
 
@@ -196,24 +196,24 @@ func TestMeterPreservesResponseWriterInterfaces(t *testing.T) {
 	}
 }
 
-func TestMeterWithoutHookIsAPassthrough(t *testing.T) {
+func TestAccountingWithoutHooksIsAPassthrough(t *testing.T) {
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
-	if got := MeterMiddleware(inner, nil); got == nil {
-		t.Error("nil meter should return the handler unchanged, not nil")
+	if got := AccountingMiddleware(inner, Accounting{}); got == nil {
+		t.Error("no hooks should return the handler unchanged, not nil")
 	}
-	if got := MeterMiddleware(nil, func(string, int64) {}); got != nil {
+	if got := AccountingMiddleware(nil, Accounting{Charge: func(string, int64) {}}); got != nil {
 		t.Error("nil handler should stay nil")
 	}
 }
 
 // Hijack must report what the exchange already cost before the connection is
 // taken over, or the request headers and any body read vanish from the count.
-func TestMeterFlushesPendingBytesOnHijack(t *testing.T) {
+func TestAccountingFlushesPendingBytesOnHijack(t *testing.T) {
 	var rec meterRecorder
 	body := strings.Repeat("b", 1024)
 	handlerDone := make(chan struct{})
 
-	h := MeterMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := AccountingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(handlerDone)
 		io.Copy(io.Discard, r.Body)
 		conn, _, err := w.(http.Hijacker).Hijack()
@@ -226,7 +226,7 @@ func TestMeterFlushesPendingBytesOnHijack(t *testing.T) {
 			t.Errorf("metered %d before hijack, want at least %d", total, len(body))
 		}
 		conn.Close()
-	}), rec.meter)
+	}), Accounting{Charge: rec.meter})
 
 	srv := httptest.NewServer(h)
 	defer srv.Close()

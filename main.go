@@ -3,12 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pod32g/proxy/internal/api"
@@ -171,6 +173,10 @@ func main() {
 		"file containing the credential-encryption secret; preferred over -secret, which is visible in ps")
 	healthcheck := flag.Bool("healthcheck", false,
 		"probe the local health endpoint and exit 0 or 1 (used by the container HEALTHCHECK)")
+	accessLogStr := flag.String("access-log", env.get("PROXY_ACCESS_LOG", "structured"),
+		"access log format ("+strings.Join(server.AccessLogFormats, ", ")+")")
+	accessLogFile := flag.String("access-log-file", env.get("PROXY_ACCESS_LOG_FILE", ""),
+		"write the access log to this file instead of stdout, so access records and diagnostics can be routed separately")
 	logFormatStr := env.get("PROXY_LOG_FORMAT", "text")
 	flag.StringVar(&logFormatStr, "log-format", logFormatStr,
 		"Log output format ("+strings.Join(config.LogFormats, ", ")+")")
@@ -198,6 +204,10 @@ func main() {
 	logFormat, err := config.ParseLogFormat(logFormatStr)
 	if err != nil {
 		fatalf("invalid -log-format: %v", err)
+	}
+	accessFormat, err := server.ParseAccessLogFormat(*accessLogStr)
+	if err != nil {
+		fatalf("invalid -access-log: %v", err)
 	}
 	var target *url.URL
 	if cfg.Mode == "reverse" {
@@ -320,6 +330,12 @@ func main() {
 		fatalf("failed to build logger: %v", err)
 	}
 
+	accessLog, closeAccessLog, err := newAccessLog(accessFormat, *accessLogFile, logFormat)
+	if err != nil {
+		fatalf("-access-log-file: %v", err)
+	}
+	defer closeAccessLog()
+
 	for _, w := range store.Warnings() {
 		logger.Warn(w)
 	}
@@ -379,10 +395,14 @@ func main() {
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string { return target.Host })
 	}
 	handler = server.MetricsMiddleware(handler, metrics)
-	// Metering wraps outermost so it sees the connection before anything else
+	// Accounting wraps outermost so it sees the connection before anything else
 	// hijacks it: a CONNECT tunnel and a WebSocket upgrade both bypass the
-	// ResponseWriter entirely, and they are the traffic a byte quota exists for.
-	handler = server.MeterMiddleware(handler, limiter.Charge)
+	// ResponseWriter entirely, and they are the traffic both the byte quota and
+	// the access log care about most. One pass feeds both.
+	handler = server.AccountingMiddleware(handler, server.Accounting{
+		Charge:    limiter.Charge,
+		Completed: accessLog,
+	})
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	apiHandler := api.New(cfg, store, logger, stats)
 	// One Router serves whatever it is given: with no Proxy it 404s unmatched
@@ -447,6 +467,60 @@ func main() {
 	if err := srv.Start(); err != nil {
 		logger.Fatalf("Server failed: %v", err)
 	}
+}
+
+// newAccessLog builds the access-log sink and a function to close it.
+//
+// The access log gets its own logger at INFO rather than sharing the process
+// logger, so that -log-level does not silence it. An operator who raises the
+// level to WARN to quieten diagnostics is not asking to stop recording what the
+// proxy brokered, and losing the access log as a side effect of a logging tweak
+// is the kind of gap discovered only when someone needs it. -access-log off is
+// the one way to turn it off.
+func newAccessLog(format, path, logFormat string) (func(server.Exchange), func(), error) {
+	noop := func() {}
+	if format == "off" {
+		return nil, noop, nil
+	}
+
+	out := io.Writer(os.Stdout)
+	closeFn := noop
+	if path != "" {
+		// 0600: an access log names every destination every client visited,
+		// which is not something to leave world-readable.
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return nil, noop, err
+		}
+		out = &lockedWriter{w: f}
+		closeFn = func() { f.Close() }
+	} else if format == "combined" {
+		out = &lockedWriter{w: os.Stdout}
+	}
+
+	if format == "combined" {
+		return server.NewAccessLog(format, nil, out), closeFn, nil
+	}
+	accessLogger, err := config.NewLogger(out, log.INFO, logFormat)
+	if err != nil {
+		closeFn()
+		return nil, noop, err
+	}
+	return server.NewAccessLog(format, accessLogger, nil), closeFn, nil
+}
+
+// lockedWriter serialises writes so concurrent requests cannot interleave
+// within a line. Records arrive from every request goroutine and, for tunnels,
+// from the goroutine that closes the connection.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // parsePorts turns a comma-separated port list into numbers.

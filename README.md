@@ -44,6 +44,10 @@ go build -o proxy
 - `-policy-file` – File of destination rules, one per line. Can be set with `PROXY_POLICY_FILE`.
 - `-client-rule` – Client access rule; repeatable, longest prefix wins. See below.
 - `-client-file` – File of client access rules. Can be set with `PROXY_CLIENT_FILE`.
+- `-quota-rule` – Request or byte quota; repeatable. Unlimited by default. See below.
+- `-quota-file` – File of quota rules, one per line. Can be set with `PROXY_QUOTA_FILE`.
+- `-access-log` – Access log format: `structured`, `combined` or `off`. Defaults to `structured` or `PROXY_ACCESS_LOG`.
+- `-access-log-file` – Write access records to this file instead of stdout. Can be set with `PROXY_ACCESS_LOG_FILE`.
 - `-health-path` – Unauthenticated liveness path. Defaults to `/healthz` or `PROXY_HEALTH_PATH`; empty disables it.
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
@@ -209,6 +213,81 @@ locking an operator out with their own table would be its own trap.
 
 A source address is spoofable in ways a credential is not, so this is a
 complement to `-auth` rather than a substitute for it.
+
+## Quotas
+
+Nothing is limited unless you say so. Quotas are enforced per client and
+globally, and count both requests and bytes:
+
+```sh
+./proxy -quota-rule "global requests 500/s burst 1000" \
+        -quota-rule "client requests 50/s burst 100" \
+        -quota-rule "client bytes 10MB/s" \
+        -quota-rule "client 10.0.0.0/8 requests 200/s"
+```
+
+Rates are written `<amount>/<s|m|h>`. Byte amounts take `KB`/`MB`/`GB` (decimal)
+or `KiB`/`MiB`/`GiB` (binary) — both spellings are accepted because both are in
+common use. `burst` defaults to one second's worth. `unlimited` is available to
+exempt a client from a default that would otherwise apply to it.
+
+Per-client entries use **longest prefix wins**, like the client access table,
+and inherit whatever they do not name: an entry that sets only a request rate
+keeps the default byte rate rather than becoming unlimited.
+
+**Requests and bytes are enforced differently, and the difference is not an
+implementation detail.** A request quota is admission control — the cost is
+known before the request runs, so an over-quota request is refused with `429`
+and `Retry-After`, and nothing is wasted.
+
+A byte quota cannot work that way. For a streaming response the total is only
+known once it has been delivered, and enforcing a ceiling mid-transfer would
+hand the client a truncated body that looks like a complete one. So bytes are
+charged *after the fact*: traffic is metered as it flows, the bucket is allowed
+to go into deficit, and the **next** request is refused until it refills. The
+deficit is floored at one full burst, so a single large download costs one
+refill window rather than a multi-hour lockout.
+
+`CONNECT` tunnels are accounted for in both directions, so a tunnel cannot move
+unlimited traffic on the strength of being a single request.
+
+Quotas are visible in `proxy_quota_rejected_total{scope}`,
+`proxy_relayed_bytes_total` and `proxy_quota_tracked_clients`. The bucket table
+is bounded at 20,000 clients; the global ceiling still applies when an entry is
+evicted.
+
+Like the policy rules, quotas can be changed at runtime through the UI or
+`/api/policy` and take effect on the next request.
+
+## Access log
+
+One record per completed request, on by default:
+
+```
+INFO access client=10.1.2.3 method=GET host=example.com status=200 bytes_in=0 bytes_out=3400 duration=4.1ms path=/a
+```
+
+- `-access-log structured` (default) goes through the logger, so it inherits
+  `-log-format` — `json` gives one JSON object per request.
+- `-access-log combined` emits NCSA combined format for existing tooling.
+- `-access-log off` disables it entirely; no record is built at all.
+- `-access-log-file` routes access records to their own file, so they can be
+  shipped separately from diagnostics. The file is created `0600` — an access
+  log names every destination every client visited.
+
+The access log has **its own logger at `INFO`** and is not silenced by
+`-log-level`. Raising the level to quieten diagnostics is not a request to stop
+recording what the proxy brokered; `-access-log off` is the one way to turn it
+off.
+
+**Query strings are dropped, not redacted.** A proxy cannot know which parameter
+carries a session token, and a partial redaction that looks thorough is worse
+than an honest omission. Userinfo is stripped from the authority for the same
+reason, and no header is ever written to this log.
+
+`CONNECT` tunnels and protocol upgrades are logged **on close**, with byte
+counts in both directions — logged at establishment they would report zero
+bytes and no duration.
 
 ## WebSocket and protocol upgrades
 
