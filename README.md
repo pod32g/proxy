@@ -191,6 +191,18 @@ allow 192.168.0.0/16
 default deny
 ```
 
+Both rule sets are editable at runtime from the **Policy** page in the UI, or
+through `GET`/`PUT /api/policy`. `POST /api/policy/test` (and the form on that
+page) answers *would this be allowed, and by which rule* without changing
+anything — worth using before a change goes live, since an ordered rule set is
+otherwise hard to reason about:
+
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"host":"api.example.com","client":"10.1.2.3"}' \
+     http://localhost:8080/api/policy/test
+```
+
 Client rules gate **proxying only**. The admin surface stays reachable from a
 denied address deliberately: the controls that fix a bad rule are behind it, and
 locking an operator out with their own table would be its own trap.

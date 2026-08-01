@@ -3,6 +3,7 @@ package config
 // Config holds the runtime configuration for the proxy server.
 import (
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 
@@ -372,4 +373,62 @@ func (c *Config) DestinationRulesFor(clientIP string) *policy.RuleSet {
 		return global
 	}
 	return clients.DestinationsFor(clientIP, global)
+}
+
+// PolicyDecision is the result of a dry run: what the rules would do with a
+// destination, and which rule decided it.
+type PolicyDecision struct {
+	Client      string `json:"client,omitempty"`
+	Host        string `json:"host"`
+	IP          string `json:"ip,omitempty"`
+	ClientAllow bool   `json:"client_allowed"`
+	ClientRule  string `json:"client_rule,omitempty"`
+	Allowed     bool   `json:"allowed"`
+	Rule        string `json:"rule,omitempty"`
+	Reason      string `json:"reason"`
+}
+
+// EvaluatePolicy answers "would this be allowed, and by which rule". An ordered
+// rule set that cannot be interrogated is guesswork in production, so this is
+// the same evaluation the request path performs rather than a reimplementation
+// that can drift from it.
+//
+// ip may be empty, in which case only rules decidable without DNS are applied
+// and the answer says so.
+func (c *Config) EvaluatePolicy(clientIP, host, ip string) PolicyDecision {
+	out := PolicyDecision{Client: clientIP, Host: host, IP: ip}
+
+	allowed, rule := c.ClientAllowed(clientIP)
+	out.ClientAllow, out.ClientRule = allowed, rule
+	if !allowed {
+		out.Reason = "client refused: " + rule
+		return out
+	}
+
+	var parsed net.IP
+	if ip != "" {
+		parsed = net.ParseIP(ip)
+	}
+	decision, matched := c.DestinationRulesFor(clientIP).Match(host, parsed)
+	if matched != nil {
+		out.Rule = matched.String()
+	}
+	switch decision {
+	case policy.Allow:
+		out.Allowed = true
+		out.Reason = "allowed by rule: " + out.Rule
+	case policy.Deny:
+		out.Reason = "denied by rule: " + out.Rule
+	default:
+		// No rule decided. The request path would fall through to the
+		// private-address default, which needs an address to evaluate.
+		out.Allowed = true
+		if ip == "" {
+			out.Reason = "no rule decided without an address; supply ip= to evaluate cidr rules " +
+				"and the private-address default"
+		} else {
+			out.Reason = "no rule matched; the private-address default applies"
+		}
+	}
+	return out
 }

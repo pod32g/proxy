@@ -231,3 +231,127 @@ func TestOversizedBodyIsRejected(t *testing.T) {
 		t.Fatalf("got %d, want 400", rec.Code)
 	}
 }
+
+func TestPolicyEndpointRoundTrip(t *testing.T) {
+	cfg, h := newAPI()
+
+	rec := doReq(t, h, "PUT", "/policy", map[string]string{
+		"destinations": "allow domain example.com\ndeny all",
+		"clients":      "allow 10.0.0.0/8\ndefault deny",
+	})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("PUT: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if cfg.PolicyRulesText() == "" || cfg.ClientRulesText() == "" {
+		t.Fatal("rules not applied")
+	}
+
+	rec2 := doReq(t, h, "GET", "/policy", nil)
+	var got map[string]string
+	if err := json.Unmarshal(rec2.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got["destinations"], "deny all") || !strings.Contains(got["clients"], "default deny") {
+		t.Fatalf("round trip lost rules: %v", got)
+	}
+}
+
+// A half-applied policy is worse than a rejected one, so both sets are
+// validated before either is installed.
+func TestPolicyEndpointValidatesBeforeApplying(t *testing.T) {
+	cfg, h := newAPI()
+	if err := cfg.SetPolicyRules("allow all"); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := doReq(t, h, "PUT", "/policy", map[string]string{
+		"destinations": "allow domain example.com\ndeny all", // valid
+		"clients":      "allow not-an-address",               // invalid
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "clients") {
+		t.Errorf("error should name the offending set: %q", rec.Body.String())
+	}
+	// The valid half must not have been applied.
+	if cfg.PolicyRulesText() != "allow all" {
+		t.Errorf("destinations were applied despite the rejection: %q", cfg.PolicyRulesText())
+	}
+}
+
+// An omitted set is left alone rather than cleared.
+func TestPolicyEndpointOmittedSetIsUntouched(t *testing.T) {
+	cfg, h := newAPI()
+	if err := cfg.SetClientRules("allow 10.0.0.0/8"); err != nil {
+		t.Fatal(err)
+	}
+	rec := doReq(t, h, "PUT", "/policy", map[string]string{"destinations": "deny all"})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if cfg.ClientRulesText() != "allow 10.0.0.0/8" {
+		t.Errorf("omitted client set was cleared: %q", cfg.ClientRulesText())
+	}
+}
+
+// The dry run is the ship gate for this ticket: an ordered rule set you cannot
+// interrogate is guesswork.
+func TestPolicyTestEndpoint(t *testing.T) {
+	cfg, h := newAPI()
+	if err := cfg.SetPolicyRules("deny domain blocked.test\nallow domain example.com\ndeny all"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.SetClientRules("deny 203.0.113.9\ndefault allow"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		body        map[string]string
+		wantAllowed bool
+		wantInRule  string
+	}{
+		{"allowed host", map[string]string{"host": "api.example.com"}, true, "allow domain example.com"},
+		{"denied host", map[string]string{"host": "blocked.test"}, false, "deny domain blocked.test"},
+		{"falls through to deny all", map[string]string{"host": "other.test"}, false, "deny all"},
+		{"url instead of host", map[string]string{"url": "https://api.example.com/path"}, true, "allow domain example.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doReq(t, h, "POST", "/policy/test", tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("got %d (%s)", rec.Code, rec.Body.String())
+			}
+			var got config.PolicyDecision
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Allowed != tc.wantAllowed {
+				t.Errorf("allowed = %v, want %v (%s)", got.Allowed, tc.wantAllowed, got.Reason)
+			}
+			// Naming the deciding rule is the whole point.
+			if !strings.Contains(got.Rule, tc.wantInRule) {
+				t.Errorf("rule = %q, want it to contain %q", got.Rule, tc.wantInRule)
+			}
+		})
+	}
+
+	// A denied client is reported as such, before destinations are considered.
+	rec := doReq(t, h, "POST", "/policy/test",
+		map[string]string{"host": "api.example.com", "client": "203.0.113.9"})
+	var got config.PolicyDecision
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ClientAllow || !strings.Contains(got.Reason, "client refused") {
+		t.Errorf("denied client: %+v", got)
+	}
+}
+
+func TestPolicyTestRequiresAHost(t *testing.T) {
+	_, h := newAPI()
+	rec := doReq(t, h, "POST", "/policy/test", map[string]string{})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}

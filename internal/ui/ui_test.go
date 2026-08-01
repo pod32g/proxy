@@ -351,3 +351,73 @@ func TestPageRenderDoesNotRaceWithIdentitySave(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestPolicyPageRoundTrip(t *testing.T) {
+	cfg := &config.Config{}
+	h := New(cfg, nil, nil, nil, nil)
+
+	rec := postForm(t, h, "/set-policy", url.Values{
+		"destinations": {"allow domain example.com\ndeny all"},
+		"clients":      {"allow 10.0.0.0/8\ndefault deny"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if cfg.PolicyRulesText() == "" || cfg.ClientRulesText() == "" {
+		t.Fatal("rules not applied")
+	}
+
+	// The page renders what was saved, so it can be edited further.
+	req := httptest.NewRequest(http.MethodGet, "/policy", nil)
+	page := httptest.NewRecorder()
+	h.ServeHTTP(page, req)
+	if !strings.Contains(page.Body.String(), "deny all") {
+		t.Error("saved rules not shown on the page")
+	}
+}
+
+// An invalid rule set must not discard what the operator typed. Redirecting
+// away with the input lost is how people stop using a form.
+func TestPolicyPageKeepsInputOnError(t *testing.T) {
+	cfg := &config.Config{}
+	if err := cfg.SetPolicyRules("allow all"); err != nil {
+		t.Fatal(err)
+	}
+	h := New(cfg, nil, nil, nil, nil)
+
+	rec := postForm(t, h, "/set-policy", url.Values{
+		"destinations": {"allow domain example.com\nallow bogus rule"},
+		"clients":      {""},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected the page to be re-rendered, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "line 2") {
+		t.Error("error should name the offending line")
+	}
+	if !strings.Contains(body, "allow bogus rule") {
+		t.Error("the operator's input was discarded")
+	}
+	if cfg.PolicyRulesText() != "allow all" {
+		t.Errorf("invalid rules were applied: %q", cfg.PolicyRulesText())
+	}
+}
+
+func TestPolicyPageDryRun(t *testing.T) {
+	cfg := &config.Config{}
+	if err := cfg.SetPolicyRules("allow domain example.com\ndeny all"); err != nil {
+		t.Fatal(err)
+	}
+	h := New(cfg, nil, nil, nil, nil)
+
+	rec := postForm(t, h, "/test-policy", url.Values{"host": {"api.example.com"}})
+	if !strings.Contains(rec.Body.String(), "ALLOWED") {
+		t.Errorf("allowed host: %q", rec.Body.String())
+	}
+	rec2 := postForm(t, h, "/test-policy", url.Values{"host": {"elsewhere.test"}})
+	body := rec2.Body.String()
+	if !strings.Contains(body, "DENIED") || !strings.Contains(body, "deny all") {
+		t.Errorf("denied host should name the rule: %q", body)
+	}
+}

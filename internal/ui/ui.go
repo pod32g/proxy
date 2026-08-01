@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/pod32g/proxy/internal/config"
+	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/server"
 	log "github.com/pod32g/simple-logger"
 )
@@ -23,6 +24,9 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *s
 	mux.HandleFunc("/analytics", h.analytics)
 	mux.HandleFunc("/identity", h.identityPage)
 	mux.HandleFunc("/set-identity", h.setIdentity)
+	mux.HandleFunc("/policy", h.policyPage)
+	mux.HandleFunc("/set-policy", h.setPolicy)
+	mux.HandleFunc("/test-policy", h.testPolicy)
 	mux.HandleFunc("/auth", h.authPage)
 	mux.HandleFunc("/set-auth", h.setAuth)
 	mux.HandleFunc("/header", h.addHeader)
@@ -55,6 +59,11 @@ type pageData struct {
 	StatsEnabled  bool
 	Stats         []server.Stat
 	CSRFToken     string
+
+	DestinationRules string
+	ClientRules      string
+	PolicyError      string
+	TestResult       string
 }
 
 // CSRF uses the double-submit pattern: a random token is stored in a cookie and
@@ -160,6 +169,7 @@ var layout = template.Must(template.New("layout").Parse(`<!DOCTYPE html>
     <ul class="nav flex-column">
         <li class="nav-item"><a href="/ui/general" class="nav-link">General Settings</a></li>
         <li class="nav-item"><a href="/ui/analytics" class="nav-link">Analytics</a></li>
+        <li class="nav-item"><a href="/ui/policy" class="nav-link">Policy</a></li>
         <li class="nav-item"><a href="/ui/identity" class="nav-link">Identity</a></li>
         <li class="nav-item"><a href="/ui/auth" class="nav-link">Authentication</a></li>
     </ul>
@@ -272,6 +282,38 @@ statsSrc.onmessage = function(e){
 </form>
 {{end}}`))
 
+var policyPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
+<h2>Destination rules</h2>
+<p>Ordered, first match wins. One rule per line; <code>#</code> comments allowed.<br>
+<code>allow domain example.com</code> &middot; <code>deny cidr 10.0.0.0/8</code> &middot; <code>deny all</code></p>
+
+<h2>Client rules</h2>
+<p>Longest prefix wins. <code>allow 10.0.0.0/8</code> &middot; <code>deny 10.1.2.3</code> &middot;
+<code>default deny</code><br>A client may carry its own destination rules:
+<code>allow 10.0.0.0/8 { allow domain example.com; deny all }</code></p>
+
+{{if .PolicyError}}<p><strong>Not applied:</strong> {{.PolicyError}}</p>{{end}}
+
+<form method="POST" action="set-policy">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <label>Destinations:<br><textarea name="destinations" rows="8" cols="60">{{.DestinationRules}}</textarea></label><br>
+    <label>Clients:<br><textarea name="clients" rows="6" cols="60">{{.ClientRules}}</textarea></label><br>
+    <button type="submit">Save</button>
+</form>
+
+<h2>Test a destination</h2>
+<p>Answers which rule decides, without changing anything. Supply an address to
+exercise <code>cidr</code> rules and the private-address default.</p>
+<form method="POST" action="test-policy">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <label>Host: <input name="host" placeholder="api.example.com"></label>
+    <label>Address: <input name="ip" placeholder="203.0.113.5 (optional)"></label>
+    <label>Client: <input name="client" placeholder="10.1.2.3 (optional)"></label>
+    <button type="submit">Test</button>
+</form>
+{{if .TestResult}}<p><strong>Result:</strong> {{.TestResult}}</p>{{end}}
+{{end}}`))
+
 var identityPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
 <h2>Proxy Identity</h2>
 <form method="POST" action="set-identity">
@@ -299,17 +341,19 @@ func (h *handler) makeData(w http.ResponseWriter, r *http.Request) pageData {
 	// config lock, so touching the fields directly races with any concurrent save.
 	proxyName, proxyID := h.cfg.GetIdentity()
 	data := pageData{
-		Headers:       h.cfg.GetHeaders(),
-		ClientHeaders: h.cfg.GetAllClientHeaders(),
-		LogLevel:      config.LevelString(h.cfg.GetLogLevel()),
-		AuthEnabled:   enabled,
-		Username:      user,
-		ProxyName:     proxyName,
-		ProxyID:       proxyID,
-		ClientCount:   0,
-		ClientAddrs:   nil,
-		StatsEnabled:  h.cfg.StatsEnabledState(),
-		CSRFToken:     h.issueCSRF(w, r),
+		Headers:          h.cfg.GetHeaders(),
+		ClientHeaders:    h.cfg.GetAllClientHeaders(),
+		LogLevel:         config.LevelString(h.cfg.GetLogLevel()),
+		AuthEnabled:      enabled,
+		Username:         user,
+		ProxyName:        proxyName,
+		ProxyID:          proxyID,
+		ClientCount:      0,
+		ClientAddrs:      nil,
+		StatsEnabled:     h.cfg.StatsEnabledState(),
+		CSRFToken:        h.issueCSRF(w, r),
+		DestinationRules: h.cfg.PolicyRulesText(),
+		ClientRules:      h.cfg.ClientRulesText(),
 	}
 	if h.clients != nil {
 		data.ClientCount = h.clients.Count()
@@ -359,6 +403,74 @@ func (h *handler) authPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	authPage.Execute(w, h.makeData(w, r))
+}
+
+func (h *handler) policyPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	policyPage.Execute(w, h.makeData(w, r))
+}
+
+func (h *handler) setPolicy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	if !h.checkCSRF(w, r) {
+		return
+	}
+	destinations := r.FormValue("destinations")
+	clients := r.FormValue("clients")
+
+	// Validate both before applying either, and re-render with the error rather
+	// than redirecting: losing what the operator typed because line 7 was wrong
+	// is how people stop using a form.
+	data := h.makeData(w, r)
+	data.DestinationRules, data.ClientRules = destinations, clients
+	if _, err := policy.Parse(destinations); err != nil {
+		data.PolicyError = "destinations: " + err.Error()
+		policyPage.Execute(w, data)
+		return
+	}
+	if _, err := policy.ParseClients(clients); err != nil {
+		data.PolicyError = "clients: " + err.Error()
+		policyPage.Execute(w, data)
+		return
+	}
+	_ = h.cfg.SetPolicyRules(destinations)
+	_ = h.cfg.SetClientRules(clients)
+	if h.logger != nil {
+		h.logger.Info("Updated policy")
+	}
+	if h.store != nil {
+		h.store.Save(h.cfg)
+	}
+	http.Redirect(w, r, "/ui/policy", http.StatusSeeOther)
+}
+
+func (h *handler) testPolicy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	if !h.checkCSRF(w, r) {
+		return
+	}
+	data := h.makeData(w, r)
+	host := r.FormValue("host")
+	if host == "" {
+		data.TestResult = "enter a host to test"
+	} else {
+		result := h.cfg.EvaluatePolicy(r.FormValue("client"), host, r.FormValue("ip"))
+		verdict := "DENIED"
+		if result.Allowed && result.ClientAllow {
+			verdict = "ALLOWED"
+		}
+		data.TestResult = verdict + " — " + result.Reason
+	}
+	policyPage.Execute(w, data)
 }
 
 func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {

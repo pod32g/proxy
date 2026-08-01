@@ -7,6 +7,7 @@ import (
 	"net/url"
 
 	"github.com/pod32g/proxy/internal/config"
+	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/server"
 	log "github.com/pod32g/simple-logger"
 )
@@ -20,6 +21,8 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, stats *ser
 	mux.HandleFunc("/auth", h.auth)
 	mux.HandleFunc("/identity", h.identity)
 	mux.HandleFunc("/stats", h.statsHandler)
+	mux.HandleFunc("/policy", h.policy)
+	mux.HandleFunc("/policy/test", h.policyTest)
 	return guard(mux, logger)
 }
 
@@ -102,6 +105,21 @@ type authReq struct {
 
 type statsReq struct {
 	Enabled *bool `json:"enabled"`
+}
+
+type policyReq struct {
+	// Whole-set replacement rather than per-rule edits: the order is the
+	// semantics, and patching one entry of an ordered list is a poor fit for a
+	// REST verb. Pointers so an omitted set is left alone rather than cleared.
+	Destinations *string `json:"destinations"`
+	Clients      *string `json:"clients"`
+}
+
+type policyTestReq struct {
+	Client string `json:"client"`
+	URL    string `json:"url"`
+	Host   string `json:"host"`
+	IP     string `json:"ip"`
 }
 
 type identityReq struct {
@@ -260,6 +278,76 @@ func (h *handler) identity(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (h *handler) policy(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]string{
+			"destinations": h.cfg.PolicyRulesText(),
+			"clients":      h.cfg.ClientRulesText(),
+		})
+	case http.MethodPut, http.MethodPost:
+		var req policyReq
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		// Validate both before applying either: a half-applied policy is worse
+		// than a rejected one, and the parsers already name the bad line.
+		if req.Destinations != nil {
+			if _, err := policy.Parse(*req.Destinations); err != nil {
+				http.Error(w, "destinations: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if req.Clients != nil {
+			if _, err := policy.ParseClients(*req.Clients); err != nil {
+				http.Error(w, "clients: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if req.Destinations != nil {
+			_ = h.cfg.SetPolicyRules(*req.Destinations)
+		}
+		if req.Clients != nil {
+			_ = h.cfg.SetClientRules(*req.Clients)
+		}
+		if h.logger != nil {
+			h.logger.Info("Updated policy")
+		}
+		if h.store != nil {
+			h.store.Save(h.cfg)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// policyTest answers "would this be allowed, and by which rule".
+func (h *handler) policyTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	var req policyTestReq
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	host := req.Host
+	if host == "" && req.URL != "" {
+		u, err := url.Parse(req.URL)
+		if err != nil || u.Host == "" {
+			http.Error(w, "url: cannot determine a host", http.StatusBadRequest)
+			return
+		}
+		host = u.Hostname()
+	}
+	if host == "" {
+		http.Error(w, `one of "url" or "host" is required`, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, h.cfg.EvaluatePolicy(req.Client, host, req.IP))
 }
 
 func (h *handler) statsHandler(w http.ResponseWriter, r *http.Request) {
