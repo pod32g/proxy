@@ -291,6 +291,45 @@ reason, and no header is ever written to this log.
 counts in both directions — logged at establishment they would report zero
 bytes and no duration.
 
+## Audit trail
+
+Every configuration change that reaches the store is recorded: when, which
+setting, from what to what, by whom, from where, and through which surface
+(`ui`, `api` or `startup`). Readable at `/ui/audit` and `GET /api/audit`.
+
+Both are **read-only**. There is no verb that edits or deletes an entry, because
+a trail somebody can rewrite is not one an investigation can rely on. The only
+removal is the retention trim below.
+
+**Coverage is structural.** The trail is computed inside `Store.Save`, by
+diffing against what is currently stored, in the transaction that performs the
+write. An audit that each of the fifteen call sites had to remember to invoke
+would be complete only until someone added the sixteenth — and then it would be
+silently incomplete while still looking complete, which is the failure mode worth
+designing against. Diffing in one place also means the entry and the change it
+describes commit or roll back together: a write that fails leaves no entry
+claiming it happened.
+
+**Credentials are recorded as changed, never with a value.** The username is
+redacted along with the password — it is half a credential, and an operator who
+set `-secret` to keep credentials out of a readable database would not expect the
+audit table to hand one back. They render as `[set]` and `[unset]`, so the
+genuinely useful transition is still visible:
+
+```
+password  [unset] -> [set]  via=api  src=10.1.2.3  user=operator
+```
+
+Credentials are compared on their **plaintext**, not their stored form. Sealing
+uses a fresh nonce, so the ciphertext differs on every save even when the
+password is untouched — diffing stored values would record a credential change
+on every single write, and an audit that cries wolf trains its reader to ignore
+the entry that matters.
+
+**Retention** is by row count (5000), trimmed in the same transaction as the
+write that adds a row. A row count is a hard bound on the table; a time window is
+a bound only if changes arrive at the rate you guessed they would.
+
 ## WebSocket and protocol upgrades
 
 Forward mode proxies HTTP upgrades, so `ws://` works through the proxy. The

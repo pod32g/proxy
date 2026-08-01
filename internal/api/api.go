@@ -5,6 +5,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/policy"
@@ -24,7 +25,20 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, stats *ser
 	mux.HandleFunc("/stats", h.statsHandler)
 	mux.HandleFunc("/policy", h.policy)
 	mux.HandleFunc("/policy/test", h.policyTest)
+	mux.HandleFunc("/audit", h.audit)
 	return guard(mux, logger)
+}
+
+// actor identifies who is making a change, for the audit trail. The username
+// comes off the request the router already authenticated, so an unauthenticated
+// deployment records the source alone rather than nothing.
+func (h *handler) actor(r *http.Request) config.Actor {
+	user, _, _ := r.BasicAuth()
+	return config.Actor{
+		Source: server.HostOnly(r.RemoteAddr),
+		User:   user,
+		Via:    config.ViaAPI,
+	}
 }
 
 // guard rejects state-changing calls a browser could be induced to make from
@@ -175,7 +189,7 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 					log.String("value", config.RedactHeaderValue(req.Name, req.Value)))
 			}
 			if h.store != nil {
-				h.store.Save(h.cfg)
+				h.store.Save(h.cfg, h.actor(r))
 			}
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -194,7 +208,7 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 				h.logger.Info("Deleted header", log.String("name", req.Name))
 			}
 			if h.store != nil {
-				h.store.Save(h.cfg)
+				h.store.Save(h.cfg, h.actor(r))
 			}
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -224,7 +238,7 @@ func (h *handler) logLevel(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("Set log level", log.String("level", req.Level))
 		}
 		if h.store != nil {
-			h.store.Save(h.cfg)
+			h.store.Save(h.cfg, h.actor(r))
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -251,7 +265,7 @@ func (h *handler) auth(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("updated auth settings")
 		}
 		if h.store != nil {
-			h.store.Save(h.cfg)
+			h.store.Save(h.cfg, h.actor(r))
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -274,7 +288,7 @@ func (h *handler) identity(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("updated identity")
 		}
 		if h.store != nil {
-			h.store.Save(h.cfg)
+			h.store.Save(h.cfg, h.actor(r))
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -328,12 +342,45 @@ func (h *handler) policy(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("Updated policy")
 		}
 		if h.store != nil {
-			h.store.Save(h.cfg)
+			h.store.Save(h.cfg, h.actor(r))
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// audit exposes the configuration change trail, read-only. There is no verb
+// here that edits or deletes an entry: a trail somebody can rewrite is not one
+// an investigation can rely on, and the only removal is the retention trim that
+// happens inside the write transaction.
+func (h *handler) audit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "the audit trail is read-only", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.store == nil {
+		writeJSON(w, []config.AuditEntry{})
+		return
+	}
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	entries, err := h.store.Audit(limit)
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Errorf("Failed to read audit trail: %v", err)
+		}
+		http.Error(w, "could not read the audit trail", http.StatusInternalServerError)
+		return
+	}
+	if entries == nil {
+		entries = []config.AuditEntry{}
+	}
+	writeJSON(w, entries)
 }
 
 // policyTest answers "would this be allowed, and by which rule".
@@ -384,7 +431,7 @@ func (h *handler) statsHandler(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("Set stats enabled", log.Bool("enabled", *req.Enabled))
 		}
 		if h.store != nil {
-			h.store.Save(h.cfg)
+			h.store.Save(h.cfg, h.actor(r))
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:

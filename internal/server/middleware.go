@@ -20,6 +20,11 @@ func hostOnly(host string) string {
 	return host
 }
 
+// HostOnly is hostOnly for callers outside this package. The audit trail and
+// the quota table key on an address, and they must all key on the same form of
+// it or the same client looks like several.
+func HostOnly(host string) string { return hostOnly(host) }
+
 // StatsMiddleware records hosts for incoming requests using DomainStats.
 func StatsMiddleware(next http.Handler, stats *DomainStats, enabled func() bool, hostGetter func(*http.Request) string) http.Handler {
 	if next == nil || stats == nil {

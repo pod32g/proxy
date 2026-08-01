@@ -39,7 +39,7 @@ func TestSaltIsRandomPerDatabase(t *testing.T) {
 		store := newTestStore(t)
 		cfg := &Config{SecretKey: "k"}
 		cfg.SetAuth(true, "u", "p")
-		if err := store.Save(cfg); err != nil {
+		if err := store.Save(cfg, Actor{}); err != nil {
 			t.Fatal(err)
 		}
 		salt, err := store.salt()
@@ -82,7 +82,7 @@ func TestLegacyCiphertextMigrates(t *testing.T) {
 		t.Fatalf("legacy credentials did not survive load: %q %q", u, p)
 	}
 
-	if err := store.Save(cfg); err != nil {
+	if err := store.Save(cfg, Actor{}); err != nil {
 		t.Fatal(err)
 	}
 	var stored string
@@ -109,7 +109,7 @@ func TestWrongSecretKeepsCurrentCredentials(t *testing.T) {
 
 	saved := &Config{SecretKey: "right"}
 	saved.SetAuth(true, "u", "p")
-	if err := store.Save(saved); err != nil {
+	if err := store.Save(saved, Actor{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -174,7 +174,7 @@ func TestStoreSaveLoad(t *testing.T) {
 	cfg.SetAuth(true, "u", "p")
 	cfg.SetStatsEnabled(true)
 	cfg.SetIdentity("n", "id")
-	if err := store.Save(cfg); err != nil {
+	if err := store.Save(cfg, Actor{}); err != nil {
 		t.Fatal(err)
 	}
 	loaded := &Config{SecretKey: "k"}
@@ -206,13 +206,13 @@ func TestSaveDoesNotRederiveKey(t *testing.T) {
 
 	cfg := &Config{SecretKey: "s3kr1t"}
 	cfg.SetAuth(true, "alice", "s3cret")
-	if err := store.Save(cfg); err != nil { // warm: pays for the derivation once
+	if err := store.Save(cfg, Actor{}); err != nil { // warm: pays for the derivation once
 		t.Fatal(err)
 	}
 
 	start := time.Now()
 	for i := 0; i < 20; i++ {
-		if err := store.Save(cfg); err != nil {
+		if err := store.Save(cfg, Actor{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -230,7 +230,7 @@ func TestWrongSecretWarns(t *testing.T) {
 
 	saved := &Config{SecretKey: "right"}
 	saved.SetAuth(true, "u", "p")
-	if err := store.Save(saved); err != nil {
+	if err := store.Save(saved, Actor{}); err != nil {
 		t.Fatal(err)
 	}
 	store.Warnings() // drain anything from the save

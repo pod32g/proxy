@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/scrypt"
@@ -228,7 +229,10 @@ func initSchema(db *sql.DB) error {
 		return err
 	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);`)
-	return err
+	if err != nil {
+		return err
+	}
+	return initAuditSchema(db)
 }
 
 // Close closes the underlying database.
@@ -372,8 +376,17 @@ func (s *Store) plaintext(secret string, salt []byte, stored, current, what stri
 	return dec
 }
 
-// Save writes the given configuration to the store.
-func (s *Store) Save(cfg *Config) error {
+// Save writes the given configuration to the store, recording what changed.
+//
+// The audit is computed here, inside the write transaction, rather than by each
+// caller. That is deliberate: with fifteen call sites across the UI, the API and
+// startup, an audit that every caller has to remember to invoke is complete only
+// until someone adds the sixteenth — and then it is silently incomplete while
+// still looking complete, which is worse than not having one. Diffing here makes
+// coverage a property of the code rather than of everyone's diligence, and gets
+// "same transaction as the change" for free: a write that rolls back leaves no
+// entry claiming it happened.
+func (s *Store) Save(cfg *Config, by Actor) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
@@ -406,6 +419,9 @@ func (s *Store) Save(cfg *Config) error {
 		{"quota_rules", cfg.QuotaText()},
 	}
 
+	// Keep the plaintext for the audit diff before sealing replaces them.
+	userPlain, passPlain := user, pass
+
 	if cfg.SecretKey != "" {
 		salt, err := ensureSalt(tx)
 		if err != nil {
@@ -424,6 +440,19 @@ func (s *Store) Save(cfg *Config) error {
 			return err
 		}
 	}
+	// Diff before writing, and diff the credentials on their plaintext.
+	//
+	// Sealing uses a fresh nonce every time, so the stored ciphertext differs on
+	// every save even when the password is untouched. Comparing stored forms
+	// would therefore record a credential change on every single write — an
+	// audit that cries wolf is worse than no audit, because it trains whoever
+	// reads it to ignore exactly the entry that matters.
+	plainCreds := map[string]string{"username": userPlain, "password": passPlain}
+	changes, err := s.diff(tx, cfg, settings, plainCreds)
+	if err != nil {
+		return err
+	}
+
 	settings = append(settings, [2]string{"username", user}, [2]string{"password", pass})
 
 	for _, kv := range settings {
@@ -431,7 +460,75 @@ func (s *Store) Save(cfg *Config) error {
 			return err
 		}
 	}
+	if err := recordAudit(tx, by, changes, time.Now()); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+// diff reports what this Save will change, reading the current values through
+// the caller's transaction so the comparison and the write see the same state.
+//
+// plainCreds carries the credential settings by their plaintext, keyed by
+// setting name; those are compared on plaintext and recorded redacted.
+func (s *Store) diff(tx *sql.Tx, cfg *Config, settings [][2]string, plainCreds map[string]string) ([]AuditEntry, error) {
+	var out []AuditEntry
+
+	for _, kv := range settings {
+		key, newValue := kv[0], kv[1]
+		oldValue, err := storedSetting(tx, key)
+		if err != nil {
+			return nil, err
+		}
+		if oldValue == newValue {
+			continue
+		}
+		out = append(out, AuditEntry{Setting: key, OldValue: oldValue, NewValue: newValue})
+	}
+
+	for key, newPlain := range plainCreds {
+		stored, err := storedSetting(tx, key)
+		if err != nil {
+			return nil, err
+		}
+		oldPlain := stored
+		if cfg.SecretKey != "" && stored != "" {
+			salt, err := ensureSalt(tx)
+			if err != nil {
+				return nil, err
+			}
+			// An unreadable stored credential is about to be replaced anyway.
+			// Treat it as different rather than failing the whole save.
+			if dec, err := s.openCredential(cfg.SecretKey, salt, stored); err == nil {
+				oldPlain = dec
+			} else {
+				oldPlain = "\x00unreadable"
+			}
+		}
+		if oldPlain == newPlain {
+			continue
+		}
+		out = append(out, AuditEntry{
+			Setting:  key,
+			OldValue: auditValue(oldPlain),
+			NewValue: auditValue(newPlain),
+		})
+	}
+	return out, nil
+}
+
+// storedSetting reads a setting through the transaction, treating "absent" as
+// empty — which is what an unset setting means everywhere else here.
+func storedSetting(tx *sql.Tx, key string) (string, error) {
+	var v string
+	err := tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
 }
 
 // CredentialsAtRisk reports whether Save would persist non-empty credentials

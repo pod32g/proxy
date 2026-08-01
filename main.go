@@ -358,7 +358,11 @@ func main() {
 	if store != nil {
 		// Also rewrites credentials sealed by older builds under the current
 		// key derivation.
-		if err := store.Save(cfg); err != nil {
+		// Startup is audited like any other change: flags and environment
+		// variables genuinely do alter stored settings through reapply, and
+		// "this value changed when the process restarted" is exactly the kind
+		// of thing an investigation needs and would otherwise never find.
+		if err := store.Save(cfg, config.Actor{Via: config.ViaStartup}); err != nil {
 			logger.Errorf("Failed to persist config: %v", err)
 		}
 	}

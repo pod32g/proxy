@@ -28,6 +28,7 @@ func New(cfg *config.Config, store *config.Store, logger *log.Logger, clients *s
 	mux.HandleFunc("/policy", h.policyPage)
 	mux.HandleFunc("/set-policy", h.setPolicy)
 	mux.HandleFunc("/test-policy", h.testPolicy)
+	mux.HandleFunc("/audit", h.auditPage)
 	mux.HandleFunc("/auth", h.authPage)
 	mux.HandleFunc("/set-auth", h.setAuth)
 	mux.HandleFunc("/header", h.addHeader)
@@ -45,6 +46,16 @@ type handler struct {
 	logger  *log.Logger
 	clients *server.ClientTracker
 	stats   *server.DomainStats
+}
+
+// actor identifies who is making a change, for the audit trail.
+func (h *handler) actor(r *http.Request) config.Actor {
+	user, _, _ := r.BasicAuth()
+	return config.Actor{
+		Source: server.HostOnly(r.RemoteAddr),
+		User:   user,
+		Via:    config.ViaUI,
+	}
 }
 
 type pageData struct {
@@ -66,6 +77,9 @@ type pageData struct {
 	Quotas           string
 	PolicyError      string
 	TestResult       string
+
+	Audit      []config.AuditEntry
+	AuditError string
 }
 
 // CSRF uses the double-submit pattern: a random token is stored in a cookie and
@@ -174,6 +188,7 @@ var layout = template.Must(template.New("layout").Parse(`<!DOCTYPE html>
         <li class="nav-item"><a href="/ui/policy" class="nav-link">Policy</a></li>
         <li class="nav-item"><a href="/ui/identity" class="nav-link">Identity</a></li>
         <li class="nav-item"><a href="/ui/auth" class="nav-link">Authentication</a></li>
+        <li class="nav-item"><a href="/ui/audit" class="nav-link">Audit</a></li>
     </ul>
 </div>
 <div class="content">
@@ -324,6 +339,32 @@ exercise <code>cidr</code> rules and the private-address default.</p>
 {{if .TestResult}}<p><strong>Result:</strong> {{.TestResult}}</p>{{end}}
 {{end}}`))
 
+var auditPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
+<h2>Configuration changes</h2>
+<p>Every change written to the store, newest first. Recorded in the same
+transaction as the change itself, so nothing here describes a write that did not
+happen. Credentials are recorded as having changed and never with their value.</p>
+{{if .AuditError}}<p><strong>Could not read the trail:</strong> {{.AuditError}}</p>{{end}}
+{{if .Audit}}
+<table>
+<thead><tr><th>When</th><th>Setting</th><th>From</th><th>To</th><th>By</th><th>Source</th><th>Via</th></tr></thead>
+{{range .Audit}}
+<tr>
+  <td>{{.At.Format "2006-01-02 15:04:05Z"}}</td>
+  <td>{{.Setting}}</td>
+  <td>{{.OldValue}}</td>
+  <td>{{.NewValue}}</td>
+  <td>{{if .User}}{{.User}}{{else}}&mdash;{{end}}</td>
+  <td>{{if .Source}}{{.Source}}{{else}}&mdash;{{end}}</td>
+  <td>{{.Via}}</td>
+</tr>
+{{end}}
+</table>
+{{else}}
+<p>No changes recorded yet.</p>
+{{end}}
+{{end}}`))
+
 var identityPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "content"}}
 <h2>Proxy Identity</h2>
 <form method="POST" action="set-identity">
@@ -416,6 +457,22 @@ func (h *handler) authPage(w http.ResponseWriter, r *http.Request) {
 	authPage.Execute(w, h.makeData(w, r))
 }
 
+func (h *handler) auditPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "the audit trail is read-only", http.StatusMethodNotAllowed)
+		return
+	}
+	data := h.makeData(w, r)
+	if h.store != nil {
+		entries, err := h.store.Audit(200)
+		if err != nil {
+			data.AuditError = err.Error()
+		}
+		data.Audit = entries
+	}
+	auditPage.Execute(w, data)
+}
+
 func (h *handler) policyPage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.NotFound(w, r)
@@ -463,7 +520,7 @@ func (h *handler) setPolicy(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info("Updated policy")
 	}
 	if h.store != nil {
-		h.store.Save(h.cfg)
+		h.store.Save(h.cfg, h.actor(r))
 	}
 	http.Redirect(w, r, "/ui/policy", http.StatusSeeOther)
 }
@@ -513,7 +570,7 @@ func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 				log.String("value", config.RedactHeaderValue(name, value)))
 		}
 		if h.store != nil {
-			h.store.Save(h.cfg)
+			h.store.Save(h.cfg, h.actor(r))
 		}
 	}
 	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
@@ -539,7 +596,7 @@ func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("Deleted header", log.String("name", name))
 		}
 		if h.store != nil {
-			h.store.Save(h.cfg)
+			h.store.Save(h.cfg, h.actor(r))
 		}
 	}
 	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
@@ -565,7 +622,7 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info("Set log level", log.String("level", levelStr))
 	}
 	if h.store != nil {
-		h.store.Save(h.cfg)
+		h.store.Save(h.cfg, h.actor(r))
 	}
 	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
 }
@@ -585,7 +642,7 @@ func (h *handler) setIdentity(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info("Updated identity", log.String("name", name), log.String("id", id))
 	}
 	if h.store != nil {
-		h.store.Save(h.cfg)
+		h.store.Save(h.cfg, h.actor(r))
 	}
 	http.Redirect(w, r, "/ui/identity", http.StatusSeeOther)
 }
@@ -613,7 +670,7 @@ func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info("Updated auth settings", log.Bool("enabled", enabled), log.String("user", user))
 	}
 	if h.store != nil {
-		h.store.Save(h.cfg)
+		h.store.Save(h.cfg, h.actor(r))
 	}
 	http.Redirect(w, r, "/ui/auth", http.StatusSeeOther)
 }
@@ -629,7 +686,7 @@ func (h *handler) setStats(w http.ResponseWriter, r *http.Request) {
 	enabled := r.FormValue("enabled") == "on"
 	h.cfg.SetStatsEnabled(enabled)
 	if h.store != nil {
-		h.store.Save(h.cfg)
+		h.store.Save(h.cfg, h.actor(r))
 	}
 	http.Redirect(w, r, "/ui/analytics", http.StatusSeeOther)
 }
