@@ -64,6 +64,19 @@ proxy_id: ""
 headers:
   X-Proxy: "1"
 
+# Conditional rules: set/add/remove/replace, optionally limited by destination,
+# on requests or responses. Applied after the hop-by-hop strip and after the
+# unconditional map above; later rules win.
+#
+# Hop-by-hop headers are refused — re-adding them would undo RFC compliance and
+# leak the credentials clients use on this proxy. cidr conditions are refused
+# too: headers are set before the destination is resolved, so use domain.
+header_rules: |
+  # set X-Internal: 1 for domain internal.example.com
+  # remove X-Debug
+  # replace User-Agent: proxy
+  # response set X-Via: proxy
+
 # Credentials. Prefer password_file: a password here is readable by anything
 # that can read this file, and this file usually lives in version control.
 # auth:

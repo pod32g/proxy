@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/quota"
 	"gopkg.in/yaml.v3"
@@ -89,6 +90,10 @@ type File struct {
 	Policy  *string `yaml:"policy"`
 	Clients *string `yaml:"clients"`
 	Quotas  *string `yaml:"quotas"`
+
+	// HeaderRules are the conditional form. The headers map above is the
+	// unconditional one and keeps working; both are applied, map first.
+	HeaderRules *string `yaml:"header_rules"`
 
 	// Listeners are additional bound addresses, each with its own TLS material,
 	// mode and rule sets. The top-level http/https settings remain exactly what
@@ -174,6 +179,11 @@ func (f *File) validate() error {
 	if f.Quotas != nil {
 		if _, err := quota.Parse(*f.Quotas); err != nil {
 			return fmt.Errorf("quotas: %w", err)
+		}
+	}
+	if f.HeaderRules != nil {
+		if _, err := header.Parse(*f.HeaderRules); err != nil {
+			return fmt.Errorf("header_rules: %w", err)
 		}
 	}
 	for _, p := range f.ConnectPorts {
@@ -408,6 +418,12 @@ func (f *File) ApplyTo(cfg *Config) ([]string, error) {
 			cfg.ReplaceHeaders(f.Headers)
 			note("headers")
 		}
+	}
+	if f.HeaderRules != nil && *f.HeaderRules != cfg.HeaderRulesText() {
+		if err := cfg.SetHeaderRules(*f.HeaderRules); err != nil {
+			return changed, err
+		}
+		note("header_rules")
 	}
 	if f.Auth != nil {
 		enabled, user, pass := cfg.GetAuth()

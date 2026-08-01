@@ -6,6 +6,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 
+	"github.com/pod32g/proxy/internal/header"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -20,7 +21,8 @@ func sanitizedURL(u *url.URL) string {
 // client certificate, or both. Reverse mode is where a private PKI upstream is
 // most common, so it takes the same material forward mode does rather than
 // being the one path that cannot reach an internal service.
-func New(target *url.URL, logger *log.Logger, headers func(string) map[string]string, upstreamTLS ...*tls.Config) *httputil.ReverseProxy {
+func New(target *url.URL, logger *log.Logger, headers func(string) map[string]string,
+	rules func(clientIP string) *header.RuleSet, upstreamTLS ...*tls.Config) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	if len(upstreamTLS) > 0 && upstreamTLS[0] != nil {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -33,6 +35,21 @@ func New(target *url.URL, logger *log.Logger, headers func(string) map[string]st
 		originalDirector(req)
 		for k, v := range headers(clientIP(req.RemoteAddr)) {
 			req.Header.Set(k, v)
+		}
+		if rules != nil {
+			rules(clientIP(req.RemoteAddr)).Apply(
+				req.Header, header.Request, hostOnly(target.Host), nil)
+		}
+	}
+
+	// Response rules run on the way back. PROXY-6's strip is the transport's
+	// job here, and a rule that could re-add a hop-by-hop header is rejected
+	// when it is written rather than filtered now.
+	if rules != nil {
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			rules(clientIP(resp.Request.RemoteAddr)).Apply(
+				resp.Header, header.Response, hostOnly(target.Host), nil)
+			return nil
 		}
 	}
 

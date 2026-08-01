@@ -44,6 +44,7 @@ go build -o proxy
 - `-policy-file` – File of destination rules, one per line. Can be set with `PROXY_POLICY_FILE`.
 - `-client-rule` – Client access rule; repeatable, longest prefix wins. See below.
 - `-client-file` – File of client access rules. Can be set with `PROXY_CLIENT_FILE`.
+- `-header-rule` – Conditional header rule; repeatable. See below.
 - `-quota-rule` – Request or byte quota; repeatable. Unlimited by default. See below.
 - `-quota-file` – File of quota rules, one per line. Can be set with `PROXY_QUOTA_FILE`.
 - `-access-log` – Access log format: `structured`, `combined` or `off`. Defaults to `structured` or `PROXY_ACCESS_LOG`.
@@ -349,6 +350,65 @@ locking an operator out with their own table would be its own trap.
 
 A source address is spoofable in ways a credential is not, so this is a
 complement to `-auth` rather than a substitute for it.
+
+## Header rules
+
+`-header` sets a header unconditionally, globally or per client, and keeps
+working exactly as it did. `-header-rule` adds conditions, removal and rewriting:
+
+```sh
+./proxy -header-rule "set X-Internal: 1 for domain internal.example.com"         -header-rule "remove X-Debug"         -header-rule "replace User-Agent: proxy"         -header-rule "response set X-Via: proxy"
+```
+
+| Action | Effect |
+|---|---|
+| `set` | Replace every value, adding the header if absent |
+| `add` | Append a value, keeping any already present |
+| `remove` | Delete the header |
+| `replace` | Rewrite **only if already present**, so a rule can normalise what a client sent without inventing a header it never did |
+
+`response` before the action applies the rule to the response instead of the
+request. Conditions use the same matcher as the destination policy — one syntax
+rather than two.
+
+### Order of application
+
+Defined, not emergent:
+
+1. **Hop-by-hop stripping.** Always first, and not something a rule can precede.
+2. **Unconditional `-header` / `headers:` entries**, then per-client ones.
+3. **`-header-rule` entries, in the order written.** Later wins, so a general
+   rule followed by a specific exception behaves the way it reads.
+4. **The proxy identity headers** (`X-Proxy-Name`, `X-Proxy-Id`), last, so no
+   rule can make the proxy misreport what it is.
+
+### What rules may not touch
+
+Hop-by-hop headers are **refused when the rule is written**, not filtered at
+runtime — a rule that can never take effect should fail where it is written, not
+silently do nothing:
+
+```
+invalid header rules: line 1: rule "set Proxy-Authorization: Basic x":
+  Proxy-Authorization may not be set by a rule: hop-by-hop; forwarding it hands
+  origins the credentials clients use on this proxy
+```
+
+`Connection` is on that list for a reason worth stating: it is how a sender
+*extends* the hop-by-hop set, so a rule on it could make any header per-hop.
+Blocking only the named headers would leave that lever untouched. `Content-Length`
+and `Transfer-Encoding` are blocked too — the transport owns them, and rewriting
+either corrupts framing.
+
+Header values containing control characters are rejected, because a newline in a
+value is response splitting.
+
+**`cidr` conditions are not supported on header rules**, and are rejected rather
+than accepted and quietly never matched. Headers must be set before the request
+is made, and the destination's address is not known until the dial, which
+happens after. The destination policy can use `cidr` because it evaluates inside
+the dialer with the resolved address in hand; there is no equivalent moment for
+a header. Use a `domain` condition.
 
 ## Quotas
 

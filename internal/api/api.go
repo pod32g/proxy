@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/pod32g/proxy/internal/config"
+	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/quota"
 	"github.com/pod32g/proxy/internal/server"
@@ -129,6 +130,7 @@ type policyReq struct {
 	Destinations *string `json:"destinations"`
 	Clients      *string `json:"clients"`
 	Quotas       *string `json:"quotas"`
+	HeaderRules  *string `json:"header_rules"`
 }
 
 type policyTestReq struct {
@@ -303,6 +305,7 @@ func (h *handler) policy(w http.ResponseWriter, r *http.Request) {
 			"destinations": h.cfg.PolicyRulesText(),
 			"clients":      h.cfg.ClientRulesText(),
 			"quotas":       h.cfg.QuotaText(),
+			"header_rules": h.cfg.HeaderRulesText(),
 		})
 	case http.MethodPut, http.MethodPost:
 		var req policyReq
@@ -329,6 +332,12 @@ func (h *handler) policy(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if req.HeaderRules != nil {
+			if _, err := header.Parse(*req.HeaderRules); err != nil {
+				http.Error(w, "header_rules: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
 		if req.Destinations != nil {
 			_ = h.cfg.SetPolicyRules(*req.Destinations)
 		}
@@ -337,6 +346,9 @@ func (h *handler) policy(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Quotas != nil {
 			_ = h.cfg.SetQuotas(*req.Quotas)
+		}
+		if req.HeaderRules != nil {
+			_ = h.cfg.SetHeaderRules(*req.HeaderRules)
 		}
 		if h.logger != nil {
 			h.logger.Info("Updated policy")

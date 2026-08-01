@@ -344,6 +344,11 @@ func (s *Store) Load(cfg *Config) error {
 			s.warn("stored quota rules are invalid and were ignored: %v", err)
 		}
 	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='header_rules'`).Scan(&val); err == nil {
+		if err := cfg.SetHeaderRules(val); err != nil {
+			s.warn("stored header rules are invalid and were ignored: %v", err)
+		}
+	}
 
 	_, user, pass := cfg.GetAuth()
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='username'`).Scan(&val); err == nil {
@@ -417,6 +422,7 @@ func (s *Store) Save(cfg *Config, by Actor) error {
 		{"policy_rules", cfg.PolicyRulesText()},
 		{"client_rules", cfg.ClientRulesText()},
 		{"quota_rules", cfg.QuotaText()},
+		{"header_rules", cfg.HeaderRulesText()},
 	}
 
 	// Keep the plaintext for the audit diff before sealing replaces them.

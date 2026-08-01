@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/pod32g/proxy/internal/config"
+	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/quota"
 	"github.com/pod32g/proxy/internal/server"
@@ -75,6 +76,7 @@ type pageData struct {
 	DestinationRules string
 	ClientRules      string
 	Quotas           string
+	HeaderRules      string
 	PolicyError      string
 	TestResult       string
 
@@ -309,6 +311,13 @@ var policyPage = template.Must(template.Must(layout.Clone()).Parse(`{{define "co
 <code>default deny</code><br>A client may carry its own destination rules:
 <code>allow 10.0.0.0/8 { allow domain example.com; deny all }</code></p>
 
+<h2>Header rules</h2>
+<p>Applied after the hop-by-hop strip, in the order written; later wins.
+<code>set X-A: 1 for domain example.com</code> &middot; <code>remove X-Debug</code> &middot;
+<code>replace User-Agent: proxy</code> &middot; <code>response set X-Via: proxy</code><br>
+Hop-by-hop headers are refused: re-adding them would undo RFC compliance and
+leak the credentials clients use on this proxy.</p>
+
 <h2>Quotas</h2>
 <p>Unlimited unless set. <code>global requests 500/s burst 1000</code> &middot;
 <code>client bytes 10MB/s</code> &middot; <code>client 10.0.0.0/8 requests 200/s</code><br>
@@ -323,6 +332,7 @@ than mid-transfer.</p>
     <label>Destinations:<br><textarea name="destinations" rows="8" cols="60">{{.DestinationRules}}</textarea></label><br>
     <label>Clients:<br><textarea name="clients" rows="6" cols="60">{{.ClientRules}}</textarea></label><br>
     <label>Quotas:<br><textarea name="quotas" rows="6" cols="60">{{.Quotas}}</textarea></label><br>
+    <label>Header rules:<br><textarea name="header_rules" rows="6" cols="60">{{.HeaderRules}}</textarea></label><br>
     <button type="submit">Save</button>
 </form>
 
@@ -406,6 +416,7 @@ func (h *handler) makeData(w http.ResponseWriter, r *http.Request) pageData {
 		DestinationRules: h.cfg.PolicyRulesText(),
 		ClientRules:      h.cfg.ClientRulesText(),
 		Quotas:           h.cfg.QuotaText(),
+		HeaderRules:      h.cfg.HeaderRulesText(),
 	}
 	if h.clients != nil {
 		data.ClientCount = h.clients.Count()
@@ -492,12 +503,14 @@ func (h *handler) setPolicy(w http.ResponseWriter, r *http.Request) {
 	destinations := r.FormValue("destinations")
 	clients := r.FormValue("clients")
 	quotas := r.FormValue("quotas")
+	headerRules := r.FormValue("header_rules")
 
 	// Validate all three before applying any, and re-render with the error rather
 	// than redirecting: losing what the operator typed because line 7 was wrong
 	// is how people stop using a form.
 	data := h.makeData(w, r)
 	data.DestinationRules, data.ClientRules, data.Quotas = destinations, clients, quotas
+	data.HeaderRules = headerRules
 	if _, err := policy.Parse(destinations); err != nil {
 		data.PolicyError = "destinations: " + err.Error()
 		policyPage.Execute(w, data)
@@ -513,9 +526,15 @@ func (h *handler) setPolicy(w http.ResponseWriter, r *http.Request) {
 		policyPage.Execute(w, data)
 		return
 	}
+	if _, err := header.Parse(headerRules); err != nil {
+		data.PolicyError = "header rules: " + err.Error()
+		policyPage.Execute(w, data)
+		return
+	}
 	_ = h.cfg.SetPolicyRules(destinations)
 	_ = h.cfg.SetClientRules(clients)
 	_ = h.cfg.SetQuotas(quotas)
+	_ = h.cfg.SetHeaderRules(headerRules)
 	if h.logger != nil {
 		h.logger.Info("Updated policy")
 	}

@@ -37,7 +37,7 @@ func TestNewAddsHeader(t *testing.T) {
 	}
 
 	headers := map[string]string{"X-Test": "value"}
-	rp := New(u, newLogger(), func(string) map[string]string { return headers })
+	rp := New(u, newLogger(), func(string) map[string]string { return headers }, nil)
 	proxySrv := httptest.NewServer(rp)
 	defer proxySrv.Close()
 
@@ -54,7 +54,7 @@ func TestNewAddsHeader(t *testing.T) {
 
 func TestErrorHandlerReturnsBadGateway(t *testing.T) {
 	u, _ := url.Parse("http://127.0.0.1:1")
-	rp := New(u, newLogger(), func(string) map[string]string { return nil })
+	rp := New(u, newLogger(), func(string) map[string]string { return nil }, nil)
 	proxySrv := httptest.NewServer(rp)
 	defer proxySrv.Close()
 

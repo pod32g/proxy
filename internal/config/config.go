@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/quota"
 	log "github.com/pod32g/simple-logger"
@@ -50,6 +51,12 @@ type Config struct {
 	// Quotas: how much a client may push through, globally and per client.
 	quotaText string
 	quotaSet  *quota.Set
+
+	// Conditional header rules. The unconditional Headers map above remains
+	// the UI's editing surface and is folded into the applied set, so the two
+	// are one mechanism rather than two that have to be kept in step.
+	headerRuleText string
+	headerRules    *header.RuleSet
 
 	mu sync.RWMutex
 }
@@ -352,6 +359,59 @@ func (c *Config) ClientRulesText() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.clientText
+}
+
+// SetHeaderRules parses and installs the conditional header rules.
+func (c *Config) SetHeaderRules(text string) error {
+	set, err := header.Parse(text)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.headerRuleText = text
+	c.headerRules = set
+	return nil
+}
+
+// HeaderRulesText returns the rules as written.
+func (c *Config) HeaderRulesText() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.headerRuleText
+}
+
+// HeaderRules returns the rules in force, with the unconditional map folded in
+// ahead of them.
+//
+// Order is the contract documented on header.RuleSet.Apply: the map's entries
+// are the older, unconditional form and run first, so a conditional rule can
+// override one of them. Rebuilt per call rather than cached because the map is
+// edited live through the UI and a cache would have to be invalidated from
+// every one of those paths.
+func (c *Config) HeaderRules(client string) *header.RuleSet {
+	c.mu.RLock()
+	rules := c.headerRules
+	base := make(map[string]string, len(c.Headers)+len(c.ClientHeaders[client]))
+	for k, v := range c.Headers {
+		base[k] = v
+	}
+	for k, v := range c.ClientHeaders[client] {
+		base[k] = v
+	}
+	c.mu.RUnlock()
+
+	migrated := header.FromMap(base)
+	if rules.Empty() {
+		return migrated
+	}
+	if migrated == nil {
+		return rules
+	}
+	out := &header.RuleSet{Rules: make([]header.Rule, 0, len(migrated.Rules)+len(rules.Rules))}
+	out.Rules = append(out.Rules, migrated.Rules...)
+	out.Rules = append(out.Rules, rules.Rules...)
+	return out
 }
 
 // SetQuotas parses and installs the quota configuration.

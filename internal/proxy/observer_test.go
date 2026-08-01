@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/reqid"
 )
 
@@ -536,5 +537,113 @@ func TestConnectMarksServedOnceTheTunnelIsUp(t *testing.T) {
 			break
 		}
 		head = append(head, buf[0])
+	}
+}
+
+// Header rules end to end, through the real handler rather than the rule
+// engine alone: the engine passing says nothing about whether anything calls it.
+func TestHeaderRulesApplyEndToEnd(t *testing.T) {
+	received := make(chan http.Header, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Clone()
+		w.Header().Set("X-Backend", "original")
+		w.Header().Set("X-Strip-Me", "still here")
+	}))
+	defer backend.Close()
+
+	rules, err := header.Parse(strings.Join([]string{
+		"set X-Added: yes",
+		"remove X-Client-Sent",
+		"replace User-Agent: proxied",
+		"response set X-Backend: rewritten",
+		"response remove X-Strip-Me",
+	}, "\n"))
+	if err != nil {
+		t.Fatalf("parse rules: %v", err)
+	}
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{
+			AllowPrivate: true, ConnectPorts: allPorts(),
+			HeaderRules: func(string) *header.RuleSet { return rules },
+		})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", backend.URL+"/", nil)
+	req.Header.Set("X-Client-Sent", "please remove me")
+	req.Header.Set("User-Agent", "curl/8")
+	resp, err := proxyClient(t, srv.URL).Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	select {
+	case got := <-received:
+		if got.Get("X-Added") != "yes" {
+			t.Error("set did not reach the origin")
+		}
+		if got.Get("X-Client-Sent") != "" {
+			t.Error("remove did not reach the origin")
+		}
+		if got.Get("User-Agent") != "proxied" {
+			t.Errorf("replace: User-Agent = %q", got.Get("User-Agent"))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("origin never received the request")
+	}
+
+	if resp.Header.Get("X-Backend") != "rewritten" {
+		t.Errorf("response set: X-Backend = %q", resp.Header.Get("X-Backend"))
+	}
+	if resp.Header.Get("X-Strip-Me") != "" {
+		t.Error("response remove did not take effect")
+	}
+}
+
+// The guard has to hold through the whole path, not just at parse time: a
+// client's Proxy-Authorization must never reach an origin, and no configuration
+// may cause it to.
+func TestHeaderRulesCannotLeakProxyCredentials(t *testing.T) {
+	received := make(chan http.Header, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Clone()
+	}))
+	defer backend.Close()
+
+	// Every attempt to express this is rejected when written, so the rule set
+	// reaching the handler cannot contain one.
+	for _, attempt := range []string{
+		"set Proxy-Authorization: Basic YWRtaW46aHVudGVyMg==",
+		"set Connection: X-Secret",
+		"response set Proxy-Authenticate: Basic",
+	} {
+		if _, err := header.Parse(attempt); err == nil {
+			t.Fatalf("the parser accepted %q, so the guard can be bypassed by configuration", attempt)
+		}
+	}
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{AllowPrivate: true, ConnectPorts: allPorts(),
+			HeaderRules: func(string) *header.RuleSet { return &header.RuleSet{} }})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", backend.URL+"/", nil)
+	req.Header.Set("Proxy-Authorization", "Basic YWRtaW46aHVudGVyMg==")
+	resp, err := proxyClient(t, srv.URL).Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case got := <-received:
+		if got.Get("Proxy-Authorization") != "" {
+			t.Error("the client's proxy credentials reached the origin")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("origin never received the request")
 	}
 }

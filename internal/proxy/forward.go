@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/reqid"
 	log "github.com/pod32g/simple-logger"
@@ -39,6 +40,11 @@ type Policy struct {
 	// per client so a client-specific list can replace the global one. Nil
 	// means no opinion, leaving AllowPrivate as the only constraint.
 	Rules func(clientIP string) *policy.RuleSet
+
+	// HeaderRules are the conditional header rules for a client, resolved per
+	// request so edits take effect without a restart. Applied after the
+	// hop-by-hop strip, which they cannot precede or undo.
+	HeaderRules func(clientIP string) *header.RuleSet
 
 	// UpstreamTLS configures outbound TLS: an additional trust bundle, a client
 	// certificate, or both. Nil uses the system trust store.
@@ -273,6 +279,30 @@ func (p Policy) dialContext(d *net.Dialer) func(context.Context, string, string)
 	}
 }
 
+// applyHeaderRules runs the configured rules over a header set.
+//
+// It is called after removeHopByHop, never before. The strip is what keeps the
+// proxy RFC-compliant and stops a client's credentials reaching every origin it
+// visits; a rule that ran first could only be undone by it, and one that could
+// run after and re-add a stripped header is rejected when it is written.
+func applyHeaderRules(pol Policy, h http.Header, dir header.Direction, client, host string) {
+	if pol.HeaderRules == nil {
+		return
+	}
+	// No address: cidr conditions read as not matching, the same conservative
+	// answer the destination policy gives before DNS.
+	pol.HeaderRules(client).Apply(h, dir, hostOnly(host), nil)
+}
+
+// hostOnly strips a port from an authority so a domain condition matches what
+// an operator would write.
+func hostOnly(hostport string) string {
+	if host, _, err := net.SplitHostPort(hostport); err == nil {
+		return host
+	}
+	return hostport
+}
+
 // setRequestID puts the exchange's identifier on an outbound request, so the
 // origin's logs and ours name the same exchange. A client that supplied its own
 // usable id sees that one propagate; anything unusable was replaced upstream of
@@ -342,7 +372,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// strip below removes the handshake and a ws:// request comes back as
 		// an ordinary response — quietly, which is the worst part.
 		if proto := requestedUpgrade(r.Header); proto != "" {
-			handleUpgrade(w, r, transport, headers, logger, proto, obs)
+			handleUpgrade(w, r, transport, headers, logger, proto, obs, pol)
 			return
 		}
 		outReq := r.Clone(context.WithValue(r.Context(), clientKey{}, clientIP(r.RemoteAddr)))
@@ -357,6 +387,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// Carried to the origin so the exchange can be followed across the hop.
 		// Set after the operator's headers so a stray -header cannot displace it.
 		setRequestID(outReq)
+		applyHeaderRules(pol, outReq.Header, header.Request, clientIP(r.RemoteAddr), r.URL.Host)
 
 		// The span covers the round trip, matching the upstream histogram. The
 		// request comes back carrying the span context and whatever propagation
@@ -392,6 +423,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		markServed(w)
 		defer resp.Body.Close()
 		removeHopByHop(resp.Header)
+		applyHeaderRules(pol, resp.Header, header.Response, clientIP(r.RemoteAddr), r.URL.Host)
 		copyHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
@@ -445,7 +477,7 @@ type statusSetter interface{ SetStatus(int) }
 // destination policy and dial timeout on the transport still apply.
 func handleUpgrade(
 	w http.ResponseWriter, r *http.Request, transport *http.Transport,
-	headers func(string) map[string]string, logger *log.Logger, proto string, obs Observer,
+	headers func(string) map[string]string, logger *log.Logger, proto string, obs Observer, pol Policy,
 ) {
 	logger.Debugf("Upgrade request %s to %s", sanitizedURL(r.URL), proto)
 
@@ -461,6 +493,7 @@ func handleUpgrade(
 		outReq.Header.Set(k, v)
 	}
 	setRequestID(outReq)
+	applyHeaderRules(pol, outReq.Header, header.Request, clientIP(r.RemoteAddr), r.URL.Host)
 
 	upstreamStart := time.Now()
 	resp, err := transport.RoundTrip(outReq)

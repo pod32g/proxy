@@ -157,6 +157,9 @@ func main() {
 		"client access rule (e.g. \"allow 10.0.0.0/8\", \"deny 10.1.2.3\", \"default deny\"); repeatable, longest prefix wins")
 	clientFile := flag.String("client-file", env.get("PROXY_CLIENT_FILE", ""),
 		"file of client access rules, one per line")
+	var headerRules policyFlags
+	flag.Var(&headerRules, "header-rule",
+		"conditional header rule (e.g. \"set X-A: 1 for domain example.com\", \"remove X-Debug\", \"response set X-Via: proxy\"); repeatable")
 	var quotaRules policyFlags
 	flag.Var(&quotaRules, "quota-rule",
 		"quota rule (e.g. \"global requests 500/s burst 1000\", \"client bytes 10MB/s\", \"client 10.0.0.0/8 requests 200/s\"); repeatable, unlimited by default")
@@ -345,6 +348,12 @@ func main() {
 		}
 		setFlagsExtra["quota-rule"] = true
 	}
+	if len(headerRules) > 0 {
+		if err := cfg.SetHeaderRules(strings.Join(headerRules, "\n")); err != nil {
+			fatalf("invalid header rules: %v", err)
+		}
+		setFlagsExtra["header-rule"] = true
+	}
 
 	cfg.Headers = headers
 	cfg.LogLevel = logLevel
@@ -526,6 +535,9 @@ func main() {
 			ConnectPorts: ports,
 			Rules:        scope.DestinationRulesFor,
 			UpstreamTLS:  upstreamTLS,
+			// Read per request so rules edited through the UI, the API or a
+			// reload take effect without a restart.
+			HeaderRules: cfg.HeaderRules,
 		}
 
 		var handler http.Handler
@@ -548,7 +560,7 @@ func main() {
 				return nil, nil, fmt.Errorf("listener %q: invalid target %q: %v", name, targetURL, err)
 			}
 			reverseTarget = u
-			handler = proxy.New(u, logger, cfg.GetHeadersForClient, upstreamTLS)
+			handler = proxy.New(u, logger, cfg.GetHeadersForClient, cfg.HeaderRules, upstreamTLS)
 		}
 		inner := handler
 		// Accounting wraps outermost so it sees the connection before anything else
