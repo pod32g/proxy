@@ -143,6 +143,10 @@ func main() {
 		"comma-separated ports CONNECT may tunnel to")
 	healthPath := flag.String("health-path", env.get("PROXY_HEALTH_PATH", server.DefaultHealthPath),
 		"path answered without authentication for liveness probes; empty disables it (in reverse mode it shadows the backend)")
+	adminAddr := flag.String("admin-http", env.get("PROXY_ADMIN_ADDR", ""),
+		"serve the UI, API and metrics on their own listener; when set they are not served on the proxy port")
+	adminCert := flag.String("admin-cert", env.get("PROXY_ADMIN_CERT_FILE", ""), "TLS certificate for the admin listener")
+	adminKey := flag.String("admin-key", env.get("PROXY_ADMIN_KEY_FILE", ""), "TLS key for the admin listener")
 	metricsPublic := flag.Bool("metrics-public", env.get("PROXY_METRICS_PUBLIC", "") == "true",
 		"serve /metrics without authentication so scrapers that send no credentials keep working")
 	authPassFile := flag.String("auth-pass-file", env.get("PROXY_AUTH_PASS_FILE", ""),
@@ -295,20 +299,38 @@ func main() {
 	handler = server.MetricsMiddleware(handler, metrics)
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)
 	apiHandler := api.New(cfg, store, logger, stats)
-	mux := &server.Router{
-		Proxy:   handler,
-		UI:      uiHandler,
-		API:     apiHandler,
-		Metrics: promhttp.Handler(),
-		// Consulted per request, so credentials changed through the UI or API
-		// take effect without a restart.
-		Auth:   cfg.GetAuth,
-		Logger: logger,
-		// Configurable because in reverse mode this shadows a backend that
-		// serves the same path.
-		HealthPath:    *healthPath,
-		MetricsPublic: *metricsPublic,
-		AuthFailures:  metrics.AuthFailures,
+	// One Router serves whatever it is given: with no Proxy it 404s unmatched
+	// paths, and with no UI/API/Metrics it proxies everything. Splitting the
+	// admin surface onto its own listener is therefore two values rather than a
+	// mode flag threaded through the dispatch.
+	newRouter := func(proxy, ui, api, metricsH http.Handler) *server.Router {
+		return &server.Router{
+			Proxy:   proxy,
+			UI:      ui,
+			API:     api,
+			Metrics: metricsH,
+			// Consulted per request, so credentials changed through the UI or
+			// API take effect without a restart.
+			Auth:   cfg.GetAuth,
+			Logger: logger,
+			// Configurable because in reverse mode this shadows a backend that
+			// serves the same path.
+			HealthPath:    *healthPath,
+			MetricsPublic: *metricsPublic,
+			AuthFailures:  metrics.AuthFailures,
+		}
+	}
+
+	var mux, adminMux *server.Router
+	if *adminAddr != "" {
+		// The proxy port proxies everything, including paths that would
+		// otherwise collide with the admin surface.
+		mux = newRouter(handler, nil, nil, nil)
+		adminMux = newRouter(nil, uiHandler, apiHandler, promhttp.Handler())
+		logger.Info("Admin surface bound to its own listener",
+			log.String("addr", *adminAddr))
+	} else {
+		mux = newRouter(handler, uiHandler, apiHandler, promhttp.Handler())
 	}
 
 	srv := server.Server{
@@ -319,6 +341,12 @@ func main() {
 		Handler:   mux,
 		Logger:    logger,
 		Clients:   tracker,
+	}
+	if adminMux != nil {
+		srv.AdminAddr = *adminAddr
+		srv.AdminHandler = adminMux
+		srv.AdminCertFile = *adminCert
+		srv.AdminKeyFile = *adminKey
 	}
 
 	if err := srv.Start(); err != nil {

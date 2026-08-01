@@ -42,6 +42,8 @@ go build -o proxy
 - `-connect-ports` – Comma-separated ports `CONNECT` may tunnel to. Defaults to `443` or `PROXY_CONNECT_PORTS`.
 - `-health-path` – Unauthenticated liveness path. Defaults to `/healthz` or `PROXY_HEALTH_PATH`; empty disables it.
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
+- `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
+- `-admin-cert` / `-admin-key` – TLS material for the admin listener. `PROXY_ADMIN_CERT_FILE`, `PROXY_ADMIN_KEY_FILE`.
 - `-healthcheck` – Probe the local health endpoint and exit 0 or 1, instead of starting the proxy. Used by the container `HEALTHCHECK`.
 
 `-mode`, `-log-level` and `-log-format` are validated at startup: an unrecognised
@@ -71,6 +73,13 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
   `/ui/`, `/api/` and `/metrics` are served for origin-form requests only. A
   client asking the proxy to fetch `http://example.com/api/headers` gets
   `example.com`, not the proxy's own configuration.
+- **Better still, give it its own listener.** `-admin-http 127.0.0.1:9000`
+  serves the UI, API and metrics there and nowhere else, so the admin interface
+  can be bound to a management interface or localhost and firewalled separately
+  from the port clients proxy through. It takes its own TLS material, so the
+  admin surface can require HTTPS even when the proxy port does not — and with
+  it enabled, `/metrics` is off the proxy port entirely, which removes the
+  trade-off `-metrics-public` exists to work around.
 - **Authentication is enforced per request.** Credentials changed through the UI
   or API take effect immediately, with no restart. If authentication is enabled
   without a usable username *and* password, the proxy fails closed and refuses
