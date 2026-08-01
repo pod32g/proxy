@@ -1,0 +1,13 @@
+# Without this, Grafana starts with no datasource and every panel in the
+# dashboard reads "No data" — which looks like a broken proxy rather than an
+# unconfigured Grafana.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Matches the service name in docker-compose.yml.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

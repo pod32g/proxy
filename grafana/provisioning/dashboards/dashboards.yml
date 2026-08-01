@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: proxy
+    type: file
+    # Let the file on disk win, so editing the committed JSON and restarting
+    # gives you the change rather than a stale copy from Grafana's database.
+    disableDeletion: false
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

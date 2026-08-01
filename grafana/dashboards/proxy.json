@@ -1,0 +1,200 @@
+{
+  "title": "Proxy",
+  "uid": "proxy-overview",
+  "tags": ["proxy"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Traffic",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests per second by status",
+      "description": "proxy_http_requests_total, by response code class.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (code) (rate(proxy_http_requests_total[$__rate_interval]))",
+          "legendFormat": "{{code}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes per second by direction",
+      "description": "proxy_relayed_bytes_total. \"in\" is from the client, \"out\" is to it. Includes CONNECT tunnels and upgraded connections, which no request counter can see.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "Bps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (direction) (rate(proxy_relayed_bytes_total[$__rate_interval]))",
+          "legendFormat": "{{direction}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Latency",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Total vs upstream latency (p95)",
+      "description": "The gap between these two lines is the proxy's own contribution. If total rises and upstream does not, the problem is here; if they rise together, it is the origin.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 0 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(proxy_http_request_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "total p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(proxy_upstream_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "upstream p95",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connections",
+      "description": "proxy_active_clients and proxy_active_tunnels. Tunnels are long-lived, so a request rate says nothing about how many are open right now.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "proxy_active_clients", "legendFormat": "clients", "refId": "A" },
+        { "expr": "proxy_active_tunnels", "legendFormat": "CONNECT tunnels", "refId": "B" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Refusals",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Policy refusals by scope",
+      "description": "proxy_policy_decisions_total. \"private-address\" rising is usually SSRF probing; \"connect-port\" is usually someone trying to relay non-HTTPS traffic.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 19 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (scope) (rate(proxy_policy_decisions_total[$__rate_interval]))",
+          "legendFormat": "{{scope}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Quota refusals by scope",
+      "description": "proxy_quota_rejected_total. A \"client-\" scope is one noisy client; a \"global-\" scope means the proxy is at its own ceiling and every client is affected.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 19 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (scope) (rate(proxy_quota_rejected_total[$__rate_interval]))",
+          "legendFormat": "{{scope}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Authentication failures",
+      "description": "proxy_auth_failures_total. Ten failures from one address in a minute earn a 429 for the rest of it.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 19 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(proxy_auth_failures_total[$__rate_interval])",
+          "legendFormat": "failures",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Destinations (requires -destination-metrics)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 }
+    },
+    {
+      "type": "barchart",
+      "title": "Busiest destinations",
+      "description": "proxy_destination_requests, off unless -destination-metrics is set. Sampled from a bounded top-N table at scrape time, so not every host appears and a host that drops out of the table restarts from zero. Use it to see what the proxy is busiest with, not to bill anyone.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "topk(10, proxy_destination_requests)",
+          "legendFormat": "{{host}}",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Quota bucket table",
+      "description": "proxy_quota_tracked_clients. Bounded at 20,000; sustained pressure against that ceiling means buckets are being evicted and per-client quotas are being reset.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 28 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "proxy_quota_tracked_clients", "legendFormat": "tracked clients", "refId": "A" }
+      ]
+    }
+  ]
+}

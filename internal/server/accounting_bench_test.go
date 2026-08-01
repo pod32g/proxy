@@ -66,7 +66,7 @@ func BenchmarkAccountingDisabled(b *testing.B) {
 
 func BenchmarkAccountingChargeOnly(b *testing.B) {
 	runBench(b, AccountingMiddleware(benchHandler(benchBody), Accounting{
-		Charge: func(string, int64) {},
+		Charge: func(string, int64, int64) {},
 	}))
 }
 
@@ -76,7 +76,7 @@ func BenchmarkAccessLogStructuredText(b *testing.B) {
 		b.Fatal(err)
 	}
 	runBench(b, AccountingMiddleware(benchHandler(benchBody), Accounting{
-		Charge:    func(string, int64) {},
+		Charge:    func(string, int64, int64) {},
 		Completed: NewAccessLog("structured", logger, nil),
 	}))
 }
@@ -87,14 +87,14 @@ func BenchmarkAccessLogStructuredJSON(b *testing.B) {
 		b.Fatal(err)
 	}
 	runBench(b, AccountingMiddleware(benchHandler(benchBody), Accounting{
-		Charge:    func(string, int64) {},
+		Charge:    func(string, int64, int64) {},
 		Completed: NewAccessLog("structured", logger, nil),
 	}))
 }
 
 func BenchmarkAccessLogCombined(b *testing.B) {
 	runBench(b, AccountingMiddleware(benchHandler(benchBody), Accounting{
-		Charge:    func(string, int64) {},
+		Charge:    func(string, int64, int64) {},
 		Completed: NewAccessLog("combined", nil, io.Discard),
 	}))
 }

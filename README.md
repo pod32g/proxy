@@ -48,6 +48,8 @@ go build -o proxy
 - `-quota-file` – File of quota rules, one per line. Can be set with `PROXY_QUOTA_FILE`.
 - `-access-log` – Access log format: `structured`, `combined` or `off`. Defaults to `structured` or `PROXY_ACCESS_LOG`.
 - `-access-log-file` – Write access records to this file instead of stdout. Can be set with `PROXY_ACCESS_LOG_FILE`.
+- `-destination-metrics` – Export per-destination request counts. **Off by default**; see Metrics. `PROXY_DESTINATION_METRICS`.
+- `-destination-metrics-top` – How many destinations to report. This is the series count. Defaults to 20.
 - `-health-path` – Unauthenticated liveness path. Defaults to `/healthz` or `PROXY_HEALTH_PATH`; empty disables it.
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
@@ -386,7 +388,57 @@ docker compose up
 
 Prometheus is configured via `prometheus.yml` to scrape the proxy service. Once
 running, Grafana is available on <http://localhost:3000> and Prometheus on
-<http://localhost:9090>.
+<http://localhost:9090>. Grafana is provisioned from `grafana/` with the
+Prometheus datasource and a **Proxy** dashboard already loaded, so `docker
+compose up` gives you populated panels rather than an empty Grafana.
+
+### What is exported
+
+| Metric | Type | Notes |
+|---|---|---|
+| `proxy_http_requests_total{method,code}` | counter | Total requests |
+| `proxy_http_request_duration_seconds{method}` | histogram | The whole exchange, as the client experienced it |
+| `proxy_upstream_duration_seconds{method}` | histogram | The origin's contribution alone |
+| `proxy_active_clients` | gauge | Live client connections |
+| `proxy_active_tunnels` | gauge | Established `CONNECT` tunnels |
+| `proxy_relayed_bytes_total{direction}` | counter | `in` from the client, `out` to it; includes tunnels |
+| `proxy_policy_decisions_total{scope}` | counter | Refusals by `destination`, `connect-port` or `private-address` |
+| `proxy_quota_rejected_total{scope}` | counter | Quota refusals by which allowance ran out |
+| `proxy_quota_tracked_clients` | gauge | Size of the quota bucket table |
+| `proxy_auth_failures_total` | counter | Rejected credentials |
+| `proxy_destination_requests{host}` | gauge | Off by default; see below |
+
+The pair worth understanding is the two histograms. `proxy_http_request_duration_seconds`
+measures the whole exchange, so a slow origin and a slow proxy look identical in
+it. `proxy_upstream_duration_seconds` times the round trip alone, and the gap
+between the two is the proxy's own contribution.
+
+### Per-destination metrics
+
+`-destination-metrics` exports `proxy_destination_requests{host}`. It is off by
+default, and the reason is cardinality.
+
+A forward proxy takes destinations from untrusted clients, so a counter labelled
+by host in the request path has an attacker-controlled series count, and every
+series ever created stays in memory for the life of the process. Capping the
+number of distinct labels does not fix it either: the cap bounds *concurrent*
+values while the churn still creates unbounded series over time.
+
+So nothing is labelled per request. A collector reads the top-N from the same
+bounded table the stats page uses, **at scrape time**. That gives at most N
+series regardless of traffic — bounded by construction, not by a limit somebody
+has to enforce — and costs nothing on the request path. `-destination-metrics-top`
+sets N (default 20); it *is* the series count, so keep it small.
+
+The trade-off is worth stating plainly: these are the top of a pruned table, not
+an exact accounting. A host that never makes the top N is invisible, and a host
+that falls out of the table restarts from zero — which is why it is a gauge and
+not a counter. Use it to see what the proxy is busiest with, not to bill anyone.
+It needs `-stats` on to populate the table.
+
+Even bounded, hostnames are information some sites do not want in a metrics
+store, where retention and access controls are not the ones they chose for their
+access logs. Hence the flag.
 
 ## Kubernetes Deployment
 

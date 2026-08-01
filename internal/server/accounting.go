@@ -29,10 +29,12 @@ type Exchange struct {
 
 // Accounting is what the middleware does with what it observes.
 type Accounting struct {
-	// Charge is called as bytes move, possibly many times per exchange. Quotas
-	// need this: a tunnel that runs for an hour must not escape its allowance
-	// until it closes.
-	Charge func(client string, n int64)
+	// Charge is called as bytes move, possibly many times per exchange, with
+	// the bytes read from and written to the client since the last call. Quotas
+	// need the incremental form: a tunnel that runs for an hour must not escape
+	// its allowance until it closes. Metrics want the direction split, and
+	// reporting once for both keeps a single pass over the connection.
+	Charge func(client string, in, out int64)
 	// Completed is called once, when the exchange is over. For a hijacked
 	// connection that is on close.
 	Completed func(Exchange)
@@ -128,13 +130,15 @@ func sanitizeHost(host string) string {
 type accountedWriter struct {
 	http.ResponseWriter
 	client string
-	charge func(string, int64)
+	charge func(client string, in, out int64)
 
-	in       atomic.Int64
-	out      atomic.Int64
-	pending  atomic.Int64
-	status   atomic.Int32
-	hijacked atomic.Bool
+	in  atomic.Int64
+	out atomic.Int64
+	// pending* are the bytes counted but not yet reported through Charge.
+	pendingIn  atomic.Int64
+	pendingOut atomic.Int64
+	status     atomic.Int32
+	hijacked   atomic.Bool
 
 	start     time.Time
 	exchange  Exchange
@@ -148,7 +152,7 @@ func (m *accountedWriter) Write(b []byte) (int, error) {
 	}
 	n, err := m.ResponseWriter.Write(b)
 	m.out.Add(int64(n))
-	m.charged(int64(n))
+	m.chargedOut(int64(n))
 	return n, err
 }
 
@@ -179,26 +183,37 @@ func (m *accountedWriter) Push(target string, opts *http.PushOptions) error {
 	return http.ErrNotSupported
 }
 
-// charged batches the quota charge. Charging on every write would put a mutex
-// acquisition on every packet; waiting for the exchange to end would let a
+// chargedIn and chargedOut batch the report. Reporting every write would put a
+// mutex acquisition on every packet; waiting for the exchange to end would let a
 // long-running transfer escape the quota it feeds.
-func (m *accountedWriter) charged(n int64) {
+func (m *accountedWriter) chargedIn(n int64) {
 	if n <= 0 || m.charge == nil {
 		return
 	}
-	if total := m.pending.Add(n); total >= chargeChunk {
-		if m.pending.CompareAndSwap(total, 0) {
-			m.charge(m.client, total)
-		}
+	if total := m.pendingIn.Add(n); total >= chargeChunk {
+		m.flushCharge()
 	}
 }
 
+func (m *accountedWriter) chargedOut(n int64) {
+	if n <= 0 || m.charge == nil {
+		return
+	}
+	if total := m.pendingOut.Add(n); total >= chargeChunk {
+		m.flushCharge()
+	}
+}
+
+// flushCharge reports and clears both directions together, so a tunnel that is
+// busy in one direction still settles the other.
 func (m *accountedWriter) flushCharge() {
 	if m.charge == nil {
 		return
 	}
-	if n := m.pending.Swap(0); n > 0 {
-		m.charge(m.client, n)
+	in := m.pendingIn.Swap(0)
+	out := m.pendingOut.Swap(0)
+	if in > 0 || out > 0 {
+		m.charge(m.client, in, out)
 	}
 }
 
@@ -259,7 +274,7 @@ func (c *accountedConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	if n > 0 {
 		c.w.in.Add(int64(n))
-		c.w.charged(int64(n))
+		c.w.chargedIn(int64(n))
 	}
 	return n, err
 }
@@ -268,7 +283,7 @@ func (c *accountedConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
 	if n > 0 {
 		c.w.out.Add(int64(n))
-		c.w.charged(int64(n))
+		c.w.chargedOut(int64(n))
 	}
 	return n, err
 }
@@ -291,7 +306,7 @@ func (b *accountedBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
 		b.w.in.Add(int64(n))
-		b.w.charged(int64(n))
+		b.w.chargedIn(int64(n))
 	}
 	return n, err
 }

@@ -23,12 +23,34 @@ type Metrics struct {
 	// exactly the thing it could not answer.
 	QuotaRejected *prometheus.CounterVec
 	// RelayedBytes is what the byte quota is charged against, exported so
-	// exhaustion is visible before anyone hits it.
-	RelayedBytes prometheus.Counter
+	// exhaustion is visible before anyone hits it. Labelled by direction:
+	// "in" is from the client, "out" is to it.
+	RelayedBytes *prometheus.CounterVec
 	// QuotaClients is the size of the per-client bucket table, which is bounded
 	// and therefore worth watching for eviction pressure.
 	QuotaClients prometheus.Gauge
+
+	// UpstreamDuration is how long the origin took, as distinct from how long
+	// the client waited. The existing duration histogram measures the whole
+	// exchange, so a slow origin and a slow proxy look identical in it — which
+	// is the question anyone actually has when latency rises.
+	UpstreamDuration *prometheus.HistogramVec
+	// ActiveTunnels counts established CONNECT tunnels. They are long-lived and
+	// invisible to a request counter, which sees each one exactly once.
+	ActiveTunnels prometheus.Gauge
+	// PolicyDecisions counts refusals by what refused them, so a spike is
+	// attributable without reading logs. Both labels are closed sets.
+	PolicyDecisions *prometheus.CounterVec
 }
+
+// PolicyScopes are the values PolicyDecisions takes for its "scope" label. A
+// closed set, listed here so the cardinality is a property of the code rather
+// than of what happens to get passed in.
+const (
+	ScopeDestination = "destination"
+	ScopeConnectPort = "connect-port"
+	ScopePrivateAddr = "private-address"
+)
 
 // NewMetrics builds the collectors and registers them with reg. Taking a
 // registerer rather than reaching for the global default means a second
@@ -70,17 +92,39 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 			},
 			[]string{"scope"},
 		),
-		RelayedBytes: prometheus.NewCounter(
+		RelayedBytes: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "proxy_relayed_bytes_total",
-				Help: "Total bytes relayed on behalf of clients, in both directions",
+				Help: "Total bytes relayed on behalf of clients, by direction",
 			},
+			[]string{"direction"},
 		),
 		QuotaClients: prometheus.NewGauge(
 			prometheus.GaugeOpts{
 				Name: "proxy_quota_tracked_clients",
 				Help: "Number of clients with live quota buckets",
 			},
+		),
+		UpstreamDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "proxy_upstream_duration_seconds",
+				Help:    "Time the upstream took to respond, excluding proxy-side work",
+				Buckets: prometheus.DefBuckets,
+			},
+			[]string{"method"},
+		),
+		ActiveTunnels: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "proxy_active_tunnels",
+				Help: "Number of established CONNECT tunnels",
+			},
+		),
+		PolicyDecisions: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "proxy_policy_decisions_total",
+				Help: "Requests refused by destination policy, by what refused them",
+			},
+			[]string{"scope"},
 		),
 	}
 	if reg == nil {
@@ -89,6 +133,7 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 	for _, c := range []prometheus.Collector{
 		m.Requests, m.Duration, m.Clients, m.AuthFailures,
 		m.QuotaRejected, m.RelayedBytes, m.QuotaClients,
+		m.UpstreamDuration, m.ActiveTunnels, m.PolicyDecisions,
 	} {
 		if err := reg.Register(c); err != nil {
 			return nil, err

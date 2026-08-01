@@ -168,24 +168,16 @@ func TestChargeIgnoresNonPositive(t *testing.T) {
 	}
 }
 
-func TestHooksReportRejectionsAndBytes(t *testing.T) {
+func TestRejectionsAreReported(t *testing.T) {
 	l, _ := newTestLimiter(t, "client requests 1/s burst 1")
 	var scopes []Scope
-	var metered int64
 	l.Rejected = func(s Scope) { scopes = append(scopes, s) }
-	l.Metered = func(n int64) { metered += n }
 
 	l.Allow("10.1.2.3")
 	l.Allow("10.1.2.3")
-	l.Charge("10.1.2.3", 4096)
 
 	if len(scopes) != 1 || scopes[0] != ScopeClientRequests {
 		t.Errorf("scopes = %v, want one client-requests rejection", scopes)
-	}
-	// Metered counts traffic whether or not a byte quota is configured; it is
-	// the number an operator watches to decide whether one is needed.
-	if metered != 4096 {
-		t.Errorf("metered = %d, want 4096", metered)
 	}
 }
 

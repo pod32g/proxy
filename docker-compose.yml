@@ -17,6 +17,10 @@ services:
       # published to an untrusted network in this compose file.
       PROXY_METRICS_PUBLIC: "true"
       PROXY_DB_PATH: /var/lib/proxy/config.db
+      # The destination panel needs both: -stats fills the top-N table, and
+      # this exports it. Off outside this stack, because hostnames are
+      # client-controlled and belong in a metrics store only deliberately.
+      PROXY_DESTINATION_METRICS: "true"
     volumes:
       - proxydata:/var/lib/proxy
 
@@ -33,6 +37,17 @@ services:
     image: grafana/grafana
     ports:
       - "3000:3000"
+    environment:
+      # This stack is a local demonstration, not a deployment. Without this you
+      # land on a login page with no credentials provisioned, which is a poor
+      # first five minutes for something whose point is "look at the dashboard".
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      # Grafana used to start here with no datasource and no dashboards, so
+      # every panel a reader might have expected simply did not exist.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
 

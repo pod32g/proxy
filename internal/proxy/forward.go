@@ -58,8 +58,12 @@ type clientKey struct{}
 type hostKey struct{}
 
 // errDenied marks a policy refusal so the handlers can answer 403 rather than
-// reporting it as an upstream fault.
-type errDenied struct{ reason string }
+// reporting it as an upstream fault. scope says which check refused, so a
+// refusal can be attributed without parsing the message.
+type errDenied struct {
+	reason string
+	scope  string
+}
 
 func (e *errDenied) Error() string { return e.reason }
 
@@ -67,6 +71,63 @@ func denied(err error) bool {
 	var d *errDenied
 	return errors.As(err, &d)
 }
+
+// deniedScope reports which check refused, or "" when the error is not a
+// refusal.
+func deniedScope(err error) string {
+	var d *errDenied
+	if errors.As(err, &d) {
+		return d.scope
+	}
+	return ""
+}
+
+// Observer receives the facts only the handler is positioned to measure. Every
+// field is optional; the zero value observes nothing.
+type Observer struct {
+	// Upstream is how long the origin took to respond. The middleware-level
+	// histogram measures the whole exchange, so it cannot tell a slow origin
+	// from a slow proxy — which is the question anyone actually has.
+	Upstream func(method string, d time.Duration)
+	// TunnelOpened and TunnelClosed bracket an established CONNECT tunnel.
+	// Tunnels are long-lived and a request counter sees each one exactly once.
+	TunnelOpened func()
+	TunnelClosed func()
+	// Denied records a refusal and which check made it.
+	Denied func(scope string)
+}
+
+func (o Observer) upstream(method string, d time.Duration) {
+	if o.Upstream != nil {
+		o.Upstream(method, d)
+	}
+}
+
+func (o Observer) denied(scope string) {
+	if o.Denied != nil && scope != "" {
+		o.Denied(scope)
+	}
+}
+
+func (o Observer) tunnelOpened() {
+	if o.TunnelOpened != nil {
+		o.TunnelOpened()
+	}
+}
+
+func (o Observer) tunnelClosed() {
+	if o.TunnelClosed != nil {
+		o.TunnelClosed()
+	}
+}
+
+// Refusal scopes. A closed set, so anything counting them has bounded
+// cardinality by construction rather than by whatever gets passed in.
+const (
+	scopeDestination = "destination"
+	scopeConnectPort = "connect-port"
+	scopePrivateAddr = "private-address"
+)
 
 // DefaultConnectPorts is the allowlist used when none is configured.
 var DefaultConnectPorts = []int{443}
@@ -139,14 +200,20 @@ func (p Policy) dialer() *net.Dialer {
 			client, _ := ctx.Value(clientKey{}).(string)
 			if decision, rule := p.ruleSet(client).Match(requested, ip); decision != policy.Undecided {
 				if decision == policy.Deny {
-					return &errDenied{fmt.Sprintf("destination %s is not permitted by policy (%s)", requested, rule)}
+					return &errDenied{
+						reason: fmt.Sprintf("destination %s is not permitted by policy (%s)", requested, rule),
+						scope:  scopeDestination,
+					}
 				}
 				// An explicit allow overrides the private-address default:
 				// naming an internal range in the rules is a deliberate act.
 				return nil
 			}
 			if p.blockedIP(ip) {
-				return &errDenied{fmt.Sprintf("destination %s is not permitted (use -allow-private to allow it)", ip)}
+				return &errDenied{
+					reason: fmt.Sprintf("destination %s is not permitted (use -allow-private to allow it)", ip),
+					scope:  scopePrivateAddr,
+				}
 			}
 			return nil
 		},
@@ -163,7 +230,10 @@ func (p Policy) dialContext(d *net.Dialer) func(context.Context, string, string)
 		}
 		client, _ := ctx.Value(clientKey{}).(string)
 		if decision, rule := p.ruleSet(client).Match(host, nil); decision == policy.Deny {
-			return nil, &errDenied{fmt.Sprintf("destination %s is not permitted by policy (%s)", host, rule)}
+			return nil, &errDenied{
+				reason: fmt.Sprintf("destination %s is not permitted by policy (%s)", host, rule),
+				scope:  scopeDestination,
+			}
 		}
 		return d.DialContext(context.WithValue(ctx, hostKey{}, host), network, addr)
 	}
@@ -189,7 +259,14 @@ func clientIP(remoteAddr string) string {
 // NewForward creates a forward proxy handler. It supports HTTPS via CONNECT
 // without requiring TLS certificates. The headers function returns the headers
 // that should be added to outbound requests and receives the client address.
-func NewForward(logger *log.Logger, headers func(string) map[string]string, pol Policy) http.Handler {
+// The observer is optional and variadic rather than a fourth parameter: it is
+// pure instrumentation, and every call site that does not measure anything would
+// otherwise have to name a zero value.
+func NewForward(logger *log.Logger, headers func(string) map[string]string, pol Policy, observer ...Observer) http.Handler {
+	var obs Observer
+	if len(observer) > 0 {
+		obs = observer[0]
+	}
 	dialer := pol.dialer()
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
@@ -200,10 +277,11 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			logger.Debugf("CONNECT request %s", r.Host)
 			if err := pol.connectAllowed(r.Host); err != nil {
 				logger.Warnf("Refused CONNECT: %v", err)
+				obs.denied(scopeConnectPort)
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
-			handleConnect(w, withClient(r), logger, pol, dialer)
+			handleConnect(w, withClient(r), logger, pol, dialer, obs)
 			return
 		}
 		logger.Debugf("Forward proxy request %s %s", r.Method, sanitizedURL(r.URL))
@@ -217,7 +295,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// strip below removes the handshake and a ws:// request comes back as
 		// an ordinary response — quietly, which is the worst part.
 		if proto := requestedUpgrade(r.Header); proto != "" {
-			handleUpgrade(w, r, transport, headers, logger, proto)
+			handleUpgrade(w, r, transport, headers, logger, proto, obs)
 			return
 		}
 		outReq := r.Clone(context.WithValue(r.Context(), clientKey{}, clientIP(r.RemoteAddr)))
@@ -229,7 +307,11 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		for k, v := range headers(clientIP(r.RemoteAddr)) {
 			outReq.Header.Set(k, v)
 		}
+		// Timed around the round trip alone, which is the origin's contribution
+		// and nothing else. The middleware histogram already covers the total.
+		upstreamStart := time.Now()
 		resp, err := transport.RoundTrip(outReq)
+		obs.upstream(r.Method, time.Since(upstreamStart))
 		if err != nil {
 			// A policy rejection is the client asking for somewhere it is not
 			// allowed to go. That is a refusal, not an upstream fault, and
@@ -238,6 +320,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			if denied(err) {
 				logger.Warn("Refused destination",
 					log.String("host", r.URL.Host), log.String("client", clientIP(r.RemoteAddr)))
+				obs.denied(deniedScope(err))
 				http.Error(w, "Destination not permitted", http.StatusForbidden)
 				return
 			}
@@ -288,7 +371,7 @@ type statusSetter interface{ SetStatus(int) }
 // destination policy and dial timeout on the transport still apply.
 func handleUpgrade(
 	w http.ResponseWriter, r *http.Request, transport *http.Transport,
-	headers func(string) map[string]string, logger *log.Logger, proto string,
+	headers func(string) map[string]string, logger *log.Logger, proto string, obs Observer,
 ) {
 	logger.Debugf("Upgrade request %s to %s", sanitizedURL(r.URL), proto)
 
@@ -304,10 +387,13 @@ func handleUpgrade(
 		outReq.Header.Set(k, v)
 	}
 
+	upstreamStart := time.Now()
 	resp, err := transport.RoundTrip(outReq)
+	obs.upstream(r.Method, time.Since(upstreamStart))
 	if err != nil {
 		if denied(err) {
 			logger.Warn("Refused upgrade destination", log.String("host", r.URL.Host))
+			obs.denied(deniedScope(err))
 			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return
 		}
@@ -375,11 +461,14 @@ func handleUpgrade(
 	}
 	logger.Debugf("Upgraded to %s via %s", proto, r.URL.Host)
 
-	go transfer(upstream, clientConn)
-	go transfer(clientConn, upstream)
+	// An upgraded connection is a tunnel by every measure that matters here:
+	// long-lived, carrying traffic a request counter cannot see, and gone from
+	// the gauge only when it closes.
+	obs.tunnelOpened()
+	go transferPair(upstream, clientConn, obs.tunnelClosed)
 }
 
-func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, pol Policy, dialer *net.Dialer) {
+func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, pol Policy, dialer *net.Dialer, obs Observer) {
 	logger.Debugf("CONNECT tunnel %s", r.Host)
 	// The same policy-aware dial the plain-HTTP path uses, so a tunnel cannot
 	// reach anywhere an ordinary request could not.
@@ -388,6 +477,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 		if denied(err) {
 			logger.Warn("Refused CONNECT destination",
 				log.String("host", r.Host), log.String("client", clientIP(r.RemoteAddr)))
+			obs.denied(deniedScope(err))
 			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return
 		}
@@ -419,14 +509,25 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 		clientConn.Close()
 		return
 	}
-	go transfer(destConn, clientConn)
-	go transfer(clientConn, destConn)
+	obs.tunnelOpened()
+	go transferPair(destConn, clientConn, obs.tunnelClosed)
 }
 
 func transfer(dst io.WriteCloser, src io.ReadCloser) {
 	io.Copy(dst, src)
 	dst.Close()
 	src.Close()
+}
+
+// transferPair splices two connections and runs done once, when the tunnel is
+// finished. Both directions are pumped; whichever ends first closes both, so
+// waiting for a single one is enough and a sync.Once is not needed.
+func transferPair(a, b io.ReadWriteCloser, done func()) {
+	go transfer(a, b)
+	transfer(b, a)
+	if done != nil {
+		done()
+	}
 }
 
 // hopByHopHeaders are meaningful only between one sender and the immediate

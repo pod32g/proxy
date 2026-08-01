@@ -165,6 +165,10 @@ func main() {
 		"serve the UI, API and metrics on their own listener; when set they are not served on the proxy port")
 	adminCert := flag.String("admin-cert", env.get("PROXY_ADMIN_CERT_FILE", ""), "TLS certificate for the admin listener")
 	adminKey := flag.String("admin-key", env.get("PROXY_ADMIN_KEY_FILE", ""), "TLS key for the admin listener")
+	destinationMetrics := flag.Bool("destination-metrics", env.get("PROXY_DESTINATION_METRICS", "") == "true",
+		"export per-destination request counts, sampled from the bounded top-N table at scrape time; off by default because hostnames are client-controlled")
+	topDestinations := flag.Int("destination-metrics-top", server.DefaultTopDestinations,
+		"how many destinations -destination-metrics reports; this is the series count, so keep it small")
 	metricsPublic := flag.Bool("metrics-public", env.get("PROXY_METRICS_PUBLIC", "") == "true",
 		"serve /metrics without authentication so scrapers that send no credentials keep working")
 	authPassFile := flag.String("auth-pass-file", env.get("PROXY_AUTH_PASS_FILE", ""),
@@ -367,11 +371,23 @@ func main() {
 	tracker.SetGauge(metrics.Clients)
 	stats := server.NewDomainStats()
 
+	// Off by default. Even a bounded set of hostnames is information some sites
+	// do not want in their metrics store, where retention and access are not the
+	// ones they chose for their access logs.
+	if *destinationMetrics {
+		if err := prometheus.DefaultRegisterer.Register(
+			server.NewDestinationCollector(stats, *topDestinations)); err != nil {
+			logger.Fatalf("Failed to register destination metrics: %v", err)
+		}
+		logger.Info("Destination metrics enabled",
+			log.Int("series", *topDestinations),
+			log.String("note", "sampled from the bounded top-N table; -stats must be on to populate it"))
+	}
+
 	// Read through a function so quotas changed in the UI or API take effect
 	// without a restart, the same way credentials and policy rules do.
 	limiter := quota.NewLimiter(cfg.QuotaSet)
 	limiter.Rejected = func(s quota.Scope) { metrics.QuotaRejected.WithLabelValues(string(s)).Inc() }
-	limiter.Metered = func(n int64) { metrics.RelayedBytes.Add(float64(n)) }
 	limiter.Tracked = func(n int) { metrics.QuotaClients.Set(float64(n)) }
 	if set := cfg.QuotaSet(); !set.Empty() {
 		logger.Info("Quotas active", log.String("rules", strings.ReplaceAll(set.String(), "\n", "; ")))
@@ -383,7 +399,14 @@ func main() {
 			logger.Info("Refusing to proxy to loopback/private addresses; pass -allow-private to permit them")
 		}
 		logger.Infof("CONNECT allowed to ports %s", *connectPorts)
-		h := proxy.NewForward(logger, cfg.GetHeadersForClient, pol)
+		h := proxy.NewForward(logger, cfg.GetHeadersForClient, pol, proxy.Observer{
+			Upstream: func(method string, d time.Duration) {
+				metrics.UpstreamDuration.WithLabelValues(method).Observe(d.Seconds())
+			},
+			TunnelOpened: func() { metrics.ActiveTunnels.Inc() },
+			TunnelClosed: func() { metrics.ActiveTunnels.Dec() },
+			Denied:       func(scope string) { metrics.PolicyDecisions.WithLabelValues(scope).Inc() },
+		})
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string {
 			if r.Method == http.MethodConnect {
 				return r.Host
@@ -400,7 +423,19 @@ func main() {
 	// ResponseWriter entirely, and they are the traffic both the byte quota and
 	// the access log care about most. One pass feeds both.
 	handler = server.AccountingMiddleware(handler, server.Accounting{
-		Charge:    limiter.Charge,
+		Charge: func(client string, in, out int64) {
+			// The quota is charged the total — bytes cost the same whichever
+			// way they went — while the metric keeps them apart, because
+			// "which direction is saturated" is a question the total cannot
+			// answer.
+			limiter.Charge(client, in+out)
+			if in > 0 {
+				metrics.RelayedBytes.WithLabelValues("in").Add(float64(in))
+			}
+			if out > 0 {
+				metrics.RelayedBytes.WithLabelValues("out").Add(float64(out))
+			}
+		},
 		Completed: accessLog,
 	})
 	uiHandler := ui.New(cfg, store, logger, tracker, stats)

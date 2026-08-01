@@ -79,9 +79,11 @@ type Limiter struct {
 	global  state
 	clients map[string]*state
 
-	// Rejected and Metered are optional hooks for metrics.
+	// Rejected and Tracked are optional hooks for metrics. Relayed bytes are
+	// not reported here: the accounting middleware already splits them by
+	// direction for the metrics, and counting them twice from two places is how
+	// the two numbers end up disagreeing.
 	Rejected func(Scope)
-	Metered  func(n int64)
 	Tracked  func(n int)
 }
 
@@ -160,9 +162,6 @@ func (l *Limiter) Allow(clientIP string) (bool, time.Duration, Scope) {
 func (l *Limiter) Charge(clientIP string, n int64) {
 	if n <= 0 {
 		return
-	}
-	if l.Metered != nil {
-		l.Metered(n)
 	}
 	set := l.set()
 	if set.Empty() {

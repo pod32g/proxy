@@ -15,15 +15,18 @@ import (
 // meterRecorder collects what the middleware reports, safely: a hijacked tunnel
 // reports from the goroutines pumping it.
 type meterRecorder struct {
-	mu    sync.Mutex
-	total int64
-	last  string
+	mu      sync.Mutex
+	total   int64
+	in, out int64
+	last    string
 }
 
-func (m *meterRecorder) meter(client string, n int64) {
+func (m *meterRecorder) meter(client string, in, out int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.total += n
+	m.total += in + out
+	m.in += in
+	m.out += out
 	m.last = client
 }
 
@@ -31,6 +34,14 @@ func (m *meterRecorder) read() (int64, string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.total, m.last
+}
+
+// directions returns the split, which the metrics consumer needs and the quota
+// does not.
+func (m *meterRecorder) directions() (int64, int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.in, m.out
 }
 
 func TestAccountingCountsResponseBytes(t *testing.T) {
@@ -201,7 +212,7 @@ func TestAccountingWithoutHooksIsAPassthrough(t *testing.T) {
 	if got := AccountingMiddleware(inner, Accounting{}); got == nil {
 		t.Error("no hooks should return the handler unchanged, not nil")
 	}
-	if got := AccountingMiddleware(nil, Accounting{Charge: func(string, int64) {}}); got != nil {
+	if got := AccountingMiddleware(nil, Accounting{Charge: func(string, int64, int64) {}}); got != nil {
 		t.Error("nil handler should stay nil")
 	}
 }
