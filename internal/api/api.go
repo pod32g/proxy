@@ -40,7 +40,7 @@ func guard(next http.Handler, logger *log.Logger) http.Handler {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
 			if !sameOrigin(r) {
 				if logger != nil {
-					logger.Warn("Rejected cross-origin API request from", r.Header.Get("Origin"))
+					logger.Warn("Rejected cross-origin API request", log.String("origin", r.Header.Get("Origin")))
 				}
 				http.Error(w, "Cross-origin request rejected", http.StatusForbidden)
 				return
@@ -151,7 +151,7 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 				h.cfg.SetClientHeader(req.Client, req.Name, req.Value)
 			}
 			if h.logger != nil {
-				h.logger.Info("Set header", req.Name, req.Value)
+				h.logger.Info("Set header", log.String("name", req.Name), log.String("value", req.Value))
 			}
 			if h.store != nil {
 				h.store.Save(h.cfg)
@@ -170,7 +170,7 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 				h.cfg.DeleteClientHeader(req.Client, req.Name)
 			}
 			if h.logger != nil {
-				h.logger.Info("Deleted header", req.Name)
+				h.logger.Info("Deleted header", log.String("name", req.Name))
 			}
 			if h.store != nil {
 				h.store.Save(h.cfg)
@@ -200,7 +200,7 @@ func (h *handler) logLevel(w http.ResponseWriter, r *http.Request) {
 		h.cfg.SetLogLevel(lvl)
 		if h.logger != nil {
 			h.logger.SetLevel(lvl)
-			h.logger.Info("Set log level", req.Level)
+			h.logger.Info("Set log level", log.String("level", req.Level))
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)
@@ -280,7 +280,7 @@ func (h *handler) statsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		h.cfg.SetStatsEnabled(*req.Enabled)
 		if h.logger != nil {
-			h.logger.Info("Set stats enabled", *req.Enabled)
+			h.logger.Info("Set stats enabled", log.Bool("enabled", *req.Enabled))
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)

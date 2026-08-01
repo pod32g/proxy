@@ -87,7 +87,7 @@ func (s *Server) Start() error {
 
 	if https {
 		go func() {
-			s.Logger.Info("Starting HTTPS proxy on", s.HTTPSAddr)
+			s.Logger.Info("Starting HTTPS proxy", log.String("addr", s.HTTPSAddr))
 			if err := servers[1].ListenAndServeTLS(s.CertFile, s.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				// A dead TLS listener used to be logged and ignored, leaving a
 				// process that answers /healthz on HTTP while the port people
@@ -97,7 +97,7 @@ func (s *Server) Start() error {
 		}()
 	}
 	go func() {
-		s.Logger.Info("Starting HTTP proxy on", s.HTTPAddr)
+		s.Logger.Info("Starting HTTP proxy", log.String("addr", s.HTTPAddr))
 		if err := servers[0].ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("HTTP server failed: %w", err)
 		}
@@ -111,7 +111,7 @@ func (s *Server) Start() error {
 	select {
 	case runErr = <-errCh:
 	case sig := <-stop:
-		s.Logger.Info("Received", sig.String()+", shutting down")
+		s.Logger.Info("Shutting down", log.String("signal", sig.String()))
 	}
 
 	// Drain either way: even on a listener failure the other one may still be
@@ -120,7 +120,7 @@ func (s *Server) Start() error {
 	defer cancel()
 	for _, srv := range servers {
 		if err := srv.Shutdown(ctx); err != nil {
-			s.Logger.Error("Shutdown:", err)
+			s.Logger.Errorf("Shutdown: %v", err)
 		}
 	}
 	// Shutdown does not track hijacked connections, so an established CONNECT

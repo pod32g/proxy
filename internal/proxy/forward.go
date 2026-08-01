@@ -120,16 +120,16 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, poli
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
-			logger.Debug("CONNECT request", r.Host)
+			logger.Debugf("CONNECT request %s", r.Host)
 			if err := policy.connectAllowed(r.Host); err != nil {
-				logger.Warn("Refused CONNECT:", err.Error())
+				logger.Warnf("Refused CONNECT: %v", err)
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
 			handleConnect(w, r, logger, dialer)
 			return
 		}
-		logger.Debug("Forward proxy request", r.Method, sanitizedURL(r.URL))
+		logger.Debugf("Forward proxy request %s %s", r.Method, sanitizedURL(r.URL))
 		if r.URL.Scheme == "" || r.URL.Host == "" {
 			logger.Error("Invalid request URL: missing scheme or host")
 			http.Error(w, "Bad request", http.StatusBadRequest)
@@ -146,7 +146,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, poli
 		}
 		resp, err := transport.RoundTrip(outReq)
 		if err != nil {
-			logger.Error("Upstream error:", err)
+			logger.Errorf("Upstream error: %v", err)
 			// A policy rejection is the client asking for somewhere it is not
 			// allowed to go, not an upstream fault.
 			if strings.Contains(err.Error(), "is not permitted") {
@@ -165,12 +165,12 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, poli
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, dialer *net.Dialer) {
-	logger.Debug("CONNECT tunnel", r.Host)
+	logger.Debugf("CONNECT tunnel %s", r.Host)
 	// DialContext with the request context: a bounded dial, and a client that
 	// gives up frees the goroutine immediately instead of waiting it out.
 	destConn, err := dialer.DialContext(r.Context(), "tcp", r.Host)
 	if err != nil {
-		logger.Error("CONNECT dial error:", err)
+		logger.Errorf("CONNECT dial error: %v", err)
 		if strings.Contains(err.Error(), "is not permitted") {
 			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return
@@ -191,7 +191,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, d
 	}
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		logger.Error("Hijack error:", err)
+		logger.Errorf("Hijack error: %v", err)
 		http.Error(w, "Hijack failed", http.StatusInternalServerError)
 		destConn.Close()
 		return

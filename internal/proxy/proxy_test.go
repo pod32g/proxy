@@ -16,7 +16,11 @@ import (
 )
 
 func newLogger() *log.Logger {
-	return log.NewLogger(io.Discard, log.ERROR, &log.DefaultFormatter{})
+	l, err := log.New(log.WithOutput(io.Discard), log.WithLevel(log.ERROR))
+	if err != nil {
+		panic(err)
+	}
+	return l
 }
 
 func TestNewAddsHeader(t *testing.T) {

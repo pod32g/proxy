@@ -237,7 +237,8 @@ func (r *Router) recordFailure(source string, hadCredentials bool) {
 	r.failMu.Unlock()
 
 	if r.Logger != nil && hadCredentials {
-		r.Logger.Warn("Rejected credentials from", source, "- failures in the last minute:", count)
+		r.Logger.Warn("Rejected credentials",
+			log.String("source", source), log.Int("failures_in_window", count))
 	}
 }
 

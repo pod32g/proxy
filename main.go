@@ -209,26 +209,29 @@ func main() {
 		reapply(cfg, cli, set)
 	}
 
-	logger := log.NewLogger(os.Stdout, cfg.GetLogLevel(), &log.DefaultFormatter{})
+	logger, err := log.New(log.WithOutput(os.Stdout), log.WithLevel(cfg.GetLogLevel()))
+	if err != nil {
+		fatalf("failed to build logger: %v", err)
+	}
 
 	for _, w := range store.Warnings() {
 		logger.Warn(w)
 	}
 	if config.CredentialsAtRisk(cfg) {
-		logger.Warn("Credentials will be stored unencrypted in", *dbPath,
-			"- set -secret (or PROXY_SECRET_KEY) to encrypt them at rest")
+		logger.Warnf("Credentials will be stored unencrypted in %s; set -secret "+
+			"(or PROXY_SECRET_KEY) to encrypt them at rest", *dbPath)
 	}
 	if store != nil {
 		// Also rewrites credentials sealed by older builds under the current
 		// key derivation.
 		if err := store.Save(cfg); err != nil {
-			logger.Error("Failed to persist config:", err)
+			logger.Errorf("Failed to persist config: %v", err)
 		}
 	}
 
 	metrics, err := server.NewMetrics(prometheus.DefaultRegisterer)
 	if err != nil {
-		logger.Fatal("Failed to register metrics:", err)
+		logger.Fatalf("Failed to register metrics: %v", err)
 	}
 	tracker := server.NewClientTracker()
 	tracker.SetGauge(metrics.Clients)
@@ -239,7 +242,7 @@ func main() {
 		if !*allowPrivate {
 			logger.Info("Refusing to proxy to loopback/private addresses; pass -allow-private to permit them")
 		}
-		logger.Info("CONNECT allowed to ports", *connectPorts)
+		logger.Infof("CONNECT allowed to ports %s", *connectPorts)
 		h := proxy.NewForward(logger, cfg.GetHeadersForClient, policy)
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string {
 			if r.Method == http.MethodConnect {
@@ -281,7 +284,7 @@ func main() {
 	}
 
 	if err := srv.Start(); err != nil {
-		logger.Fatal("Server failed:", err)
+		logger.Fatalf("Server failed: %v", err)
 	}
 }
 

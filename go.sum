@@ -22,6 +22,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/pod32g/simple-logger v0.7.0 h1:FzE6/r87O5XuLawHmdXn8LfLS2ERTgazY1Ee/4404lg=
 github.com/pod32g/simple-logger v0.7.0/go.mod h1:NXqdbOrraS4s+qLnkunKgihJLEtzI31WZhIzVz2hYss=
+github.com/pod32g/simple-logger v0.8.1 h1:SmlvNvikjRgTdtmcRClEg676cPfgKAHiWhD/EWeXnWM=
+github.com/pod32g/simple-logger v0.8.1/go.mod h1:gINlo6OigMb5H9vpBVCBgHUXrjx5Lvu3vwgrT6zbSNM=
 github.com/prometheus/client_golang v1.24.1 h1:JnJkREXzWxUdCuPFpIWZiPispT9xVV59uiuyR2bPlnU=
 github.com/prometheus/client_golang v1.24.1/go.mod h1:F+oSRECHg4sse5ucfYpYDeIv/hu68Zo0uoHKetWnzcE=
 github.com/prometheus/client_model v0.6.2 h1:oBsgwpGs7iVziMvrGhE53c/GrLUsZdHnqNwqPLxwZyk=

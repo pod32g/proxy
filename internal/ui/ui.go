@@ -83,7 +83,7 @@ func (h *handler) issueCSRF(w http.ResponseWriter, r *http.Request) string {
 	token, err := newCSRFToken()
 	if err != nil {
 		if h.logger != nil {
-			h.logger.Error("Failed to generate CSRF token:", err)
+			h.logger.Errorf("Failed to generate CSRF token: %v", err)
 		}
 		return ""
 	}
@@ -110,7 +110,7 @@ func (h *handler) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
 	sent := r.FormValue(csrfFieldName)
 	if sent == "" || subtle.ConstantTimeCompare([]byte(sent), []byte(cookie.Value)) != 1 {
 		if h.logger != nil {
-			h.logger.Warn("Rejected request with bad CSRF token", r.URL.Path)
+			h.logger.Warn("Rejected request with bad CSRF token", log.String("path", r.URL.Path))
 		}
 		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
 		return false
@@ -379,7 +379,7 @@ func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 			h.cfg.SetClientHeader(client, name, value)
 		}
 		if h.logger != nil {
-			h.logger.Info("Set header", name, value)
+			h.logger.Info("Set header", log.String("name", name), log.String("value", value))
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)
@@ -405,7 +405,7 @@ func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
 			h.cfg.DeleteClientHeader(client, name)
 		}
 		if h.logger != nil {
-			h.logger.Info("Deleted header", name)
+			h.logger.Info("Deleted header", log.String("name", name))
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)
@@ -431,7 +431,7 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 	h.cfg.SetLogLevel(level)
 	if h.logger != nil {
 		h.logger.SetLevel(level)
-		h.logger.Info("Set log level", levelStr)
+		h.logger.Info("Set log level", log.String("level", levelStr))
 	}
 	if h.store != nil {
 		h.store.Save(h.cfg)
@@ -451,7 +451,7 @@ func (h *handler) setIdentity(w http.ResponseWriter, r *http.Request) {
 	id := r.FormValue("id")
 	h.cfg.SetIdentity(name, id)
 	if h.logger != nil {
-		h.logger.Info("Updated identity", name, id)
+		h.logger.Info("Updated identity", log.String("name", name), log.String("id", id))
 	}
 	if h.store != nil {
 		h.store.Save(h.cfg)
@@ -479,7 +479,7 @@ func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	h.cfg.SetAuth(enabled, user, pass)
 	if h.logger != nil {
-		h.logger.Info("Updated auth settings", "enabled=", enabled, "user=", user)
+		h.logger.Info("Updated auth settings", log.Bool("enabled", enabled), log.String("user", user))
 	}
 	if h.store != nil {
 		h.store.Save(h.cfg)

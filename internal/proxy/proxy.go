@@ -18,7 +18,7 @@ func New(target *url.URL, logger *log.Logger, headers func(string) map[string]st
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
-		logger.Debug("Reverse proxy request", req.Method, sanitizedURL(req.URL))
+		logger.Debugf("Reverse proxy request %s %s", req.Method, sanitizedURL(req.URL))
 		originalDirector(req)
 		for k, v := range headers(clientIP(req.RemoteAddr)) {
 			req.Header.Set(k, v)
@@ -26,7 +26,7 @@ func New(target *url.URL, logger *log.Logger, headers func(string) map[string]st
 	}
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		logger.Error("Upstream error:", err)
+		logger.Errorf("Upstream error: %v", err)
 		http.Error(rw, "Bad gateway", http.StatusBadGateway)
 	}
 
