@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/pod32g/proxy/internal/policy"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -32,6 +33,12 @@ type Config struct {
 
 	Headers       map[string]string
 	ClientHeaders map[string]map[string]string
+
+	// Destination policy. Held as both the text as written and its parsed
+	// form; the text is what the operator sees and what round-trips to the
+	// store, the parsed set is what the request path evaluates.
+	policyText  string
+	policyRules *policy.RuleSet
 
 	mu sync.RWMutex
 }
@@ -276,4 +283,35 @@ func (c *Config) GetAuth() (bool, string, string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.AuthEnabled, c.Username, c.Password
+}
+
+// SetPolicyRules parses and installs the destination rule set. The text is kept
+// alongside the parsed form so it can be round-tripped to the store and shown
+// in the UI exactly as written, comments included.
+func (c *Config) SetPolicyRules(text string) error {
+	set, err := policy.Parse(text)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.policyText = text
+	c.policyRules = set
+	return nil
+}
+
+// PolicyRuleSet returns the active rules. Safe to call per request: the pointer
+// is replaced wholesale rather than mutated, so an in-flight evaluation keeps
+// using the set it started with.
+func (c *Config) PolicyRuleSet() *policy.RuleSet {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.policyRules
+}
+
+// PolicyRulesText returns the rules as written.
+func (c *Config) PolicyRulesText() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.policyText
 }

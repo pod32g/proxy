@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pod32g/proxy/internal/policy"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -30,6 +32,35 @@ type Policy struct {
 	// through port 25, for scanning the internal network, and for laundering
 	// arbitrary traffic through this host's address.
 	ConnectPorts []int
+
+	// Rules is an ordered allow/deny list applied to the destination. Nil means
+	// no opinion, leaving AllowPrivate as the only constraint.
+	Rules func() *policy.RuleSet
+}
+
+// ruleSet returns the current rules. It is a function so the set can be
+// replaced at runtime without rebuilding the handler.
+func (p Policy) ruleSet() *policy.RuleSet {
+	if p.Rules == nil {
+		return nil
+	}
+	return p.Rules()
+}
+
+// hostKey carries the requested hostname to ControlContext, which otherwise
+// sees only the resolved address. Both facts are needed at once: evaluating
+// domain and CIDR rules in separate passes would reorder the list.
+type hostKey struct{}
+
+// errDenied marks a policy refusal so the handlers can answer 403 rather than
+// reporting it as an upstream fault.
+type errDenied struct{ reason string }
+
+func (e *errDenied) Error() string { return e.reason }
+
+func denied(err error) bool {
+	var d *errDenied
+	return errors.As(err, &d)
 }
 
 // DefaultConnectPorts is the allowlist used when none is configured.
@@ -86,16 +117,48 @@ func (p Policy) dialer() *net.Dialer {
 		// connection while the client waits with no response at all.
 		Timeout:   15 * time.Second,
 		KeepAlive: 30 * time.Second,
-		Control: func(network, address string, _ syscall.RawConn) error {
+		// ControlContext rather than Control, so the requested hostname can be
+		// read off the context alongside the resolved address. This is the one
+		// place both are known, and the ordered rule list needs both to be
+		// evaluated in the order it was written.
+		ControlContext: func(ctx context.Context, network, address string, _ syscall.RawConn) error {
 			host, _, err := net.SplitHostPort(address)
 			if err != nil {
 				return nil
 			}
-			if ip := net.ParseIP(host); p.blockedIP(ip) {
-				return fmt.Errorf("destination %s is not permitted (use -allow-private to allow it)", ip)
+			ip := net.ParseIP(host)
+			requested, _ := ctx.Value(hostKey{}).(string)
+			if requested == "" {
+				requested = host
+			}
+			if decision, rule := p.ruleSet().Match(requested, ip); decision != policy.Undecided {
+				if decision == policy.Deny {
+					return &errDenied{fmt.Sprintf("destination %s is not permitted by policy (%s)", requested, rule)}
+				}
+				// An explicit allow overrides the private-address default:
+				// naming an internal range in the rules is a deliberate act.
+				return nil
+			}
+			if p.blockedIP(ip) {
+				return &errDenied{fmt.Sprintf("destination %s is not permitted (use -allow-private to allow it)", ip)}
 			}
 			return nil
 		},
+	}
+}
+
+// dialContext wraps the dialer so the hostname reaches ControlContext, and so
+// an unambiguous denial can be answered without a DNS lookup or a dial.
+func (p Policy) dialContext(d *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+		if decision, rule := p.ruleSet().Match(host, nil); decision == policy.Deny {
+			return nil, &errDenied{fmt.Sprintf("destination %s is not permitted by policy (%s)", host, rule)}
+		}
+		return d.DialContext(context.WithValue(ctx, hostKey{}, host), network, addr)
 	}
 }
 
@@ -113,21 +176,21 @@ func clientIP(remoteAddr string) string {
 // NewForward creates a forward proxy handler. It supports HTTPS via CONNECT
 // without requiring TLS certificates. The headers function returns the headers
 // that should be added to outbound requests and receives the client address.
-func NewForward(logger *log.Logger, headers func(string) map[string]string, policy Policy) http.Handler {
-	dialer := policy.dialer()
+func NewForward(logger *log.Logger, headers func(string) map[string]string, pol Policy) http.Handler {
+	dialer := pol.dialer()
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
-	transport.DialContext = dialer.DialContext
+	transport.DialContext = pol.dialContext(dialer)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			logger.Debugf("CONNECT request %s", r.Host)
-			if err := policy.connectAllowed(r.Host); err != nil {
+			if err := pol.connectAllowed(r.Host); err != nil {
 				logger.Warnf("Refused CONNECT: %v", err)
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
-			handleConnect(w, r, logger, dialer)
+			handleConnect(w, r, logger, pol, dialer)
 			return
 		}
 		logger.Debugf("Forward proxy request %s %s", r.Method, sanitizedURL(r.URL))
@@ -155,13 +218,17 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, poli
 		}
 		resp, err := transport.RoundTrip(outReq)
 		if err != nil {
-			logger.Errorf("Upstream error: %v", err)
 			// A policy rejection is the client asking for somewhere it is not
-			// allowed to go, not an upstream fault.
-			if strings.Contains(err.Error(), "is not permitted") {
+			// allowed to go. That is a refusal, not an upstream fault, and
+			// logging it at ERROR would put routine enforcement in with real
+			// failures.
+			if denied(err) {
+				logger.Warn("Refused destination",
+					log.String("host", r.URL.Host), log.String("client", clientIP(r.RemoteAddr)))
 				http.Error(w, "Destination not permitted", http.StatusForbidden)
 				return
 			}
+			logger.Errorf("Upstream error: %v", err)
 			http.Error(w, "Bad gateway", http.StatusBadGateway)
 			return
 		}
@@ -226,11 +293,12 @@ func handleUpgrade(
 
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
-		logger.Errorf("Upgrade upstream error: %v", err)
-		if strings.Contains(err.Error(), "is not permitted") {
+		if denied(err) {
+			logger.Warn("Refused upgrade destination", log.String("host", r.URL.Host))
 			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return
 		}
+		logger.Errorf("Upgrade upstream error: %v", err)
 		http.Error(w, "Bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -298,17 +366,19 @@ func handleUpgrade(
 	go transfer(clientConn, upstream)
 }
 
-func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, dialer *net.Dialer) {
+func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, pol Policy, dialer *net.Dialer) {
 	logger.Debugf("CONNECT tunnel %s", r.Host)
-	// DialContext with the request context: a bounded dial, and a client that
-	// gives up frees the goroutine immediately instead of waiting it out.
-	destConn, err := dialer.DialContext(r.Context(), "tcp", r.Host)
+	// The same policy-aware dial the plain-HTTP path uses, so a tunnel cannot
+	// reach anywhere an ordinary request could not.
+	destConn, err := pol.dialContext(dialer)(r.Context(), "tcp", r.Host)
 	if err != nil {
-		logger.Errorf("CONNECT dial error: %v", err)
-		if strings.Contains(err.Error(), "is not permitted") {
+		if denied(err) {
+			logger.Warn("Refused CONNECT destination",
+				log.String("host", r.Host), log.String("client", clientIP(r.RemoteAddr)))
 			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return
 		}
+		logger.Errorf("CONNECT dial error: %v", err)
 		var netErr net.Error
 		if errors.As(err, &netErr) && netErr.Timeout() {
 			http.Error(w, "Gateway timeout", http.StatusGatewayTimeout)

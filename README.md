@@ -40,6 +40,8 @@ go build -o proxy
 - `-stats` – Enable analysis of top visited websites. Can be set with `PROXY_STATS_ENABLED`.
 - `-allow-private` – Permit proxying to loopback, private and link-local addresses. **Off by default.** Can be set with `PROXY_ALLOW_PRIVATE`.
 - `-connect-ports` – Comma-separated ports `CONNECT` may tunnel to. Defaults to `443` or `PROXY_CONNECT_PORTS`.
+- `-policy-rule` – Destination rule; repeatable, first match wins. See below.
+- `-policy-file` – File of destination rules, one per line. Can be set with `PROXY_POLICY_FILE`.
 - `-health-path` – Unauthenticated liveness path. Defaults to `/healthz` or `PROXY_HEALTH_PATH`; empty disables it.
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
@@ -112,6 +114,51 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
   increments `proxy_auth_failures_total`.
 - **Proxied requests are challenged with `407`** and `Proxy-Authenticate`, as
   RFC 7235 requires; requests addressed to the proxy itself get `401`.
+
+## Destination policy
+
+Beyond the private-address default, you can say exactly where the proxy may go.
+Rules are an **ordered list, first match wins**:
+
+```sh
+./proxy -policy-rule "deny domain internal.example.com" \
+        -policy-rule "allow domain example.com" \
+        -policy-rule "deny all"
+```
+
+or in a file, where `#` comments are allowed:
+
+```
+# Only our own estate, and not the internal host.
+deny  domain internal.example.com
+allow domain example.com
+allow cidr   203.0.113.0/24
+deny  all
+```
+
+| Matcher | Matches |
+| --- | --- |
+| `domain example.com` | The host and its subdomains |
+| `domain *.example.com` | Subdomains only, excluding the apex |
+| `domain *` | Anything |
+| `cidr 203.0.113.0/24` | The address the host resolved to |
+| `cidr 203.0.113.5` | A single address |
+| `all` | Everything — for a terminal default |
+
+Rules apply to both ordinary requests and `CONNECT`, and are persisted, so they
+survive a restart and can be changed without one. An unparseable rule is a
+startup error naming the offending line.
+
+**CIDR rules are matched against the resolved address, after DNS.** That is what
+makes them meaningful — a hostname check alone would be defeated by a name that
+resolves wherever the client likes — and it is why the whole list is evaluated
+post-resolution rather than in two passes. Evaluating domain and CIDR rules
+separately would silently reorder them: with `allow cidr 10.0.0.0/8` followed by
+`deny all`, a hostname-only pass would reach the deny and reject a name that
+resolves into 10/8.
+
+An explicit `allow` overrides the private-address default, so naming an internal
+range in the rules is enough — `-allow-private` is not also required.
 
 ## WebSocket and protocol upgrades
 

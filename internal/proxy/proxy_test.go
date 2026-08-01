@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pod32g/proxy/internal/policy"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -534,5 +535,113 @@ func TestNonUpgradeRequestsStillStripped(t *testing.T) {
 		if v := got.Get(name); v != "" {
 			t.Errorf("origin saw hop-by-hop header %s: %q", name, v)
 		}
+	}
+}
+
+func rules(t *testing.T, text string) func() *policy.RuleSet {
+	t.Helper()
+	set, err := policy.Parse(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return func() *policy.RuleSet { return set }
+}
+
+// The ordered list must be honoured end to end, including the case that
+// motivates evaluating post-DNS: a CIDR allow ahead of a deny-all, for a
+// hostname that resolves into the allowed range.
+func TestPolicyRulesEndToEnd(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("REACHED"))
+	}))
+	defer origin.Close()
+	originHost, _, _ := net.SplitHostPort(strings.TrimPrefix(origin.URL, "http://"))
+
+	for _, tc := range []struct {
+		name, ruleText string
+		wantCode       int
+	}{
+		{"deny all blocks everything", "deny all", http.StatusForbidden},
+		{"allow all permits", "allow all", http.StatusOK},
+		{"cidr allow ahead of deny all", "allow cidr " + originHost + "/32\ndeny all", http.StatusOK},
+		{"deny all with an unrelated cidr allow", "allow cidr 198.51.100.0/24\ndeny all", http.StatusForbidden},
+		{"specific deny precedes broad allow", "deny cidr " + originHost + "/32\nallow all", http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewForward(newLogger(), func(string) map[string]string { return nil },
+				Policy{AllowPrivate: true, Rules: rules(t, tc.ruleText)})
+			req := httptest.NewRequest(http.MethodGet, origin.URL+"/", nil)
+			req.RequestURI = ""
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("got %d (%q), want %d", rec.Code, strings.TrimSpace(rec.Body.String()), tc.wantCode)
+			}
+		})
+	}
+}
+
+// An explicit allow is a deliberate act and overrides the private-address
+// default, so an internal range can be opened without -allow-private.
+func TestPolicyAllowOverridesPrivateDefault(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("REACHED"))
+	}))
+	defer origin.Close()
+	originHost, _, _ := net.SplitHostPort(strings.TrimPrefix(origin.URL, "http://"))
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{Rules: rules(t, "allow cidr "+originHost+"/32")}) // AllowPrivate stays false
+	req := httptest.NewRequest(http.MethodGet, origin.URL+"/", nil)
+	req.RequestURI = ""
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d (%q), want 200", rec.Code, strings.TrimSpace(rec.Body.String()))
+	}
+}
+
+// A tunnel must not reach anywhere an ordinary request could not.
+func TestPolicyRulesApplyToConnect(t *testing.T) {
+	svc, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{AllowPrivate: true, ConnectPorts: allPorts(), Rules: rules(t, "deny all")})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", svc.Addr(), svc.Addr())
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(line, "403") {
+		t.Fatalf("got %q, want 403", strings.TrimSpace(line))
+	}
+}
+
+// With no rules configured nothing changes: the private-address default is
+// still the only constraint.
+func TestNoRulesLeavesBehaviourUnchanged(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer origin.Close()
+
+	strict := NewForward(newLogger(), func(string) map[string]string { return nil }, Policy{})
+	req := httptest.NewRequest(http.MethodGet, origin.URL+"/", nil)
+	req.RequestURI = ""
+	rec := httptest.NewRecorder()
+	strict.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("loopback should still be refused: got %d", rec.Code)
 	}
 }

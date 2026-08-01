@@ -322,6 +322,14 @@ func (s *Store) Load(cfg *Config) error {
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='proxy_id'`).Scan(&val); err == nil {
 		cfg.SetProxyID(val)
 	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='policy_rules'`).Scan(&val); err == nil {
+		if err := cfg.SetPolicyRules(val); err != nil {
+			// Refusing to start over a stored rule set would strand the proxy
+			// on a value only the UI can fix. Warn and carry on with no rules,
+			// which leaves the private-address default in place.
+			s.warn("stored policy rules are invalid and were ignored: %v", err)
+		}
+	}
 
 	_, user, pass := cfg.GetAuth()
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='username'`).Scan(&val); err == nil {
@@ -383,6 +391,7 @@ func (s *Store) Save(cfg *Config) error {
 		{"stats_enabled", strconv.FormatBool(cfg.StatsEnabledState())},
 		{"proxy_name", proxyName},
 		{"proxy_id", proxyID},
+		{"policy_rules", cfg.PolicyRulesText()},
 	}
 
 	if cfg.SecretKey != "" {

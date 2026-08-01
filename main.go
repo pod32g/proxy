@@ -139,6 +139,11 @@ func main() {
 	flag.BoolVar(&cfg.StatsEnabled, "stats", env.get("PROXY_STATS_ENABLED", "") == "true", "enable traffic analysis")
 	allowPrivate := flag.Bool("allow-private", env.get("PROXY_ALLOW_PRIVATE", "") == "true",
 		"allow proxying to loopback, private and link-local addresses (off by default: a forward proxy takes destinations from untrusted clients)")
+	var policyRules policyFlags
+	flag.Var(&policyRules, "policy-rule",
+		"destination rule, first match wins (e.g. \"allow domain *.example.com\", \"deny cidr 10.0.0.0/8\", \"deny all\"); repeatable")
+	policyFile := flag.String("policy-file", env.get("PROXY_POLICY_FILE", ""),
+		"file of destination rules, one per line; # comments allowed")
 	connectPorts := flag.String("connect-ports", env.get("PROXY_CONNECT_PORTS", "443"),
 		"comma-separated ports CONNECT may tunnel to")
 	healthPath := flag.String("health-path", env.get("PROXY_HEALTH_PATH", server.DefaultHealthPath),
@@ -207,17 +212,45 @@ func main() {
 		secretsFromFile["secret"] = true
 	}
 
+	setFlagsExtra := map[string]bool{}
+
 	ports, err := parsePorts(*connectPorts)
 	if err != nil {
 		fatalf("invalid -connect-ports: %v", err)
 	}
-	policy := proxy.Policy{AllowPrivate: *allowPrivate, ConnectPorts: ports}
+	// Validate rules before anything else touches them: an unparseable rule set
+	// must not reach the request path, and an operator needs to be told which
+	// line is wrong rather than discovering it as unexpected traffic.
+	if *policyFile != "" {
+		data, err := os.ReadFile(*policyFile)
+		if err != nil {
+			fatalf("-policy-file: %v", err)
+		}
+		policyRules = append(policyRules, strings.Split(string(data), "\n")...)
+	}
+	if len(policyRules) > 0 {
+		if err := cfg.SetPolicyRules(strings.Join(policyRules, "\n")); err != nil {
+			fatalf("invalid policy rules: %v", err)
+		}
+		setFlagsExtra["policy-rule"] = true
+	}
+
+	pol := proxy.Policy{
+		AllowPrivate: *allowPrivate,
+		ConnectPorts: ports,
+		// Read per request so rules changed at runtime take effect without a
+		// restart, the same way credentials do.
+		Rules: cfg.PolicyRuleSet,
+	}
 
 	cfg.Headers = headers
 	cfg.LogLevel = logLevel
 
 	setFlags := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	for k := range setFlagsExtra {
+		setFlags[k] = true
+	}
 	cli := startupValues{
 		logLevel:     logLevel,
 		authEnabled:  cfg.AuthEnabled,
@@ -285,7 +318,7 @@ func main() {
 			logger.Info("Refusing to proxy to loopback/private addresses; pass -allow-private to permit them")
 		}
 		logger.Infof("CONNECT allowed to ports %s", *connectPorts)
-		h := proxy.NewForward(logger, cfg.GetHeadersForClient, policy)
+		h := proxy.NewForward(logger, cfg.GetHeadersForClient, pol)
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string {
 			if r.Method == http.MethodConnect {
 				return r.Host
@@ -430,4 +463,15 @@ func warnFlagSecrets(logger *log.Logger, set overrides, fromFile map[string]bool
 		logger.Warnf("credential supplied via -%s/%s is readable by any local user "+
 			"(ps, /proc); prefer %s", s.flagName, s.envName, s.fileFlag)
 	}
+}
+
+// policyFlags collects repeated -policy-rule values, preserving order. The
+// order is the semantics here, so a map or a set would lose the meaning.
+type policyFlags []string
+
+func (p *policyFlags) String() string { return strings.Join(*p, "; ") }
+
+func (p *policyFlags) Set(value string) error {
+	*p = append(*p, value)
+	return nil
 }
