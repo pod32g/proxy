@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +39,13 @@ type Policy struct {
 	// per client so a client-specific list can replace the global one. Nil
 	// means no opinion, leaving AllowPrivate as the only constraint.
 	Rules func(clientIP string) *policy.RuleSet
+
+	// UpstreamTLS configures outbound TLS: an additional trust bundle, a client
+	// certificate, or both. Nil uses the system trust store.
+	//
+	// There is no way to disable verification here, deliberately. See
+	// config.UpstreamTLS for why.
+	UpstreamTLS *tls.Config
 }
 
 // ruleSet returns the rules in force for a client. It is a function so the set
@@ -307,6 +315,9 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	transport.DialContext = pol.dialContext(dialer)
+	if pol.UpstreamTLS != nil {
+		transport.TLSClientConfig = pol.UpstreamTLS.Clone()
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {

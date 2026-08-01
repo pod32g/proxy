@@ -73,6 +73,19 @@ headers:
 
 # secret_file: /run/secrets/proxy-secret   # encrypts credentials at rest (restart)
 
+# --- restart: TLS the proxy uses when connecting OUTWARD ---------------------
+#
+# Distinct from cert/key above, which is what the proxy presents to its own
+# clients. The CA bundle is *added* to the system roots, not substituted for
+# them, so public destinations keep working.
+#
+# There is no option to skip verification. If you are here because an internal
+# service has a private CA, `ca:` is the answer.
+# upstream_tls:
+#   ca: /etc/pki/internal-ca.pem
+#   cert: /etc/pki/proxy.crt
+#   key: /etc/pki/proxy.key
+
 # Destination rules: ordered, first match wins.
 policy: |
   # deny domain internal.example.com
@@ -118,3 +131,10 @@ quotas: |
 #       default deny
 #     quotas: |
 #       client requests 20/s burst 40
+#
+#   - name: internal-mtls
+#     address: "10.0.0.6:8080"
+#     upstream_tls:                # this interface presents a client certificate
+#       ca: /etc/pki/internal-ca.pem
+#       cert: /etc/pki/proxy.crt
+#       key: /etc/pki/proxy.key

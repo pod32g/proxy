@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -14,8 +15,18 @@ func sanitizedURL(u *url.URL) string {
 
 // New creates a reverse proxy to the given target URL.
 // The headers function receives the client address and returns headers to set on each upstream request.
-func New(target *url.URL, logger *log.Logger, headers func(string) map[string]string) *httputil.ReverseProxy {
+//
+// upstreamTLS, when given, configures outbound TLS — a private trust bundle, a
+// client certificate, or both. Reverse mode is where a private PKI upstream is
+// most common, so it takes the same material forward mode does rather than
+// being the one path that cannot reach an internal service.
+func New(target *url.URL, logger *log.Logger, headers func(string) map[string]string, upstreamTLS ...*tls.Config) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	if len(upstreamTLS) > 0 && upstreamTLS[0] != nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = upstreamTLS[0].Clone()
+		proxy.Transport = transport
+	}
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		logger.Debugf("Reverse proxy request %s %s", req.Method, sanitizedURL(req.URL))

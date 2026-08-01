@@ -174,6 +174,12 @@ func main() {
 		"export per-destination request counts, sampled from the bounded top-N table at scrape time; off by default because hostnames are client-controlled")
 	topDestinations := flag.Int("destination-metrics-top", server.DefaultTopDestinations,
 		"how many destinations -destination-metrics reports; this is the series count, so keep it small")
+	upstreamCA := flag.String("upstream-ca", env.get("PROXY_UPSTREAM_CA", ""),
+		"additional CA bundle trusted for upstream TLS; added to the system roots rather than replacing them")
+	upstreamCert := flag.String("upstream-cert", env.get("PROXY_UPSTREAM_CERT", ""),
+		"client certificate presented to upstreams that ask for one")
+	upstreamKey := flag.String("upstream-key", env.get("PROXY_UPSTREAM_KEY", ""),
+		"key for -upstream-cert")
 	metricsPublic := flag.Bool("metrics-public", env.get("PROXY_METRICS_PUBLIC", "") == "true",
 		"serve /metrics without authentication so scrapers that send no credentials keep working")
 	authPassFile := flag.String("auth-pass-file", env.get("PROXY_AUTH_PASS_FILE", ""),
@@ -238,7 +244,10 @@ func main() {
 			accessLog: accessLogStr, accessLogFile: accessLogFile,
 			otelEndpoint: otelEndpoint, otelInsecure: otelInsecure, otelSample: otelSample,
 			destMetrics: destinationMetrics, destTop: topDestinations,
-			secretFile: secretFile,
+			secretFile:   secretFile,
+			upstreamCA:   upstreamCA,
+			upstreamCert: upstreamCert,
+			upstreamKey:  upstreamKey,
 		})
 	}
 
@@ -441,6 +450,20 @@ func main() {
 		}()
 	}
 
+	// Loaded at startup so a bundle that does not parse, or a certificate that
+	// does not match its key, is a configuration error rather than a 502 on the
+	// first request that needs it.
+	globalUpstream := config.UpstreamTLS{
+		CAFile: *upstreamCA, CertFile: *upstreamCert, KeyFile: *upstreamKey,
+	}
+	globalUpstreamTLS, err := globalUpstream.BuildTLSConfig()
+	if err != nil {
+		fatalf("upstream TLS: %v", err)
+	}
+	if !globalUpstream.Empty() {
+		logger.Info("Upstream TLS configured", log.String("using", globalUpstream.Describe()))
+	}
+
 	metrics, err := server.NewMetrics(prometheus.DefaultRegisterer)
 	if err != nil {
 		logger.Fatalf("Failed to register metrics: %v", err)
@@ -483,12 +506,26 @@ func main() {
 	// refusals produced no record at all, so the log silently omitted exactly
 	// the requests an operator goes looking for.
 	buildChain := func(name string, scope proxyScope, mode, targetURL string,
-		allowPrivate bool, ports []int, lim *quota.Limiter) (http.Handler, func(http.Handler) http.Handler, error) {
+		allowPrivate bool, ports []int, lim *quota.Limiter,
+		upstream config.UpstreamTLS) (http.Handler, func(http.Handler) http.Handler, error) {
+
+		// A listener with no material of its own uses the global one, so
+		// configuring a private CA once covers every listener that did not ask
+		// for something different.
+		upstreamTLS := globalUpstreamTLS
+		if !upstream.Empty() {
+			built, err := upstream.BuildTLSConfig()
+			if err != nil {
+				return nil, nil, fmt.Errorf("listener %q upstream TLS: %v", name, err)
+			}
+			upstreamTLS = built
+		}
 
 		listenerPol := proxy.Policy{
 			AllowPrivate: allowPrivate,
 			ConnectPorts: ports,
 			Rules:        scope.DestinationRulesFor,
+			UpstreamTLS:  upstreamTLS,
 		}
 
 		var handler http.Handler
@@ -511,7 +548,7 @@ func main() {
 				return nil, nil, fmt.Errorf("listener %q: invalid target %q: %v", name, targetURL, err)
 			}
 			reverseTarget = u
-			handler = proxy.New(u, logger, cfg.GetHeadersForClient)
+			handler = proxy.New(u, logger, cfg.GetHeadersForClient, upstreamTLS)
 		}
 		inner := handler
 		// Accounting wraps outermost so it sees the connection before anything else
@@ -572,7 +609,8 @@ func main() {
 		}
 		logger.Infof("CONNECT allowed to ports %s", *connectPorts)
 	}
-	handler, instrument, err := buildChain("http", cfg, cfg.Mode, cfg.TargetURL, *allowPrivate, ports, limiter)
+	handler, instrument, err := buildChain("http", cfg, cfg.Mode, cfg.TargetURL,
+		*allowPrivate, ports, limiter, config.UpstreamTLS{})
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -634,7 +672,7 @@ func main() {
 				lim = newLimiter(l.QuotaSet, metrics)
 			}
 			chain, instrumentListener, err := buildChain(l.Name, l, l.ResolvedMode(), l.ResolvedTarget(),
-				l.AllowPrivate, l.ConnectPorts, lim)
+				l.AllowPrivate, l.ConnectPorts, lim, l.UpstreamTLS)
 			if err != nil {
 				fatalf("%v", err)
 			}
@@ -852,6 +890,9 @@ type startupFlags struct {
 	destMetrics   *bool
 	destTop       *int
 	secretFile    *string
+	upstreamCA    *string
+	upstreamCert  *string
+	upstreamKey   *string
 }
 
 // applyStartupFile writes file values into the startup settings, skipping any

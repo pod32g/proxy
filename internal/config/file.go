@@ -60,6 +60,15 @@ type File struct {
 		Top     *int  `yaml:"top"`
 	} `yaml:"destination_metrics"`
 
+	// UpstreamTLS is what the proxy presents and trusts when connecting
+	// outward, distinct from cert/key above, which is what it presents to its
+	// own clients.
+	UpstreamTLS *struct {
+		CA   *string `yaml:"ca"`
+		Cert *string `yaml:"cert"`
+		Key  *string `yaml:"key"`
+	} `yaml:"upstream_tls"`
+
 	Stats         *bool   `yaml:"stats"`
 	AllowPrivate  *bool   `yaml:"allow_private"`
 	ConnectPorts  []int   `yaml:"connect_ports"`
@@ -99,11 +108,16 @@ type ListenerFile struct {
 	Mode   *string `yaml:"mode"`
 	Target *string `yaml:"target"`
 
-	AllowPrivate *bool   `yaml:"allow_private"`
-	ConnectPorts []int   `yaml:"connect_ports"`
-	Policy       *string `yaml:"policy"`
-	Clients      *string `yaml:"clients"`
-	Quotas       *string `yaml:"quotas"`
+	AllowPrivate *bool `yaml:"allow_private"`
+	ConnectPorts []int `yaml:"connect_ports"`
+	UpstreamTLS  *struct {
+		CA   *string `yaml:"ca"`
+		Cert *string `yaml:"cert"`
+		Key  *string `yaml:"key"`
+	} `yaml:"upstream_tls"`
+	Policy  *string `yaml:"policy"`
+	Clients *string `yaml:"clients"`
+	Quotas  *string `yaml:"quotas"`
 }
 
 // LoadFile reads and fully validates a configuration file.
@@ -176,6 +190,12 @@ func (f *File) validate() error {
 		return fmt.Errorf("auth: set password or password_file, not both")
 	}
 
+	if u := f.upstreamTLS(); !u.Empty() {
+		if err := u.Validate(); err != nil {
+			return fmt.Errorf("upstream_tls: %w", err)
+		}
+	}
+
 	names := map[string]bool{"http": true, "https": true, "admin": true}
 	for i, l := range f.Listeners {
 		where := fmt.Sprintf("listeners[%d]", i)
@@ -218,8 +238,51 @@ func (f *File) validate() error {
 				return fmt.Errorf("%s: quotas: %w", where, err)
 			}
 		}
+		if u := listenerUpstreamTLS(l); !u.Empty() {
+			if err := u.Validate(); err != nil {
+				return fmt.Errorf("%s: upstream_tls: %w", where, err)
+			}
+		}
 	}
 	return nil
+}
+
+// upstreamTLS reads the top-level outbound TLS material.
+func (f *File) upstreamTLS() UpstreamTLS {
+	var out UpstreamTLS
+	if f == nil || f.UpstreamTLS == nil {
+		return out
+	}
+	if f.UpstreamTLS.CA != nil {
+		out.CAFile = *f.UpstreamTLS.CA
+	}
+	if f.UpstreamTLS.Cert != nil {
+		out.CertFile = *f.UpstreamTLS.Cert
+	}
+	if f.UpstreamTLS.Key != nil {
+		out.KeyFile = *f.UpstreamTLS.Key
+	}
+	return out
+}
+
+// UpstreamTLSConfig returns the top-level outbound TLS material.
+func (f *File) UpstreamTLSConfig() UpstreamTLS { return f.upstreamTLS() }
+
+func listenerUpstreamTLS(l ListenerFile) UpstreamTLS {
+	var out UpstreamTLS
+	if l.UpstreamTLS == nil {
+		return out
+	}
+	if l.UpstreamTLS.CA != nil {
+		out.CAFile = *l.UpstreamTLS.CA
+	}
+	if l.UpstreamTLS.Cert != nil {
+		out.CertFile = *l.UpstreamTLS.Cert
+	}
+	if l.UpstreamTLS.Key != nil {
+		out.KeyFile = *l.UpstreamTLS.Key
+	}
+	return out
 }
 
 // BuildListeners resolves the file's listener entries against the global
@@ -247,6 +310,7 @@ func (f *File) BuildListeners(cfg *Config, defaultAllowPrivate bool, defaultPort
 		if len(lf.ConnectPorts) > 0 {
 			l.ConnectPorts = lf.ConnectPorts
 		}
+		l.UpstreamTLS = listenerUpstreamTLS(lf)
 		if lf.Policy != nil {
 			if err := l.SetPolicyRules(*lf.Policy); err != nil {
 				return nil, err

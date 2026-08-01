@@ -33,6 +33,10 @@ type Listener struct {
 	AllowPrivate bool
 	ConnectPorts []int
 
+	// UpstreamTLS is this listener's outbound TLS material. An empty value
+	// means the global one applies.
+	UpstreamTLS UpstreamTLS
+
 	// global supplies anything this listener does not override.
 	global *Config
 

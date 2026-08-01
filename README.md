@@ -57,6 +57,8 @@ go build -o proxy
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
 - `-admin-cert` / `-admin-key` – TLS material for the admin listener. `PROXY_ADMIN_CERT_FILE`, `PROXY_ADMIN_KEY_FILE`.
+- `-upstream-ca` – Additional CA bundle trusted for upstream TLS, added to the system roots. `PROXY_UPSTREAM_CA`.
+- `-upstream-cert` / `-upstream-key` – Client certificate presented to upstreams that ask for one. `PROXY_UPSTREAM_CERT`, `PROXY_UPSTREAM_KEY`.
 - `-config` – YAML configuration file. SIGHUP re-reads it. See below. `PROXY_CONFIG`.
 - `-healthcheck` – Probe the local health endpoint and exit 0 or 1, instead of starting the proxy. Used by the container `HEALTHCHECK`.
 
@@ -492,6 +494,63 @@ reach a span. The only headers read are the propagation ones — `Authorization`
 Spans are flushed on shutdown. A batching exporter holds them in memory, so
 without that the last seconds of traces are lost on every restart — exactly the
 window around a deployment that anyone wants to see.
+
+## Upstream TLS
+
+Reaching an internal service behind a private PKI, or one that demands a client
+certificate:
+
+```sh
+./proxy -upstream-ca /etc/pki/internal-ca.pem         -upstream-cert /etc/pki/proxy.crt         -upstream-key /etc/pki/proxy.key
+```
+
+or per listener, so an internal interface can carry a client certificate the
+external one does not:
+
+```yaml
+listeners:
+  - name: internal
+    address: "10.0.0.5:8080"
+    upstream_tls:
+      ca: /etc/pki/internal-ca.pem
+      cert: /etc/pki/proxy.crt
+      key: /etc/pki/proxy.key
+```
+
+These are distinct from `-cert`/`-key`, which are what the proxy presents to its
+*own* clients. Conflating the two is easy and the consequences are quiet: a
+server certificate offered as a client certificate is simply not accepted, and
+the failure looks like an upstream problem.
+
+**The CA bundle extends the system roots; it does not replace them.** Trusting
+the public internet *and* an internal PKI is almost always what is meant, and
+replacing would silently break every public destination the moment somebody
+configured an internal one.
+
+**Everything is loaded at startup.** A bundle that does not parse, a certificate
+that does not match its key, a file that cannot be read — all are startup
+errors:
+
+```
+upstream TLS: upstream CA bundle bad-ca.pem contains no usable certificates
+upstream TLS: upstream cert and key must be given together
+```
+
+Deferring to the first request means the failure arrives as a `502` on real
+traffic at a moment nobody chose, looking like an upstream fault rather than a
+mistake in a file.
+
+**There is no way to disable verification, deliberately.** The pressure for such
+a flag comes from exactly the situation `-upstream-ca` solves — a private PKI
+with no way to trust it — and with that solved, a skip-verify flag would be a
+permanent, silent downgrade for a problem that no longer exists. On a forward
+proxy it would also be indiscriminate: verification off for *every* destination
+at once, not just the internal one somebody was trying to reach.
+
+Forward mode does its own TLS only for absolute-form `https://` requests;
+`CONNECT` tunnels are opaque, and the client inside them does its own handshake
+against its own trust store. This material applies to the connections the proxy
+itself makes.
 
 ## Audit trail
 
