@@ -322,6 +322,11 @@ func (s *Store) Load(cfg *Config) error {
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='proxy_id'`).Scan(&val); err == nil {
 		cfg.SetProxyID(val)
 	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='client_rules'`).Scan(&val); err == nil {
+		if err := cfg.SetClientRules(val); err != nil {
+			s.warn("stored client rules are invalid and were ignored: %v", err)
+		}
+	}
 	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='policy_rules'`).Scan(&val); err == nil {
 		if err := cfg.SetPolicyRules(val); err != nil {
 			// Refusing to start over a stored rule set would strand the proxy
@@ -392,6 +397,7 @@ func (s *Store) Save(cfg *Config) error {
 		{"proxy_name", proxyName},
 		{"proxy_id", proxyID},
 		{"policy_rules", cfg.PolicyRulesText()},
+		{"client_rules", cfg.ClientRulesText()},
 	}
 
 	if cfg.SecretKey != "" {

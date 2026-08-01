@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -368,5 +369,68 @@ func TestMetricsPublicBypassesAuth(t *testing.T) {
 	public.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/ui/general", nil))
 	if rec3.Code != http.StatusUnauthorized {
 		t.Errorf("exemption leaked: got %d", rec3.Code)
+	}
+}
+
+// Client access governs proxying. It must not lock an operator out of the
+// admin surface — the controls that fix a bad rule are behind it.
+func TestClientACLGatesProxyingNotAdmin(t *testing.T) {
+	var asked []string
+	r := &Router{
+		Proxy: okHandler("PROXIED"),
+		UI:    okHandler("ADMIN-UI"),
+		ClientAllowed: func(ip string) (bool, string) {
+			asked = append(asked, ip)
+			return ip != "203.0.113.9", "deny 203.0.113.9"
+		},
+	}
+
+	blocked := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	blocked.RemoteAddr = "203.0.113.9:5000"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, blocked)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("denied client: got %d, want 403", rec.Code)
+	}
+
+	allowed := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	allowed.RemoteAddr = "10.0.0.5:5000"
+	rec2 := httptest.NewRecorder()
+	r.ServeHTTP(rec2, allowed)
+	if rec2.Body.String() != "PROXIED" {
+		t.Errorf("permitted client: got %q", rec2.Body.String())
+	}
+
+	// The same denied address reaching the admin surface is an operator, not a
+	// proxy client, and must still get through.
+	admin := httptest.NewRequest(http.MethodGet, "/ui/general", nil)
+	admin.RemoteAddr = "203.0.113.9:5000"
+	rec3 := httptest.NewRecorder()
+	r.ServeHTTP(rec3, admin)
+	if rec3.Body.String() != "ADMIN-UI" {
+		t.Errorf("admin access from a denied client: got %q", rec3.Body.String())
+	}
+
+	// The check is asked about the address without its ephemeral port.
+	for _, ip := range asked {
+		if strings.Contains(ip, ":") {
+			t.Errorf("ClientAllowed asked about %q, want a bare address", ip)
+		}
+	}
+}
+
+// CONNECT is proxying too, so the client gate applies to it.
+func TestClientACLAppliesToConnect(t *testing.T) {
+	r := &Router{
+		Proxy:         okHandler("PROXIED"),
+		ClientAllowed: func(string) (bool, string) { return false, "default deny" },
+	}
+	req := httptest.NewRequest(http.MethodConnect, "http://example.com:443", nil)
+	req.Host = "example.com:443"
+	req.RemoteAddr = "203.0.113.9:5000"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("got %d, want 403", rec.Code)
 	}
 }

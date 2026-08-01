@@ -47,6 +47,12 @@ type Router struct {
 	// scraper that sends no credentials keeps working when auth is enabled.
 	MetricsPublic bool
 
+	// ClientAllowed reports whether a source address may use the proxy at all.
+	// Consulted after authentication and before anything is forwarded, so the
+	// order is: who are you, may you use this proxy, may you go there. Nil
+	// admits every client.
+	ClientAllowed func(ip string) (bool, string)
+
 	// Logger and AuthFailures are optional.
 	Logger       *log.Logger
 	AuthFailures prometheus.Counter
@@ -85,6 +91,21 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if !(metricsRequest && r.MetricsPublic) {
 		if ok, retryAfter := r.authOK(req); !ok {
 			r.denyAuth(w, req, proxied, retryAfter)
+			return
+		}
+	}
+
+	// Client access is about proxying, not about the admin surface: an operator
+	// reaching the UI from a workstation is not a proxy client, and locking
+	// them out of the controls that fix the rules would be its own trap.
+	if proxied && r.ClientAllowed != nil {
+		source := hostOnly(req.RemoteAddr)
+		if ok, rule := r.ClientAllowed(source); !ok {
+			if r.Logger != nil {
+				r.Logger.Warn("Refused client",
+					log.String("source", source), log.String("rule", rule))
+			}
+			http.Error(w, "Client not permitted", http.StatusForbidden)
 			return
 		}
 	}

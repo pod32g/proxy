@@ -538,13 +538,13 @@ func TestNonUpgradeRequestsStillStripped(t *testing.T) {
 	}
 }
 
-func rules(t *testing.T, text string) func() *policy.RuleSet {
+func rules(t *testing.T, text string) func(string) *policy.RuleSet {
 	t.Helper()
 	set, err := policy.Parse(text)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return func() *policy.RuleSet { return set }
+	return func(string) *policy.RuleSet { return set }
 }
 
 // The ordered list must be honoured end to end, including the case that
@@ -643,5 +643,50 @@ func TestNoRulesLeavesBehaviourUnchanged(t *testing.T) {
 	strict.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("loopback should still be refused: got %d", rec.Code)
+	}
+}
+
+// Per-client destination rules must reach the dialer, which is the only place
+// the resolved address is known.
+func TestPerClientDestinationRules(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("REACHED"))
+	}))
+	defer origin.Close()
+
+	permissive, err := policy.Parse("allow all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restrictive, err := policy.Parse("deny all")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, Policy{
+		AllowPrivate: true,
+		Rules: func(client string) *policy.RuleSet {
+			if client == "203.0.113.9" {
+				return restrictive
+			}
+			return permissive
+		},
+	})
+
+	for _, tc := range []struct {
+		client   string
+		wantCode int
+	}{
+		{"203.0.113.9", http.StatusForbidden},
+		{"10.0.0.5", http.StatusOK},
+	} {
+		req := httptest.NewRequest(http.MethodGet, origin.URL+"/", nil)
+		req.RequestURI = ""
+		req.RemoteAddr = tc.client + ":40000"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != tc.wantCode {
+			t.Errorf("client %s: got %d, want %d", tc.client, rec.Code, tc.wantCode)
+		}
 	}
 }

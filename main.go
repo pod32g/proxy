@@ -144,6 +144,11 @@ func main() {
 		"destination rule, first match wins (e.g. \"allow domain *.example.com\", \"deny cidr 10.0.0.0/8\", \"deny all\"); repeatable")
 	policyFile := flag.String("policy-file", env.get("PROXY_POLICY_FILE", ""),
 		"file of destination rules, one per line; # comments allowed")
+	var clientRules policyFlags
+	flag.Var(&clientRules, "client-rule",
+		"client access rule (e.g. \"allow 10.0.0.0/8\", \"deny 10.1.2.3\", \"default deny\"); repeatable, longest prefix wins")
+	clientFile := flag.String("client-file", env.get("PROXY_CLIENT_FILE", ""),
+		"file of client access rules, one per line")
 	connectPorts := flag.String("connect-ports", env.get("PROXY_CONNECT_PORTS", "443"),
 		"comma-separated ports CONNECT may tunnel to")
 	healthPath := flag.String("health-path", env.get("PROXY_HEALTH_PATH", server.DefaultHealthPath),
@@ -235,12 +240,26 @@ func main() {
 		setFlagsExtra["policy-rule"] = true
 	}
 
+	if *clientFile != "" {
+		data, err := os.ReadFile(*clientFile)
+		if err != nil {
+			fatalf("-client-file: %v", err)
+		}
+		clientRules = append(clientRules, strings.Split(string(data), "\n")...)
+	}
+	if len(clientRules) > 0 {
+		if err := cfg.SetClientRules(strings.Join(clientRules, "\n")); err != nil {
+			fatalf("invalid client rules: %v", err)
+		}
+		setFlagsExtra["client-rule"] = true
+	}
+
 	pol := proxy.Policy{
 		AllowPrivate: *allowPrivate,
 		ConnectPorts: ports,
 		// Read per request so rules changed at runtime take effect without a
 		// restart, the same way credentials do.
-		Rules: cfg.PolicyRuleSet,
+		Rules: cfg.DestinationRulesFor,
 	}
 
 	cfg.Headers = headers

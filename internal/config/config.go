@@ -40,6 +40,11 @@ type Config struct {
 	policyText  string
 	policyRules *policy.RuleSet
 
+	// Client access table: who may use the proxy, and optionally a
+	// destination rule set scoped to them.
+	clientText  string
+	clientRules *policy.ClientSet
+
 	mu sync.RWMutex
 }
 
@@ -314,4 +319,57 @@ func (c *Config) PolicyRulesText() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.policyText
+}
+
+// SetClientRules parses and installs the client access table.
+func (c *Config) SetClientRules(text string) error {
+	set, err := policy.ParseClients(text)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clientText = text
+	c.clientRules = set
+	return nil
+}
+
+// ClientRuleSet returns the active client table.
+func (c *Config) ClientRuleSet() *policy.ClientSet {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clientRules
+}
+
+// ClientRulesText returns the client table as written.
+func (c *Config) ClientRulesText() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clientText
+}
+
+// ClientAllowed reports whether an address may use the proxy, naming the rule
+// responsible so a refusal can say why.
+func (c *Config) ClientAllowed(ip string) (bool, string) {
+	set := c.ClientRuleSet()
+	decision, rule := set.Match(ip)
+	if decision != policy.Deny {
+		return true, ""
+	}
+	if rule != nil {
+		return false, rule.String()
+	}
+	return false, "default deny"
+}
+
+// DestinationRulesFor returns the destination rules in force for a client: the
+// client's own set when it has one, otherwise the global set.
+func (c *Config) DestinationRulesFor(clientIP string) *policy.RuleSet {
+	c.mu.RLock()
+	clients, global := c.clientRules, c.policyRules
+	c.mu.RUnlock()
+	if clients == nil {
+		return global
+	}
+	return clients.DestinationsFor(clientIP, global)
 }

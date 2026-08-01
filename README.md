@@ -42,6 +42,8 @@ go build -o proxy
 - `-connect-ports` – Comma-separated ports `CONNECT` may tunnel to. Defaults to `443` or `PROXY_CONNECT_PORTS`.
 - `-policy-rule` – Destination rule; repeatable, first match wins. See below.
 - `-policy-file` – File of destination rules, one per line. Can be set with `PROXY_POLICY_FILE`.
+- `-client-rule` – Client access rule; repeatable, longest prefix wins. See below.
+- `-client-file` – File of client access rules. Can be set with `PROXY_CLIENT_FILE`.
 - `-health-path` – Unauthenticated liveness path. Defaults to `/healthz` or `PROXY_HEALTH_PATH`; empty disables it.
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
@@ -159,6 +161,42 @@ resolves into 10/8.
 
 An explicit `allow` overrides the private-address default, so naming an internal
 range in the rules is enough — `-allow-private` is not also required.
+
+## Client access
+
+Who may use the proxy at all, as a table of addresses:
+
+```
+# Our own networks, and one host that must not have access.
+allow   10.0.0.0/8
+deny    10.1.2.3
+default deny
+```
+
+`default allow` makes the table a denylist; `default deny` makes it an
+allowlist. With no table configured, every client may connect.
+
+**The most specific prefix wins, not the first match** — the opposite of
+destination rules, and deliberate. Destination rules are a policy written in
+priority order; a client table describes a network, where the most specific
+statement about an address should govern. `allow 10.0.0.0/8` with
+`deny 10.1.2.3` denies that host whichever order they are written in.
+
+A client can carry its own destination rules, which replace the global ones for
+that client:
+
+```
+allow 10.0.0.0/8 { allow domain example.com; deny all }
+allow 192.168.0.0/16
+default deny
+```
+
+Client rules gate **proxying only**. The admin surface stays reachable from a
+denied address deliberately: the controls that fix a bad rule are behind it, and
+locking an operator out with their own table would be its own trap.
+
+A source address is spoofable in ways a credential is not, so this is a
+complement to `-auth` rather than a substitute for it.
 
 ## WebSocket and protocol upgrades
 

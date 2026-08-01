@@ -33,19 +33,24 @@ type Policy struct {
 	// arbitrary traffic through this host's address.
 	ConnectPorts []int
 
-	// Rules is an ordered allow/deny list applied to the destination. Nil means
-	// no opinion, leaving AllowPrivate as the only constraint.
-	Rules func() *policy.RuleSet
+	// Rules is an ordered allow/deny list applied to the destination, resolved
+	// per client so a client-specific list can replace the global one. Nil
+	// means no opinion, leaving AllowPrivate as the only constraint.
+	Rules func(clientIP string) *policy.RuleSet
 }
 
-// ruleSet returns the current rules. It is a function so the set can be
-// replaced at runtime without rebuilding the handler.
-func (p Policy) ruleSet() *policy.RuleSet {
+// ruleSet returns the rules in force for a client. It is a function so the set
+// can be replaced at runtime without rebuilding the handler.
+func (p Policy) ruleSet(clientIP string) *policy.RuleSet {
 	if p.Rules == nil {
 		return nil
 	}
-	return p.Rules()
+	return p.Rules(clientIP)
 }
+
+// clientKey carries the requesting client's address to the dialer, which needs
+// it to pick the right destination rules.
+type clientKey struct{}
 
 // hostKey carries the requested hostname to ControlContext, which otherwise
 // sees only the resolved address. Both facts are needed at once: evaluating
@@ -131,7 +136,8 @@ func (p Policy) dialer() *net.Dialer {
 			if requested == "" {
 				requested = host
 			}
-			if decision, rule := p.ruleSet().Match(requested, ip); decision != policy.Undecided {
+			client, _ := ctx.Value(clientKey{}).(string)
+			if decision, rule := p.ruleSet(client).Match(requested, ip); decision != policy.Undecided {
 				if decision == policy.Deny {
 					return &errDenied{fmt.Sprintf("destination %s is not permitted by policy (%s)", requested, rule)}
 				}
@@ -155,11 +161,18 @@ func (p Policy) dialContext(d *net.Dialer) func(context.Context, string, string)
 		if err != nil {
 			host = addr
 		}
-		if decision, rule := p.ruleSet().Match(host, nil); decision == policy.Deny {
+		client, _ := ctx.Value(clientKey{}).(string)
+		if decision, rule := p.ruleSet(client).Match(host, nil); decision == policy.Deny {
 			return nil, &errDenied{fmt.Sprintf("destination %s is not permitted by policy (%s)", host, rule)}
 		}
 		return d.DialContext(context.WithValue(ctx, hostKey{}, host), network, addr)
 	}
+}
+
+// withClient tags a request context with the client address so the dialer can
+// resolve that client's rules.
+func withClient(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), clientKey{}, clientIP(r.RemoteAddr)))
 }
 
 // clientIP strips the ephemeral source port from a RemoteAddr. Header rules are
@@ -190,7 +203,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
-			handleConnect(w, r, logger, pol, dialer)
+			handleConnect(w, withClient(r), logger, pol, dialer)
 			return
 		}
 		logger.Debugf("Forward proxy request %s %s", r.Method, sanitizedURL(r.URL))
@@ -207,7 +220,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			handleUpgrade(w, r, transport, headers, logger, proto)
 			return
 		}
-		outReq := r.Clone(r.Context())
+		outReq := r.Clone(context.WithValue(r.Context(), clientKey{}, clientIP(r.RemoteAddr)))
 		outReq.RequestURI = ""
 		// r.Clone copies every header the client sent to the *proxy*, including
 		// the credentials it used to authenticate to us. Strip the per-hop set
@@ -279,7 +292,7 @@ func handleUpgrade(
 ) {
 	logger.Debugf("Upgrade request %s to %s", sanitizedURL(r.URL), proto)
 
-	outReq := r.Clone(r.Context())
+	outReq := r.Clone(context.WithValue(r.Context(), clientKey{}, clientIP(r.RemoteAddr)))
 	outReq.RequestURI = ""
 	// Strip the per-hop set as usual, then put back exactly the two headers
 	// that carry this handshake. Re-issuing them is the deliberate act RFC 7230
