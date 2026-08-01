@@ -379,7 +379,8 @@ func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 			h.cfg.SetClientHeader(client, name, value)
 		}
 		if h.logger != nil {
-			h.logger.Info("Set header", log.String("name", name), log.String("value", value))
+			h.logger.Info("Set header", log.String("name", name),
+				log.String("value", config.RedactHeaderValue(name, value)))
 		}
 		if h.store != nil {
 			h.store.Save(h.cfg)

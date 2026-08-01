@@ -35,6 +35,10 @@ spec:
           value: "http://example-service:9000"
         - name: PROXY_DB_PATH
           value: "/var/lib/proxy/config.db"
+        # Container stdout is collected by a log pipeline here, not read by a
+        # person, so emit records a collector can parse rather than prose.
+        - name: PROXY_LOG_FORMAT
+          value: "json"
         # This Deployment runs in reverse mode, where every request is
         # origin-form — so the default /healthz would shadow the backend's own
         # health endpoint and the probes would report the proxy alive while the

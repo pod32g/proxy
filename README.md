@@ -33,6 +33,7 @@ go build -o proxy
 - `-header` – Custom header to add to upstream requests. Can be repeated.
 - `-mode` – Proxy mode: `forward` or `reverse`. Defaults to `forward` or `PROXY_MODE`.
 - `-log-level` – Logging level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`). Defaults to `INFO` or `PROXY_LOG_LEVEL`.
+- `-log-format` – Output encoding: `text`, `json` or `console`. Defaults to `text` or `PROXY_LOG_FORMAT`.
 - `-db` – Path to the SQLite database used to persist runtime settings. Defaults to `config.db` or `PROXY_DB_PATH`.
 - `-stats` – Enable analysis of top visited websites. Can be set with `PROXY_STATS_ENABLED`.
 - `-allow-private` – Permit proxying to loopback, private and link-local addresses. **Off by default.** Can be set with `PROXY_ALLOW_PRIVATE`.
@@ -41,8 +42,8 @@ go build -o proxy
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-healthcheck` – Probe the local health endpoint and exit 0 or 1, instead of starting the proxy. Used by the container `HEALTHCHECK`.
 
-`-mode` and `-log-level` are validated at startup: an unrecognised value is an
-error rather than a silent fall back to `reverse` or `INFO`.
+`-mode`, `-log-level` and `-log-format` are validated at startup: an unrecognised
+value is an error rather than a silent fall back to `reverse`, `INFO` or `text`.
 
 ### Configuration precedence
 
@@ -93,6 +94,43 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
   increments `proxy_auth_failures_total`.
 - **Proxied requests are challenged with `407`** and `Proxy-Authenticate`, as
   RFC 7235 requires; requests addressed to the proxy itself get `401`.
+
+## Logging
+
+`-log-format json` emits one JSON object per line, for shipping to a log
+aggregator:
+
+```json
+{"timestamp":"2026-08-01T01:06:42-06:00","level":"INFO","message":"Starting HTTP proxy","addr":"127.0.0.1:8080"}
+{"timestamp":"2026-08-01T01:06:43-06:00","level":"WARN","message":"Rejected credentials","source":"127.0.0.1","failures_in_window":1}
+```
+
+Every record carries `timestamp`, `level` and `message`. Structured fields are
+promoted to top-level keys so they can be filtered on directly. The field names
+below are **stable** — treat renaming one as a breaking change:
+
+| Field | Where | Meaning |
+| --- | --- | --- |
+| `addr` | startup | Listen address of an HTTP or HTTPS listener |
+| `signal` | shutdown | Signal that initiated the shutdown |
+| `source` | auth | Client IP whose credentials were rejected |
+| `failures_in_window` | auth | Failed attempts from that source in the current minute |
+| `origin` | api | `Origin` header of a rejected cross-origin request |
+| `path` | ui | Request path of a rejected CSRF submission |
+| `name`, `value` | api, ui | Header being set or deleted |
+| `level` | api, ui | Log level being applied at runtime |
+| `enabled` | api, ui | New state of a toggled setting |
+| `id` | ui | Proxy identifier being set |
+
+`console` is `text` with colour and alignment, intended for a terminal rather
+than a file.
+
+**Secrets are kept out of the log.** Header values are redacted when the header
+name suggests a credential — `Authorization`, `Cookie`, anything containing
+`token`, `secret`, `password`, `api-key`, `credential` or `session` — because a
+custom header is exactly where an upstream API key tends to live. Fields named
+after credentials are redacted independently of that, so a future call site
+cannot leak one by accident. URLs are logged without their query strings.
 
 ## Health checks
 

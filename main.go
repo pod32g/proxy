@@ -147,6 +147,9 @@ func main() {
 		"serve /metrics without authentication so scrapers that send no credentials keep working")
 	healthcheck := flag.Bool("healthcheck", false,
 		"probe the local health endpoint and exit 0 or 1 (used by the container HEALTHCHECK)")
+	logFormatStr := env.get("PROXY_LOG_FORMAT", "text")
+	flag.StringVar(&logFormatStr, "log-format", logFormatStr,
+		"Log output format ("+strings.Join(config.LogFormats, ", ")+")")
 	logLevelStr := env.get("PROXY_LOG_LEVEL", "INFO")
 	flag.StringVar(&logLevelStr, "log-level", logLevelStr, "Log level ("+strings.Join(config.LogLevels, ", ")+")")
 	var headers headerFlags
@@ -167,6 +170,10 @@ func main() {
 	logLevel, err := config.ParseLogLevelStrict(logLevelStr)
 	if err != nil {
 		fatalf("invalid -log-level: %v", err)
+	}
+	logFormat, err := config.ParseLogFormat(logFormatStr)
+	if err != nil {
+		fatalf("invalid -log-format: %v", err)
 	}
 	var target *url.URL
 	if cfg.Mode == "reverse" {
@@ -209,7 +216,7 @@ func main() {
 		reapply(cfg, cli, set)
 	}
 
-	logger, err := log.New(log.WithOutput(os.Stdout), log.WithLevel(cfg.GetLogLevel()))
+	logger, err := config.NewLogger(os.Stdout, cfg.GetLogLevel(), logFormat)
 	if err != nil {
 		fatalf("failed to build logger: %v", err)
 	}

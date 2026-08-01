@@ -151,7 +151,8 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 				h.cfg.SetClientHeader(req.Client, req.Name, req.Value)
 			}
 			if h.logger != nil {
-				h.logger.Info("Set header", log.String("name", req.Name), log.String("value", req.Value))
+				h.logger.Info("Set header", log.String("name", req.Name),
+					log.String("value", config.RedactHeaderValue(req.Name, req.Value)))
 			}
 			if h.store != nil {
 				h.store.Save(h.cfg)
