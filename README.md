@@ -104,6 +104,20 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
 - **Proxied requests are challenged with `407`** and `Proxy-Authenticate`, as
   RFC 7235 requires; requests addressed to the proxy itself get `401`.
 
+## WebSocket and protocol upgrades
+
+Forward mode proxies HTTP upgrades, so `ws://` works through the proxy. The
+handshake is relayed with the origin's negotiated headers intact, and traffic
+then flows in both directions over the upgraded connection.
+
+`wss://` has always worked and takes a different path — it goes through
+`CONNECT`, so the proxy never sees the handshake at all. Note that `CONNECT` is
+restricted to `-connect-ports` (443 by default), which is the setting that
+governs secure WebSockets.
+
+Upgrades are recorded in `proxy_http_requests_total` with `code="101"`, so they
+are distinguishable from ordinary traffic.
+
 ## Logging
 
 `-log-format json` emits one JSON object per line, for shipping to a log

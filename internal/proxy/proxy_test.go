@@ -363,3 +363,176 @@ func TestPolicyBlocksPrivateConnectDestination(t *testing.T) {
 		t.Fatalf("got %q, want 403 for a loopback CONNECT target", strings.TrimSpace(line))
 	}
 }
+
+// A ws:// request through forward mode must complete its handshake and pass
+// data. Upgrade is hop-by-hop, so before this the strip removed the handshake
+// and the client got an ordinary response instead of a protocol switch.
+func TestForwardProxiesUpgrade(t *testing.T) {
+	// Origin that accepts the upgrade and then echoes, uppercased, so the test
+	// can tell real bidirectional traffic from a replayed buffer.
+	origin, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer origin.Close()
+	go func() {
+		c, err := origin.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		var sawUpgrade, sawKey bool
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil || strings.TrimSpace(line) == "" {
+				break
+			}
+			lower := strings.ToLower(line)
+			if strings.HasPrefix(lower, "upgrade:") && strings.Contains(lower, "websocket") {
+				sawUpgrade = true
+			}
+			if strings.HasPrefix(lower, "sec-websocket-key:") {
+				sawKey = true
+			}
+		}
+		if !sawUpgrade || !sawKey {
+			io.WriteString(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+			return
+		}
+		io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\nConnection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: test-accept-value\r\n\r\n")
+		for {
+			line, err := bufio.NewReader(c).ReadString('\n')
+			if err != nil {
+				return
+			}
+			io.WriteString(c, strings.ToUpper(line))
+		}
+	}()
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, testPolicy())
+	proxySrv := httptest.NewServer(h)
+	defer proxySrv.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(proxySrv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "GET http://%s/chat HTTP/1.1\r\nHost: %s\r\n"+
+		"Connection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		origin.Addr(), origin.Addr())
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	br := bufio.NewReader(conn)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("no response: %v", err)
+	}
+	if !strings.Contains(status, "101") {
+		t.Fatalf("handshake not proxied: %q", strings.TrimSpace(status))
+	}
+	// The origin's negotiated headers must reach the client, or no real
+	// WebSocket client would accept the connection.
+	var sawAccept bool
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+		if strings.Contains(strings.ToLower(line), "sec-websocket-accept: test-accept-value") {
+			sawAccept = true
+		}
+	}
+	if !sawAccept {
+		t.Error("origin's Sec-WebSocket-Accept did not reach the client")
+	}
+
+	// Traffic after the switch must flow in both directions.
+	if _, err := io.WriteString(conn, "hello\n"); err != nil {
+		t.Fatalf("write after upgrade: %v", err)
+	}
+	echoed, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read after upgrade: %v", err)
+	}
+	if strings.TrimSpace(echoed) != "HELLO" {
+		t.Fatalf("got %q, want %q", strings.TrimSpace(echoed), "HELLO")
+	}
+}
+
+// An origin that declines the upgrade gets relayed as an ordinary response
+// rather than hijacked.
+func TestForwardUpgradeDeclinedByOrigin(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no upgrades here", http.StatusUpgradeRequired)
+	}))
+	defer origin.Close()
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, testPolicy())
+	req := httptest.NewRequest(http.MethodGet, origin.URL+"/", nil)
+	req.RequestURI = ""
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUpgradeRequired {
+		t.Fatalf("got %d, want the origin's %d", rec.Code, http.StatusUpgradeRequired)
+	}
+	if !strings.Contains(rec.Body.String(), "no upgrades here") {
+		t.Errorf("origin body lost: %q", rec.Body.String())
+	}
+}
+
+func TestRequestedUpgrade(t *testing.T) {
+	for _, tc := range []struct{ conn, upgrade, want string }{
+		{"Upgrade", "websocket", "websocket"},
+		{"keep-alive, Upgrade", "websocket", "websocket"}, // Connection is a list
+		{"upgrade", "h2c", "h2c"},                         // token match is case-insensitive
+		{"keep-alive", "websocket", ""},                   // not requested
+		{"", "websocket", ""},                             // Upgrade alone is not enough
+		{"Upgrade", "", ""},
+	} {
+		h := http.Header{}
+		if tc.conn != "" {
+			h.Set("Connection", tc.conn)
+		}
+		if tc.upgrade != "" {
+			h.Set("Upgrade", tc.upgrade)
+		}
+		if got := requestedUpgrade(h); got != tc.want {
+			t.Errorf("Connection=%q Upgrade=%q: got %q, want %q", tc.conn, tc.upgrade, got, tc.want)
+		}
+	}
+}
+
+// Ordinary requests must keep stripping hop-by-hop headers exactly as before.
+func TestNonUpgradeRequestsStillStripped(t *testing.T) {
+	var got http.Header
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}))
+	defer origin.Close()
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, testPolicy())
+	req := httptest.NewRequest(http.MethodGet, origin.URL+"/", nil)
+	req.RequestURI = ""
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Upgrade", "websocket") // present but not requested via Connection
+	req.Header.Set("Proxy-Authorization", "Basic x")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	for _, name := range []string{"Connection", "Upgrade", "Proxy-Authorization"} {
+		if v := got.Get(name); v != "" {
+			t.Errorf("origin saw hop-by-hop header %s: %q", name, v)
+		}
+	}
+}

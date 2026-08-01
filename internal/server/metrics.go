@@ -91,6 +91,11 @@ type statusRecorder struct {
 	status int
 }
 
+// SetStatus records a status the handler could not report through WriteHeader.
+// A protocol switch is written directly to a hijacked connection, so without
+// this the exchange would be counted as a 200 like any other.
+func (r *statusRecorder) SetStatus(code int) { r.status = code }
+
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)

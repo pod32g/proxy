@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -135,6 +136,14 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, poli
 			http.Error(w, "Bad request", http.StatusBadRequest)
 			return
 		}
+		// Upgrade is hop-by-hop, so a compliant proxy consumes it and must
+		// re-issue it deliberately to support one. Without this branch the
+		// strip below removes the handshake and a ws:// request comes back as
+		// an ordinary response — quietly, which is the worst part.
+		if proto := requestedUpgrade(r.Header); proto != "" {
+			handleUpgrade(w, r, transport, headers, logger, proto)
+			return
+		}
 		outReq := r.Clone(r.Context())
 		outReq.RequestURI = ""
 		// r.Clone copies every header the client sent to the *proxy*, including
@@ -162,6 +171,131 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, poli
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
 	})
+}
+
+// requestedUpgrade returns the protocol a client is asking to switch to, or ""
+// when the request is an ordinary one.
+func requestedUpgrade(h http.Header) string {
+	if !headerHasToken(h, "Connection", "upgrade") {
+		return ""
+	}
+	return h.Get("Upgrade")
+}
+
+// headerHasToken reports whether a comma-separated header lists a token.
+// Connection carries a list, so a plain equality check would miss
+// "Connection: keep-alive, Upgrade".
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// statusSetter lets a handler report a status it could not write through
+// WriteHeader. A protocol switch is written straight to a hijacked connection,
+// so without this the metrics middleware would record the exchange as a 200.
+type statusSetter interface{ SetStatus(int) }
+
+// handleUpgrade proxies a protocol switch — a WebSocket handshake, in practice.
+//
+// The upstream side needs no raw dialing: Go's transport hands back a 101
+// response whose Body is an io.ReadWriteCloser over the same connection, so the
+// destination policy and dial timeout on the transport still apply.
+func handleUpgrade(
+	w http.ResponseWriter, r *http.Request, transport *http.Transport,
+	headers func(string) map[string]string, logger *log.Logger, proto string,
+) {
+	logger.Debugf("Upgrade request %s to %s", sanitizedURL(r.URL), proto)
+
+	outReq := r.Clone(r.Context())
+	outReq.RequestURI = ""
+	// Strip the per-hop set as usual, then put back exactly the two headers
+	// that carry this handshake. Re-issuing them is the deliberate act RFC 7230
+	// asks for; blanket-forwarding them would not be.
+	removeHopByHop(outReq.Header)
+	outReq.Header.Set("Connection", "Upgrade")
+	outReq.Header.Set("Upgrade", proto)
+	for k, v := range headers(clientIP(r.RemoteAddr)) {
+		outReq.Header.Set(k, v)
+	}
+
+	resp, err := transport.RoundTrip(outReq)
+	if err != nil {
+		logger.Errorf("Upgrade upstream error: %v", err)
+		if strings.Contains(err.Error(), "is not permitted") {
+			http.Error(w, "Destination not permitted", http.StatusForbidden)
+			return
+		}
+		http.Error(w, "Bad gateway", http.StatusBadGateway)
+		return
+	}
+
+	// The origin is entitled to decline. Anything but 101 is an ordinary
+	// response and must be relayed as one rather than hijacked.
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		defer resp.Body.Close()
+		removeHopByHop(resp.Header)
+		copyHeader(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	upstream, ok := resp.Body.(io.ReadWriteCloser)
+	if !ok {
+		resp.Body.Close()
+		logger.Error("Upgrade succeeded upstream but the connection is not writable")
+		http.Error(w, "Bad gateway", http.StatusBadGateway)
+		return
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		upstream.Close()
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, clientBuf, err := hijacker.Hijack()
+	if err != nil {
+		upstream.Close()
+		logger.Errorf("Upgrade hijack error: %v", err)
+		return
+	}
+
+	// Replay the origin's 101 verbatim, headers included: the client needs
+	// Sec-WebSocket-Accept and anything else the origin negotiated.
+	var head bytes.Buffer
+	fmt.Fprintf(&head, "HTTP/1.1 %d %s\r\n", resp.StatusCode, http.StatusText(resp.StatusCode))
+	if err := resp.Header.Write(&head); err != nil {
+		upstream.Close()
+		clientConn.Close()
+		return
+	}
+	head.WriteString("\r\n")
+	if _, err := clientConn.Write(head.Bytes()); err != nil {
+		upstream.Close()
+		clientConn.Close()
+		return
+	}
+	// Anything the client pipelined after its handshake is sitting in the
+	// hijack buffer; it belongs to the upgraded protocol and would be lost.
+	if n := clientBuf.Reader.Buffered(); n > 0 {
+		if pending, err := clientBuf.Reader.Peek(n); err == nil {
+			upstream.Write(pending)
+		}
+	}
+
+	if setter, ok := w.(statusSetter); ok {
+		setter.SetStatus(http.StatusSwitchingProtocols)
+	}
+	logger.Debugf("Upgraded to %s via %s", proto, r.URL.Host)
+
+	go transfer(upstream, clientConn)
+	go transfer(clientConn, upstream)
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, dialer *net.Dialer) {
