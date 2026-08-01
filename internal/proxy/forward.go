@@ -96,6 +96,31 @@ type Observer struct {
 	TunnelClosed func()
 	// Denied records a refusal and which check made it.
 	Denied func(scope string)
+
+	// Trace, when set, brackets the upstream round trip with a span. It is given
+	// the outbound request and returns it, so a tracer can attach both a span
+	// context and its propagation headers, plus a function to end the span.
+	//
+	// A plain function rather than an OpenTelemetry dependency in this package.
+	// That is what keeps tracing genuinely optional: with tracing off the field
+	// is nil and the handler does no tracing work at all, rather than calling
+	// into a no-op implementation and paying for the call. No SDK type appears
+	// on this path in either case.
+	//
+	// host and path are passed already sanitised — the path never carries a
+	// query string, and url.URL keeps userinfo out of Host — so the tracer is
+	// handed exactly the destination and nothing that could be a credential. It
+	// reads no headers.
+	Trace func(out *http.Request, host, path string) (*http.Request, func(status int, err error))
+}
+
+// trace starts a span if tracing is on. Both return values are safe to use when
+// it is off.
+func (o Observer) trace(out *http.Request, host, path string) (*http.Request, func(int, error)) {
+	if o.Trace == nil {
+		return out, func(int, error) {}
+	}
+	return o.Trace(out, host, path)
 }
 
 func (o Observer) upstream(method string, d time.Duration) {
@@ -321,6 +346,13 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// Carried to the origin so the exchange can be followed across the hop.
 		// Set after the operator's headers so a stray -header cannot displace it.
 		setRequestID(outReq)
+
+		// The span covers the round trip, matching the upstream histogram. The
+		// request comes back carrying the span context and whatever propagation
+		// headers the tracer adds, so the origin's own tracing joins this trace
+		// rather than starting a new one.
+		outReq, endSpan := obs.trace(outReq, r.URL.Host, r.URL.EscapedPath())
+
 		// Timed around the round trip alone, which is the origin's contribution
 		// and nothing else. The middleware histogram already covers the total.
 		upstreamStart := time.Now()
@@ -336,13 +368,16 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 					log.String("host", r.URL.Host), log.String("client", clientIP(r.RemoteAddr)),
 					log.String("request_id", reqid.FromContext(r.Context())))
 				obs.denied(deniedScope(err))
+				endSpan(http.StatusForbidden, err)
 				http.Error(w, "Destination not permitted", http.StatusForbidden)
 				return
 			}
 			logger.Errorf("Upstream error: %v", err)
+			endSpan(http.StatusBadGateway, err)
 			http.Error(w, "Bad gateway", http.StatusBadGateway)
 			return
 		}
+		endSpan(resp.StatusCode, nil)
 		defer resp.Body.Close()
 		removeHopByHop(resp.Header)
 		copyHeader(w.Header(), resp.Header)

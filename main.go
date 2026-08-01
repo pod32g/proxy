@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/pod32g/proxy/internal/proxy"
 	"github.com/pod32g/proxy/internal/quota"
 	"github.com/pod32g/proxy/internal/server"
+	"github.com/pod32g/proxy/internal/tracing"
 	"github.com/pod32g/proxy/internal/ui"
 	log "github.com/pod32g/simple-logger"
 	"github.com/prometheus/client_golang/prometheus"
@@ -177,6 +179,12 @@ func main() {
 		"file containing the credential-encryption secret; preferred over -secret, which is visible in ps")
 	healthcheck := flag.Bool("healthcheck", false,
 		"probe the local health endpoint and exit 0 or 1 (used by the container HEALTHCHECK)")
+	otelEndpoint := flag.String("otel-endpoint", env.get("PROXY_OTEL_ENDPOINT", ""),
+		"OTLP/HTTP collector for traces, e.g. localhost:4318; empty disables tracing entirely")
+	otelInsecure := flag.Bool("otel-insecure", env.get("PROXY_OTEL_INSECURE", "") == "true",
+		"send traces over plain HTTP rather than TLS")
+	otelSample := flag.Float64("otel-sample", 1.0,
+		"fraction of traces to record, 0 to 1; a proxy sees every request its clients make")
 	accessLogStr := flag.String("access-log", env.get("PROXY_ACCESS_LOG", "structured"),
 		"access log format ("+strings.Join(server.AccessLogFormats, ", ")+")")
 	accessLogFile := flag.String("access-log-file", env.get("PROXY_ACCESS_LOG_FILE", ""),
@@ -367,6 +375,34 @@ func main() {
 		}
 	}
 
+	// Tracing is off unless an endpoint is given, and "off" means no tracer at
+	// all rather than one that does nothing — the handler skips the work on a
+	// nil check instead of calling into a no-op.
+	tracer, err := tracing.Start(context.Background(), tracing.Config{
+		Endpoint:    *otelEndpoint,
+		Insecure:    *otelInsecure,
+		ServiceName: cfg.ProxyName,
+		SampleRatio: *otelSample,
+	})
+	if err != nil {
+		fatalf("tracing: %v", err)
+	}
+	if tracer != nil {
+		logger.Info("Tracing enabled",
+			log.String("endpoint", *otelEndpoint),
+			log.String("sample", strconv.FormatFloat(*otelSample, 'g', -1, 64)))
+		// A batching exporter holds spans in memory, so without this flush the
+		// last seconds of traces are lost on every restart — exactly the window
+		// around a deployment anyone wants to see.
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), tracing.ShutdownTimeout)
+			defer cancel()
+			if err := tracer.Shutdown(ctx); err != nil {
+				logger.Errorf("Flushing traces: %v", err)
+			}
+		}()
+	}
+
 	metrics, err := server.NewMetrics(prometheus.DefaultRegisterer)
 	if err != nil {
 		logger.Fatalf("Failed to register metrics: %v", err)
@@ -410,6 +446,8 @@ func main() {
 			TunnelOpened: func() { metrics.ActiveTunnels.Inc() },
 			TunnelClosed: func() { metrics.ActiveTunnels.Dec() },
 			Denied:       func(scope string) { metrics.PolicyDecisions.WithLabelValues(scope).Inc() },
+			// nil when tracing is off, which is what makes it free.
+			Trace: tracer.Hook(),
 		})
 		handler = server.StatsMiddleware(h, stats, cfg.StatsEnabledState, func(r *http.Request) string {
 			if r.Method == http.MethodConnect {

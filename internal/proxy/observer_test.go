@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -322,5 +323,99 @@ func TestOperatorHeaderCannotDisplaceTheRequestID(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("origin never received the request")
+	}
+}
+
+// The tracer is handed the destination with the query already gone. This is the
+// seam the "spans carry the destination but not credentials or query strings"
+// criterion depends on, so it is asserted here rather than trusted.
+func TestTraceHookReceivesASanitisedDestination(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer backend.Close()
+
+	type call struct{ host, path string }
+	calls := make(chan call, 1)
+	statuses := make(chan int, 1)
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, testPolicy(),
+		Observer{
+			Trace: func(out *http.Request, host, path string) (*http.Request, func(int, error)) {
+				calls <- call{host, path}
+				// Stand in for traceparent injection.
+				out.Header.Set("X-Traceparent-Probe", "injected")
+				return out, func(status int, err error) { statuses <- status }
+			},
+		})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := proxyClient(t, srv.URL).Get(backend.URL + "/search?token=s3cret&q=hi")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case c := <-calls:
+		if strings.Contains(c.path, "s3cret") || strings.Contains(c.path, "?") {
+			t.Errorf("path = %q, want the query dropped before it reaches a span", c.path)
+		}
+		if c.path != "/search" {
+			t.Errorf("path = %q, want %q", c.path, "/search")
+		}
+		if c.host == "" || strings.Contains(c.host, "@") {
+			t.Errorf("host = %q, want a bare authority", c.host)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the trace hook was never called")
+	}
+
+	select {
+	case status := <-statuses:
+		if status != http.StatusOK {
+			t.Errorf("span ended with status %d, want 200", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the span was never ended")
+	}
+}
+
+// A span must be ended on the failure paths too, or every refused or failed
+// request leaks a span that never closes.
+func TestTraceSpanEndsOnRefusal(t *testing.T) {
+	ended := make(chan int, 1)
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{AllowPrivate: true, Rules: rules(t, "deny all")},
+		Observer{
+			Trace: func(out *http.Request, host, path string) (*http.Request, func(int, error)) {
+				return out, func(status int, err error) { ended <- status }
+			},
+		})
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	select {
+	case status := <-ended:
+		if status != http.StatusForbidden {
+			t.Errorf("span ended with %d, want 403", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a refused request left its span open")
+	}
+}
+
+// "Entirely optional with no cost when disabled": with no hook the handler must
+// do no tracing work at all, not call into a no-op.
+func BenchmarkObserverTraceDisabled(b *testing.B) {
+	var obs Observer
+	req := httptest.NewRequest("GET", "http://example.com/a", nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, end := obs.trace(req, "example.com", "/a")
+		_ = out
+		end(200, nil)
 	}
 }

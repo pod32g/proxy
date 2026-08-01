@@ -50,6 +50,9 @@ go build -o proxy
 - `-access-log-file` – Write access records to this file instead of stdout. Can be set with `PROXY_ACCESS_LOG_FILE`.
 - `-destination-metrics` – Export per-destination request counts. **Off by default**; see Metrics. `PROXY_DESTINATION_METRICS`.
 - `-destination-metrics-top` – How many destinations to report. This is the series count. Defaults to 20.
+- `-otel-endpoint` – OTLP/HTTP collector for traces. Empty disables tracing entirely. `PROXY_OTEL_ENDPOINT`.
+- `-otel-insecure` – Send traces over plain HTTP rather than TLS. `PROXY_OTEL_INSECURE`.
+- `-otel-sample` – Fraction of traces to record, 0 to 1. Defaults to 1.
 - `-health-path` – Unauthenticated liveness path. Defaults to `/healthz` or `PROXY_HEALTH_PATH`; empty disables it.
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
@@ -312,6 +315,43 @@ honouring the caller.
 Generated IDs are 16 random bytes, hex — deliberately the shape of a W3C
 trace-id, so that the request ID and a trace ID can be the same value rather
 than two identifiers somebody has to join.
+
+## Tracing
+
+Off unless you point it at a collector:
+
+```sh
+./proxy -otel-endpoint localhost:4318 -otel-insecure -otel-sample 0.1
+```
+
+OTLP over HTTP. `-otel-sample` is the fraction of traces recorded — a proxy sees
+every request its clients make, so recording all of them is a decision rather
+than a default. Sampling is parent-based, so a client that is already tracing
+keeps its own decision; sampling a child out of a sampled trace produces a gap,
+not a saving.
+
+**Off means off.** With no endpoint there is no tracer at all, not a tracer that
+does nothing: the hook the proxy handler calls is nil and it skips the work
+entirely. Measured at **0 allocations and ~3ns** per request for the disabled
+path. Only one package imports an OpenTelemetry SDK; everything on the request
+path talks to it through a plain function value, so no SDK type appears there in
+either configuration.
+
+**Traces are continued in both directions.** An inbound `traceparent` becomes
+the parent, and a `traceparent` is injected on the way out. Both halves matter:
+without the extract, a client that is already tracing has its trace *fragmented*
+at this hop and the request shows up in the backend twice with nothing joining
+them — which is the exact problem tracing a proxy is supposed to solve.
+
+**Spans carry the destination and nothing else.** Method, host, path and status.
+The path has already had its query string dropped, and `url.URL` keeps userinfo
+out of the host, so a session token or a credential in the request line cannot
+reach a span. The only headers read are the propagation ones — `Authorization`,
+`Proxy-Authorization` and `Cookie` are never touched.
+
+Spans are flushed on shutdown. A batching exporter holds them in memory, so
+without that the last seconds of traces are lost on every restart — exactly the
+window around a deployment that anyone wants to see.
 
 ## Audit trail
 
