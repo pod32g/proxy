@@ -39,6 +39,13 @@ spec:
         # person, so emit records a collector can parse rather than prose.
         - name: PROXY_LOG_FORMAT
           value: "json"
+        # Credentials arrive as mounted files, not as env vars or args: both of
+        # those are readable by any process that can see /proc, and env vars end
+        # up in `kubectl describe pod` output too.
+        - name: PROXY_AUTH_PASS_FILE
+          value: "/etc/proxy/secrets/auth-password"
+        - name: PROXY_SECRET_FILE
+          value: "/etc/proxy/secrets/encryption-key"
         # This Deployment runs in reverse mode, where every request is
         # origin-form — so the default /healthz would shadow the backend's own
         # health endpoint and the probes would report the proxy alive while the
@@ -75,12 +82,22 @@ spec:
         volumeMounts:
         - name: config
           mountPath: /var/lib/proxy
+        - name: secrets
+          mountPath: /etc/proxy/secrets
+          readOnly: true
       volumes:
       # emptyDir keeps the read-only root filesystem workable, but configuration
       # changed at runtime through the UI is lost when the pod is replaced.
       # Swap in a PersistentVolumeClaim to make those changes durable.
       - name: config
         emptyDir: {}
+      # Create with:
+      #   kubectl create secret generic proxy-credentials \
+      #     --from-literal=auth-password=... --from-literal=encryption-key=...
+      - name: secrets
+        secret:
+          secretName: proxy-credentials
+          defaultMode: 0400
 ---
 apiVersion: v1
 kind: Service

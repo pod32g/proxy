@@ -27,7 +27,9 @@ go build -o proxy
 - `-auth` – Enable basic authentication. Can be set with `PROXY_AUTH_ENABLED`.
 - `-auth-user` – Username for basic authentication. Can be set with `PROXY_AUTH_USER`.
 - `-auth-pass` – Password for basic authentication. Can be set with `PROXY_AUTH_PASS`.
-- `-secret` – Encryption key used to protect credentials. Can be set with `PROXY_SECRET_KEY`.
+- `-secret` – Encryption key used to protect credentials. Can be set with `PROXY_SECRET_KEY`. Prefer `-secret-file`.
+- `-auth-pass-file` – File containing the basic-auth password. Can be set with `PROXY_AUTH_PASS_FILE`.
+- `-secret-file` – File containing the encryption secret. Can be set with `PROXY_SECRET_FILE`.
 - `-proxy-name` – Name used to identify this proxy instance. Can be set with `PROXY_NAME`.
 - `-proxy-id` – Identifier for this proxy instance. Can be set with `PROXY_ID`.
 - `-header` – Custom header to add to upstream requests. Can be repeated.
@@ -89,6 +91,13 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
   after DNS, so a hostname pointing at `127.0.0.1` does not get through either.
 - **`CONNECT` is limited to port 443** unless `-connect-ports` says otherwise.
   An unrestricted `CONNECT` is a general-purpose TCP relay.
+- **Supply credentials as files, not flags.** `-auth-pass` and `-secret` end up
+  in `/proc/<pid>/cmdline`, which means `ps` shows them to every local user;
+  the environment equivalents are readable through `/proc/<pid>/environ`. Use
+  `-auth-pass-file` and `-secret-file`, which take the shape Docker and
+  Kubernetes secrets already have. The proxy warns when a credential arrives by
+  flag or environment, and when a secret file is world-readable. A missing or
+  empty secret file is a startup error rather than an empty credential.
 - **Failed logins are logged and throttled.** Ten failures from one address
   within a minute earn a `429` for the rest of that minute, and every failure
   increments `proxy_auth_failures_total`.

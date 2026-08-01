@@ -145,6 +145,10 @@ func main() {
 		"path answered without authentication for liveness probes; empty disables it (in reverse mode it shadows the backend)")
 	metricsPublic := flag.Bool("metrics-public", env.get("PROXY_METRICS_PUBLIC", "") == "true",
 		"serve /metrics without authentication so scrapers that send no credentials keep working")
+	authPassFile := flag.String("auth-pass-file", env.get("PROXY_AUTH_PASS_FILE", ""),
+		"file containing the basic-auth password; preferred over -auth-pass, which is visible in ps")
+	secretFile := flag.String("secret-file", env.get("PROXY_SECRET_FILE", ""),
+		"file containing the credential-encryption secret; preferred over -secret, which is visible in ps")
 	healthcheck := flag.Bool("healthcheck", false,
 		"probe the local health endpoint and exit 0 or 1 (used by the container HEALTHCHECK)")
 	logFormatStr := env.get("PROXY_LOG_FORMAT", "text")
@@ -183,6 +187,22 @@ func main() {
 		}
 	}
 
+	// Secrets from files win over their flag equivalents: an operator who
+	// supplies both has clearly moved to the file, and silently preferring the
+	// flag would leave the credential in ps while looking like it had been fixed.
+	secretsFromFile := map[string]bool{}
+	if *authPassFile != "" {
+		v, err := SecretFromFileOrExit(*authPassFile, "-auth-pass-file")
+		cfg.Password = v
+		secretsFromFile["auth-pass"] = true
+		_ = err
+	}
+	if *secretFile != "" {
+		v, _ := SecretFromFileOrExit(*secretFile, "-secret-file")
+		cfg.SecretKey = v
+		secretsFromFile["secret"] = true
+	}
+
 	ports, err := parsePorts(*connectPorts)
 	if err != nil {
 		fatalf("invalid -connect-ports: %v", err)
@@ -202,6 +222,9 @@ func main() {
 		proxyName:    cfg.ProxyName,
 		proxyID:      cfg.ProxyID,
 		statsEnabled: cfg.StatsEnabled,
+	}
+	for name := range secretsFromFile {
+		setFlags[name] = true
 	}
 	set := overrides{flags: setFlags, envs: env.set}
 
@@ -223,6 +246,14 @@ func main() {
 
 	for _, w := range store.Warnings() {
 		logger.Warn(w)
+	}
+	warnFlagSecrets(logger, set, secretsFromFile)
+	for _, f := range []struct{ path, flag string }{
+		{*authPassFile, "-auth-pass-file"}, {*secretFile, "-secret-file"},
+	} {
+		if f.path != "" && config.FileIsWorldReadable(f.path) {
+			logger.Warnf("%s: %s is world-readable; restrict it to the proxy user (chmod 600)", f.flag, f.path)
+		}
 	}
 	if config.CredentialsAtRisk(cfg) {
 		logger.Warnf("Credentials will be stored unencrypted in %s; set -secret "+
@@ -344,4 +375,31 @@ func runHealthcheck(httpAddr, healthPath string) int {
 		return 1
 	}
 	return 0
+}
+
+// SecretFromFileOrExit reads a secret file or terminates. A credential that
+// cannot be read is not something to continue past: with -auth enabled an empty
+// password is the fail-open case, so this refuses to start instead.
+func SecretFromFileOrExit(path, flagName string) (string, error) {
+	v, err := config.SecretFromFile(path)
+	if err != nil {
+		fatalf("%s: %v", flagName, err)
+	}
+	return v, nil
+}
+
+// warnFlagSecrets points out credentials that arrived by flag or environment
+// rather than from a file. Both are readable by any local user — flags through
+// /proc/<pid>/cmdline and `ps`, the environment through /proc/<pid>/environ.
+func warnFlagSecrets(logger *log.Logger, set overrides, fromFile map[string]bool) {
+	for _, s := range []struct{ flagName, envName, fileFlag string }{
+		{"auth-pass", "PROXY_AUTH_PASS", "-auth-pass-file"},
+		{"secret", "PROXY_SECRET_KEY", "-secret-file"},
+	} {
+		if fromFile[s.flagName] || !set.has(s.flagName, s.envName) {
+			continue
+		}
+		logger.Warnf("credential supplied via -%s/%s is readable by any local user "+
+			"(ps, /proc); prefer %s", s.flagName, s.envName, s.fileFlag)
+	}
 }
