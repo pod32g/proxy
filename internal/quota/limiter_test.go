@@ -232,3 +232,69 @@ func TestConcurrentUseIsSafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// PROXY-72. A quota below one per second used to refuse every request, forever.
+//
+// The default burst was "one second of refill", which for any sub-1/s rate is
+// less than one whole token — and admission needs one. The bucket was capped at
+// that, so it could never fill enough to admit anything. `requests 100/h` did
+// not throttle a client to a hundred an hour; it locked them out permanently,
+// which is the opposite of what it reads as.
+//
+// The rates below straddle the boundary in both units. 60/m worked before only
+// because it lands on exactly 1.0.
+func TestSubSecondRequestQuotasAdmitRequests(t *testing.T) {
+	for _, rule := range []string{
+		"client requests 100/h",
+		"client requests 1/h",
+		"client requests 30/m",
+		"client requests 59/m",
+		"client requests 60/m",
+		"client requests 1/s",
+		"global requests 100/h",
+	} {
+		t.Run(rule, func(t *testing.T) {
+			l, c := newTestLimiter(t, rule)
+			ok, wait, scope := l.Allow("10.0.0.1")
+			if !ok {
+				t.Fatalf("%q refused the first request (wait %v, scope %q)", rule, wait, scope)
+			}
+
+			// And the refusal that follows has to be truthful: the Router puts
+			// this straight into Retry-After, so a wait after which the request
+			// still fails is a client retrying forever.
+			ok, wait, _ = l.Allow("10.0.0.1")
+			if ok {
+				return // a rate fast enough to admit two in the same instant
+			}
+			if wait <= 0 {
+				t.Fatalf("%q refused but reported no wait", rule)
+			}
+			c.add(wait)
+			if ok, wait, scope := l.Allow("10.0.0.1"); !ok {
+				t.Errorf("%q still refused after the wait it asked for (another %v, scope %q)", rule, wait, scope)
+			}
+		})
+	}
+}
+
+// The other direction: the floor must not turn a quota off. A sub-1/s rate
+// still has to throttle, not merely stop locking people out.
+func TestSubSecondRequestQuotasStillThrottle(t *testing.T) {
+	l, c := newTestLimiter(t, "client requests 100/h")
+	if ok, _, _ := l.Allow("10.0.0.1"); !ok {
+		t.Fatal("the first request was refused")
+	}
+	if ok, _, _ := l.Allow("10.0.0.1"); ok {
+		t.Error("a second immediate request was admitted; 100/h should not burst")
+	}
+	// A hundred an hour is one every thirty-six seconds.
+	c.add(35 * time.Second)
+	if ok, _, _ := l.Allow("10.0.0.1"); ok {
+		t.Error("admitted after 35s; 100/h is one every 36s")
+	}
+	c.add(2 * time.Second)
+	if ok, _, _ := l.Allow("10.0.0.1"); !ok {
+		t.Error("still refused after 37s; 100/h is one every 36s")
+	}
+}

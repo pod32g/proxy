@@ -154,7 +154,45 @@ func (p *Proxy) Addr() string {
 	return net.JoinHostPort(p.URL.Hostname(), "80")
 }
 
+// Secure reports whether the parent is reached over TLS. Callers that dial it
+// themselves — the CONNECT path — have to wrap the connection; the ordinary
+// path gets it from http.Transport.
+func (p *Proxy) Secure() bool { return p.Configured() && p.URL.Scheme == "https" }
+
+// ProxyURL returns the parent with its credentials attached, for
+// http.Transport's Proxy hook.
+//
+// Credentials are deliberately returned *with* the URL rather than set on the
+// request separately, even though Parse went to the trouble of lifting them
+// out. http.Transport turns userinfo on a proxy URL into Proxy-Authorization
+// itself, and only when it actually routes the request through that proxy — so
+// "which parent" and "which credential" become one decision that cannot come
+// apart.
+//
+// They came apart before. The handler set the header whenever it believed a
+// request was chained, and the h2c transport then dialled the origin directly:
+// every cleartext origin was handed the credentials this proxy uses on its
+// parent. Nothing downstream could catch it, because the header is set after
+// the hop-by-hop strip by code that believes it is talking to the parent.
+//
+// String and BypassList are unaffected — they read p.URL, which never carries
+// the credentials.
+func (p *Proxy) ProxyURL() *url.URL {
+	if !p.Configured() {
+		return nil
+	}
+	if p.Username == "" {
+		return p.URL
+	}
+	withAuth := *p.URL
+	withAuth.User = url.UserPassword(p.Username, p.Password)
+	return &withAuth
+}
+
 // AuthHeader returns the Proxy-Authorization value for the parent, or "".
+//
+// For the CONNECT path, which writes the request to the parent by hand. The
+// ordinary path must not use this: see ProxyURL.
 func (p *Proxy) AuthHeader() string {
 	if !p.Configured() || p.Username == "" {
 		return ""

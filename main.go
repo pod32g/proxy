@@ -611,9 +611,14 @@ func main() {
 			// Read per request so rules edited through the UI, the API or a
 			// reload take effect without a restart.
 			HeaderRules: cfg.HeaderRules,
-			Cache:       responseCache,
-			HTTP2:       http2Mode,
-			Upstream:    cfg.UpstreamProxy,
+			// One namespace per listener, out of one memory budget. Listeners
+			// differ on AllowPrivate and on the client certificate they present
+			// upstream, and neither is a property of the request — so a shared
+			// entry could be filled by a listener entitled to the content and
+			// read by one that is not. See cache.Scope.
+			Cache:    responseCache.Scope(name),
+			HTTP2:    http2Mode,
+			Upstream: cfg.UpstreamProxy,
 		}
 
 		var handler http.Handler

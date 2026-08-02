@@ -67,7 +67,11 @@ func (p Policy) buildTransport(dialer *net.Dialer) (ordinary, upgrade *http.Tran
 			if !parent.Configured() || parent.Bypass(r.URL.Host) {
 				return nil, nil
 			}
-			return parent.URL, nil
+			// With the credentials on it: the transport attaches
+			// Proxy-Authorization only when it routes through this URL, so the
+			// credential cannot outlive the routing decision. See
+			// upstream.Proxy.ProxyURL.
+			return parent.ProxyURL(), nil
 		}
 	}
 
@@ -137,8 +141,18 @@ func withALPN(cfg *tls.Config, protos ...string) *tls.Config {
 // With h2c configured, cleartext requests go over HTTP/2 and TLS ones keep
 // negotiating normally — h2c is about the cleartext hop, and forcing it onto a
 // TLS connection would skip the ALPN that already answers the question.
+//
+// A destination going through a parent is the exception, and not for protocol
+// reasons. The h2c transport dials the origin itself; only the ordinary
+// transport carries the Proxy hook. Sending a chained request to h2c did not
+// merely lose HTTP/2 — it silently bypassed the parent altogether, in the
+// egress-controlled deployment that is the parent's whole reason for existing,
+// and handed the origin the parent's credentials along the way.
+//
+// So h2c governs the hop this proxy makes on its own. When there is a parent in
+// the way, the hop is to the parent, and the parent decides what it speaks.
 func (p Policy) roundTripper(ordinary *http.Transport, h2 *http2.Transport, r *http.Request) http.RoundTripper {
-	if h2 != nil && r.URL.Scheme == "http" {
+	if h2 != nil && r.URL.Scheme == "http" && !p.chained(r.URL.Host) {
 		return h2
 	}
 	return ordinary

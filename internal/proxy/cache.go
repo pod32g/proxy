@@ -16,7 +16,7 @@ import (
 // Returns the stored entry when the request is cacheable but the entry is
 // stale, so the caller can revalidate rather than refetch — that is the whole
 // economy of a validator.
-func serveFromCache(w http.ResponseWriter, r *http.Request, c *cache.Cache) (served bool, stale *cache.Entry) {
+func serveFromCache(w http.ResponseWriter, r *http.Request, c *cache.Scope) (served bool, stale *cache.Entry) {
 	if c == nil {
 		return false, nil
 	}
@@ -63,6 +63,11 @@ func writeEntry(w http.ResponseWriter, e *cache.Entry, status string, rewrite fu
 	// Without it the cache is invisible from outside and the only way to know
 	// whether it worked is to watch the origin.
 	w.Header().Set("X-Cache", status)
+	// RFC 9111 §5.1. Set after the rules, not before, because this is a
+	// measurement rather than a preference: a rule that could overwrite it
+	// would be misreporting the age of the content to everyone downstream, and
+	// a downstream cache would extend the lifetime on the strength of it.
+	w.Header().Set("Age", strconv.FormatInt(int64(e.Age(time.Now()).Seconds()), 10))
 	w.Header().Set("Content-Length", strconv.Itoa(len(e.Body)))
 	w.WriteHeader(e.Status)
 	_, _ = w.Write(e.Body)
@@ -88,17 +93,18 @@ func conditional(out *http.Request, entry *cache.Entry) {
 // be complete. The size limit is checked as it is read: buffering a large body
 // only to decide not to store it would be the worst of both outcomes, so
 // reading stops at the limit and the remainder streams straight through.
-func storeResponse(r *http.Request, resp *http.Response, c *cache.Cache) io.Reader {
+func storeResponse(r *http.Request, resp *http.Response, c *cache.Scope) io.Reader {
 	if c == nil {
 		return resp.Body
 	}
 	if cache.StorableRequest(r) != cache.ReasonStorable {
 		return resp.Body
 	}
-	if cache.StorableResponse(resp) != cache.ReasonStorable {
+	now := time.Now()
+	if cache.StorableResponse(resp, now) != cache.ReasonStorable {
 		return resp.Body
 	}
-	ttl, ok := cache.TTL(resp)
+	ttl, ok := cache.TTL(resp, now)
 	if !ok {
 		return resp.Body
 	}

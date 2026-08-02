@@ -17,6 +17,8 @@ import (
 
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/upstream"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // parentProxy is a real proxy running in-process: it speaks both the plain-HTTP
@@ -121,6 +123,9 @@ func (p *parentProxy) handle(conn net.Conn) {
 	// Plain HTTP: the request arrives in absolute form and the parent fetches.
 	p.record("", req.URL.String(), auth)
 	req.RequestURI = ""
+	// Hop-by-hop, and recorded above already. A parent that forwarded it would
+	// be the bug under test in another costume.
+	req.Header.Del("Proxy-Authorization")
 	resp, err := http.DefaultTransport.RoundTrip(req)
 	if err != nil {
 		io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -505,5 +510,181 @@ func TestRemovingTheParentTakesEffect(t *testing.T) {
 
 	if _, requests, _ := parent.seen(); len(requests) != 1 {
 		t.Errorf("the parent saw %d requests, want only the first", len(requests))
+	}
+}
+
+// newTLSParentProxy is the same parent, reached over TLS. An https:// parent is
+// the configuration that keeps the credentials this proxy uses on its parent
+// off the wire, so it has to actually work.
+func newTLSParentProxy(t *testing.T, requireAuth string, pair tls.Certificate) *parentProxy {
+	t.Helper()
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{pair},
+		NextProtos:   []string{"http/1.1"},
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	p := &parentProxy{ln: ln, requireAuth: requireAuth}
+	go p.serve()
+	t.Cleanup(func() { ln.Close() })
+	return p
+}
+
+// PROXY-74. The CONNECT path dials the parent itself, because a hijacked tunnel
+// cannot go through the transport's Proxy hook — and having taken the dial, it
+// has to take the TLS with it. It did not, so the nested CONNECT went out in
+// cleartext to a port expecting a handshake, carrying the parent credentials in
+// base64.
+//
+// A working tunnel is the assertion. A plaintext CONNECT cannot produce one
+// against a TLS listener, so this fails on the old code by construction rather
+// than by inspecting bytes and hoping the check is the right one.
+func TestConnectThroughATLSParentSpeaksTLS(t *testing.T) {
+	pki := newPKI(t)
+	_, _, pair := pki.issue(t, "parent")
+
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ORIGIN")
+	}))
+	defer origin.Close()
+
+	const user, pass = "parentuser", "parentsecret"
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+	parent := newTLSParentProxy(t, want, pair)
+
+	up, err := upstream.Parse("https://"+user+":"+pass+"@"+parent.addr(), "")
+	if err != nil {
+		t.Fatalf("upstream.Parse: %v", err)
+	}
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, Policy{
+		AllowPrivate: true,
+		ConnectPorts: allPorts(),
+		Upstream:     func() *upstream.Proxy { return up },
+		// The parent's certificate is verified against the same upstream trust
+		// material everything else uses.
+		UpstreamTLS: &tls.Config{RootCAs: pki.caPool},
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	client := proxyClient(t, srv.URL)
+	client.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
+		RootCAs: originPool(t, origin),
+	}
+	resp, err := client.Get(origin.URL + "/path")
+	if err != nil {
+		t.Fatalf("tunnelled request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ORIGIN" {
+		t.Errorf("body = %q, want ORIGIN", body)
+	}
+
+	connects, _, auth := parent.seen()
+	if len(connects) != 1 {
+		t.Fatalf("the TLS parent saw %d CONNECTs, want 1", len(connects))
+	}
+	if len(auth) == 0 || auth[len(auth)-1] != want {
+		t.Errorf("parent saw auth %v, want %q", auth, want)
+	}
+}
+
+// PROXY-73, first half. h2c dials the origin from its own transport, which
+// carries no Proxy hook — so a chained request sent to it bypassed the parent
+// entirely, in the egress-controlled deployment that is the parent's whole
+// reason for existing.
+func TestH2CStillGoesThroughTheParent(t *testing.T) {
+	origin := httptest.NewServer(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ORIGIN")
+	}), &http2.Server{}))
+	defer origin.Close()
+
+	parent := newParentProxy(t, "")
+	up, err := upstream.Parse(parent.url(), "")
+	if err != nil {
+		t.Fatalf("upstream.Parse: %v", err)
+	}
+	h := NewForward(newLogger(), func(string) map[string]string { return nil }, Policy{
+		AllowPrivate: true,
+		ConnectPorts: allPorts(),
+		HTTP2:        HTTP2Cleartext,
+		Upstream:     func() *upstream.Proxy { return up },
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := proxyClient(t, srv.URL).Get(origin.URL + "/path")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	io.ReadAll(resp.Body)
+
+	if _, requests, _ := parent.seen(); len(requests) != 1 {
+		t.Errorf("the parent saw %d requests, want 1 — h2c went direct", len(requests))
+	}
+}
+
+// PROXY-73, second half, and the part that made it a disclosure rather than a
+// misconfiguration.
+//
+// The handler set Proxy-Authorization whenever it believed a request was
+// chained; the transport then decided independently where the request actually
+// went. Under h2c those two disagreed, and the origin — any origin — received
+// the credentials this proxy uses on its parent. The hop-by-hop strip cannot
+// catch it, because the header is set after the strip by code that believes it
+// is talking to the parent.
+//
+// The credential travels with the routing decision now, on the proxy URL, so
+// the two cannot come apart. The destination is deliberately *not* on the
+// bypass list: the leak needed the handler to think the request was chained,
+// which is the case this asserts.
+func TestParentCredentialsNeverReachTheOrigin(t *testing.T) {
+	var seen atomic.Value
+	seen.Store("")
+	origin := httptest.NewServer(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.Store(r.Header.Get("Proxy-Authorization"))
+		io.WriteString(w, "ORIGIN")
+	}), &http2.Server{}))
+	defer origin.Close()
+
+	const user, pass = "parentuser", "parentsecret"
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+
+	for _, mode := range []UpstreamHTTP2{HTTP2Auto, HTTP2Cleartext} {
+		t.Run(string(mode), func(t *testing.T) {
+			seen.Store("")
+			parent := newParentProxy(t, want)
+			up, err := upstream.Parse("http://"+user+":"+pass+"@"+parent.addr(), "")
+			if err != nil {
+				t.Fatalf("upstream.Parse: %v", err)
+			}
+			h := NewForward(newLogger(), func(string) map[string]string { return nil }, Policy{
+				AllowPrivate: true,
+				ConnectPorts: allPorts(),
+				HTTP2:        mode,
+				Upstream:     func() *upstream.Proxy { return up },
+			})
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+
+			resp, err := proxyClient(t, srv.URL).Get(origin.URL + "/path")
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if got := seen.Load().(string); got != "" {
+				t.Errorf("the origin received the parent's credentials: %q", got)
+			}
+			// The other half: the credential must still reach the parent, or
+			// this would pass by never sending it anywhere.
+			if _, _, auth := parent.seen(); len(auth) == 0 || auth[len(auth)-1] != want {
+				t.Errorf("the parent saw auth %v, want %q", auth, want)
+			}
+		})
 	}
 }

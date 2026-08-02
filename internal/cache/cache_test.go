@@ -101,7 +101,7 @@ func TestNeverStored(t *testing.T) {
 			},
 		} {
 			t.Run(name, func(t *testing.T) {
-				if got := StorableResponse(tc.resp); got != tc.want {
+				if got := StorableResponse(tc.resp, time.Now()); got != tc.want {
 					t.Errorf("StorableResponse = %q, want %q", got, tc.want)
 				}
 			})
@@ -115,12 +115,12 @@ func TestDirectiveParsing(t *testing.T) {
 	for _, header := range []string{
 		"no-store", "NO-STORE", "max-age=60, no-store", " no-store , public ",
 	} {
-		if got := StorableResponse(response(200, "Cache-Control", header)); got != ReasonNoStore {
+		if got := StorableResponse(response(200, "Cache-Control", header), time.Now()); got != ReasonNoStore {
 			t.Errorf("Cache-Control: %q -> %q, want no-store", header, got)
 		}
 	}
 	// "public" alone still needs explicit freshness.
-	if got := StorableResponse(response(200, "Cache-Control", "public")); got != ReasonNoFreshness {
+	if got := StorableResponse(response(200, "Cache-Control", "public"), time.Now()); got != ReasonNoFreshness {
 		t.Errorf("public alone -> %q, want a freshness refusal", got)
 	}
 }
@@ -131,7 +131,7 @@ func TestStorableResponseAcceptsExplicitFreshness(t *testing.T) {
 		{"Cache-Control", "s-maxage=60"},
 		{"Cache-Control", "public, max-age=60"},
 	} {
-		if got := StorableResponse(response(200, header...)); got != ReasonStorable {
+		if got := StorableResponse(response(200, header...), time.Now()); got != ReasonStorable {
 			t.Errorf("%v -> %q, want storable", header, got)
 		}
 	}
@@ -140,7 +140,7 @@ func TestStorableResponseAcceptsExplicitFreshness(t *testing.T) {
 // s-maxage is addressed to shared caches specifically and outranks max-age.
 func TestSharedMaxAgeWins(t *testing.T) {
 	resp := response(200, "Cache-Control", "max-age=10, s-maxage=600")
-	ttl, ok := TTL(resp)
+	ttl, ok := TTL(resp, time.Now())
 	if !ok {
 		t.Fatal("not cacheable")
 	}
@@ -297,7 +297,7 @@ func TestNoCacheIsStoredButNeverFresh(t *testing.T) {
 	r := request(t, "http://example.com/a")
 	resp := response(200, "Cache-Control", "no-cache, max-age=300", "ETag", `"v1"`)
 
-	if got := StorableResponse(resp); got != ReasonStorable {
+	if got := StorableResponse(resp, time.Now()); got != ReasonStorable {
 		t.Fatalf("no-cache was refused outright (%q); it should be stored and revalidated", got)
 	}
 	if !c.Store(r, resp, []byte("body"), 5*time.Minute) {
@@ -498,7 +498,7 @@ func TestAuthenticatedRequestNeverProducesAnEntry(t *testing.T) {
 	}
 	// Even the most permissive response headers must not change that.
 	resp := response(200, "Cache-Control", "public, max-age=31536000")
-	if StorableRequest(r) == ReasonStorable && StorableResponse(resp) == ReasonStorable {
+	if StorableRequest(r) == ReasonStorable && StorableResponse(resp, time.Now()) == ReasonStorable {
 		t.Error("public, max-age would have cached an authenticated response")
 	}
 	if _, entries := c.Stats(); entries != 0 {
@@ -519,4 +519,149 @@ func TestVaryKeyIsOrderStableAndCaseInsensitive(t *testing.T) {
 	if !strings.Contains(a, "accept-encoding=gzip") {
 		t.Errorf("fingerprint = %q", a)
 	}
+}
+
+// PROXY-75. A forward proxy usually sits in front of a CDN, so a response that
+// is already most of the way through its life is the common case, not the
+// exotic one. Storing it for its full declared lifetime again serves it at up
+// to twice the staleness the origin authorised — and the origin has no way to
+// tell.
+func TestStoredFreshnessSubtractsTheAgeOnArrival(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	c := New(1<<20, 1<<16)
+	c.now = func() time.Time { return now }
+
+	r := request(t, "http://example.com/a")
+	resp := response(200, "Cache-Control", "max-age=3600", "Age", "3500")
+	ttl, ok := TTL(resp, now)
+	if !ok {
+		t.Fatal("no declared freshness")
+	}
+	if !c.Store(r, resp, []byte("body"), ttl) {
+		t.Fatal("not stored")
+	}
+
+	e := c.Get(r)
+	if e == nil {
+		t.Fatal("not found")
+	}
+	if want := now.Add(100 * time.Second); !e.Expires.Equal(want) {
+		t.Errorf("Expires = %v, want %v (3600s of life, 3500s already spent)", e.Expires, want)
+	}
+	if !e.Fresh(now.Add(99 * time.Second)) {
+		t.Error("not fresh with a second of life left")
+	}
+	if e.Fresh(now.Add(101 * time.Second)) {
+		t.Error("still fresh past the origin's lifetime")
+	}
+	// And the age it reports counts from the origin, not from us.
+	if got := e.Age(now); got != 3500*time.Second {
+		t.Errorf("Age at store = %v, want 3500s", got)
+	}
+	if got := e.Age(now.Add(50 * time.Second)); got != 3550*time.Second {
+		t.Errorf("Age after 50s = %v, want 3550s", got)
+	}
+}
+
+// Date does the same job when the upstream cache omitted Age, and skew towards
+// the future is not a reason to call something fresher than it is.
+func TestInitialAgeFromDateAndSkew(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		h    http.Header
+		want time.Duration
+	}{
+		{"neither", http.Header{}, 0},
+		{"age only", http.Header{"Age": {"120"}}, 120 * time.Second},
+		{"date only", http.Header{"Date": {now.Add(-90 * time.Second).Format(http.TimeFormat)}}, 90 * time.Second},
+		{"the larger wins", http.Header{
+			"Age":  {"120"},
+			"Date": {now.Add(-300 * time.Second).Format(http.TimeFormat)},
+		}, 300 * time.Second},
+		{"clock ahead is not negative age", http.Header{
+			"Date": {now.Add(600 * time.Second).Format(http.TimeFormat)},
+		}, 0},
+		{"garbage age ignored", http.Header{"Age": {"soon"}}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := InitialAge(tc.h, now); got != tc.want {
+				t.Errorf("InitialAge = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A response that arrives already past its lifetime is not fresh, and is worth
+// keeping only for what it can be revalidated with.
+func TestArrivingExpiredIsNotFresh(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	c := New(1<<20, 1<<16)
+	c.now = func() time.Time { return now }
+
+	r := request(t, "http://example.com/a")
+	resp := response(200, "Cache-Control", "max-age=60", "Age", "600", "ETag", `"v1"`)
+	ttl, _ := TTL(resp, now)
+	c.Store(r, resp, []byte("body"), ttl)
+
+	e := c.Get(r)
+	if e == nil {
+		t.Fatal("dropped an entry that still has a validator")
+	}
+	if e.Fresh(now) {
+		t.Error("a response that arrived ten minutes past its lifetime is not fresh")
+	}
+
+	// Without a validator there is nothing to keep.
+	r2 := request(t, "http://example.com/b")
+	resp2 := response(200, "Cache-Control", "max-age=60", "Age", "600")
+	ttl2, _ := TTL(resp2, now)
+	c.Store(r2, resp2, []byte("body"), ttl2)
+	if c.Get(r2) != nil {
+		t.Error("kept an expired entry with nothing to revalidate against")
+	}
+}
+
+// PROXY-71, the half that cannot be fixed by checking rules before the lookup.
+//
+// Listeners differ on AllowPrivate and on the client certificate they present
+// upstream, and neither is a property of the request — so one listener's
+// entries must not be another's. See cache.Scope.
+func TestScopesDoNotShareEntries(t *testing.T) {
+	c := New(1<<20, 1<<16)
+	a, b := c.Scope("listener-a"), c.Scope("listener-b")
+
+	r := request(t, "http://example.com/a")
+	if !a.Store(r, response(200, "Cache-Control", "max-age=300"), []byte("PRIVILEGED"), time.Minute) {
+		t.Fatal("not stored")
+	}
+	if a.Get(r) == nil {
+		t.Error("the scope that stored it cannot find it")
+	}
+	if got := b.Get(r); got != nil {
+		t.Errorf("another listener read it: %q", got.Body)
+	}
+	if got := c.Get(r); got != nil {
+		t.Errorf("the unnamed scope read it: %q", got.Body)
+	}
+
+	// Each scope keeps its own copy of the same URL.
+	b.Store(r, response(200, "Cache-Control", "max-age=300"), []byte("OTHER"), time.Minute)
+	if got := a.Get(r); got == nil || string(got.Body) != "PRIVILEGED" {
+		t.Errorf("scope a = %v, want PRIVILEGED", got)
+	}
+	if got := b.Get(r); got == nil || string(got.Body) != "OTHER" {
+		t.Errorf("scope b = %v, want OTHER", got)
+	}
+
+	// A nil cache yields a nil scope whose every method is a no-op, so callers
+	// need one nil check rather than two.
+	var none *Cache
+	s := none.Scope("x")
+	if s.Get(r) != nil || s.Store(r, response(200), nil, time.Minute) || s.MaxEntryBytes() != 0 {
+		t.Error("a scope over a nil cache is not inert")
+	}
+	s.Hit()
+	s.Miss()
+	s.Revalidated()
 }

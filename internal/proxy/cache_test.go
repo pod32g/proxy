@@ -5,11 +5,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pod32g/proxy/internal/cache"
 	"github.com/pod32g/proxy/internal/header"
+	"github.com/pod32g/proxy/internal/policy"
 )
 
 // cachingProxy wires a real cache into a real handler. The predicates are unit
@@ -17,7 +20,7 @@ import (
 func cachingProxy(t *testing.T, c *cache.Cache) http.Handler {
 	t.Helper()
 	return NewForward(newLogger(), func(string) map[string]string { return nil },
-		Policy{AllowPrivate: true, ConnectPorts: allPorts(), Cache: c})
+		Policy{AllowPrivate: true, ConnectPorts: allPorts(), Cache: c.Scope("test")})
 }
 
 func fetch(t *testing.T, h http.Handler, url string, headers ...string) *httptest.ResponseRecorder {
@@ -261,7 +264,7 @@ func TestResponseRulesApplyToHitsAndMisses(t *testing.T) {
 	c := cache.New(1<<20, 1<<16)
 	h := NewForward(newLogger(), func(string) map[string]string { return nil },
 		Policy{
-			AllowPrivate: true, ConnectPorts: allPorts(), Cache: c,
+			AllowPrivate: true, ConnectPorts: allPorts(), Cache: c.Scope("test"),
 			HeaderRules: rules.get,
 		})
 
@@ -406,3 +409,141 @@ func (a *atomicRules) set(t *testing.T, text string) {
 }
 
 func (a *atomicRules) get(string) *header.RuleSet { return a.v.Load() }
+
+// atomicDestinationRules is a destination rule set an operator can change
+// mid-flight, which is the whole point: Policy.Rules is a function so that an
+// edit applies to the next request rather than the next restart.
+type atomicDestinationRules struct{ v atomic.Value }
+
+func (a *atomicDestinationRules) set(t *testing.T, text string) {
+	t.Helper()
+	if text == "" {
+		a.v.Store((*policy.RuleSet)(nil))
+		return
+	}
+	set, err := policy.Parse(text)
+	if err != nil {
+		t.Fatalf("policy.Parse(%q): %v", text, err)
+	}
+	a.v.Store(set)
+}
+
+func (a *atomicDestinationRules) get(string) *policy.RuleSet {
+	set, _ := a.v.Load().(*policy.RuleSet)
+	return set
+}
+
+// PROXY-71. A fresh cache hit answered above every check there was, so a
+// destination the operator had denied kept being served out of the cache — with
+// the refusal counter untouched and X-Cache: HIT the only trace that anything
+// had happened at all.
+//
+// This is the same shape as PROXY-70, where response header rules were skipped
+// on a hit for the same reason: the early return sits above the code that does
+// the work. There it produced a stale header. Here it produced a bypassed
+// security control.
+func TestACacheHitIsStillSubjectToTheDestinationPolicy(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=300")
+		io.WriteString(w, "SECRET")
+	}))
+	defer origin.Close()
+
+	rules := &atomicDestinationRules{}
+	rules.set(t, "")
+
+	var refusals atomic.Int64
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{
+			AllowPrivate: true, ConnectPorts: allPorts(),
+			Cache: cache.New(1<<20, 1<<16).Scope("test"),
+			Rules: rules.get,
+		},
+		Observer{Denied: func(string) { refusals.Add(1) }})
+
+	if got := fetch(t, h, origin.URL+"/a"); got.Code != http.StatusOK {
+		t.Fatalf("the priming fetch got %d", got.Code)
+	}
+	if got := fetch(t, h, origin.URL+"/a"); got.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("the second fetch was not a hit: %s", got.Header().Get("X-Cache"))
+	}
+
+	rules.set(t, "deny all")
+	denied := fetch(t, h, origin.URL+"/a")
+	if denied.Code != http.StatusForbidden {
+		t.Errorf("denied destination served %d %q (X-Cache: %s), want 403",
+			denied.Code, denied.Body.String(), denied.Header().Get("X-Cache"))
+	}
+	// Counted as a refusal, so it is visible as one rather than as a served
+	// request. A silent bypass is what made this hard to see.
+	if refusals.Load() != 1 {
+		t.Errorf("refusals = %d, want 1", refusals.Load())
+	}
+}
+
+// PROXY-75, the serving half. RFC 9111 §5.1: a downstream cache with no Age to
+// go on restarts the clock from zero and extends the lifetime again, so the
+// error compounds at every hop.
+//
+// The origin sends both an Age and an older Date, and they disagree. That is
+// deliberate: writeEntry replays the stored headers, so a test against an
+// origin that sent Age: 60 would pass on the copied header whether or not this
+// proxy computes anything at all. Only the value derived from the *larger* of
+// the two can distinguish a measurement from an echo.
+func TestHitsCarryAnAgeHeader(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=600")
+		w.Header().Set("Age", "60")
+		w.Header().Set("Date", time.Now().Add(-300*time.Second).UTC().Format(http.TimeFormat))
+		io.WriteString(w, "ORIGIN")
+	}))
+	defer origin.Close()
+
+	h := cachingProxy(t, cache.New(1<<20, 1<<16))
+	fetch(t, h, origin.URL+"/a")
+
+	hit := fetch(t, h, origin.URL+"/a")
+	if got := hit.Header().Get("X-Cache"); got != "HIT" {
+		t.Fatalf("X-Cache = %q, want HIT", got)
+	}
+	raw := hit.Header().Get("Age")
+	age, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("Age = %q: %v", raw, err)
+	}
+	if age == 60 {
+		t.Fatalf("Age = 60: the origin's header was replayed, not measured")
+	}
+	// Counted from when the origin generated the response, not from when this
+	// cache first saw it.
+	if age < 300 || age > 305 {
+		t.Errorf("Age = %d, want ~300 — the age on arrival plus time held here", age)
+	}
+}
+
+// A rule must not be able to overwrite Age: it is a measurement, and a
+// downstream cache extends a lifetime on the strength of it.
+func TestAgeSurvivesResponseHeaderRules(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=300")
+		w.Header().Set("Age", "120")
+		io.WriteString(w, "ORIGIN")
+	}))
+	defer origin.Close()
+
+	rules := &atomicRules{}
+	rules.set(t, "response set Age: 0")
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{
+			AllowPrivate: true, ConnectPorts: allPorts(),
+			Cache:       cache.New(1<<20, 1<<16).Scope("test"),
+			HeaderRules: rules.get,
+		})
+	fetch(t, h, origin.URL+"/a")
+
+	hit := fetch(t, h, origin.URL+"/a")
+	if got := hit.Header().Get("Age"); got == "0" {
+		t.Error("a rule overwrote Age; downstream caches would treat the entry as new")
+	}
+}

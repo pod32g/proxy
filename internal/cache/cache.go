@@ -38,6 +38,13 @@ type Entry struct {
 	ETag         string
 	LastModified string
 
+	// storedAt and initialAge are what Age is computed from: how old the
+	// response already was when it arrived, plus how long it has sat here.
+	// Both are needed — a response from a CDN is not new just because this
+	// cache has only just seen it.
+	storedAt   time.Time
+	initialAge time.Duration
+
 	// vary is the request-header fingerprint this variant was stored under.
 	vary string
 	// varyNames is the Vary header list itself, kept so candidate lookups do
@@ -61,6 +68,22 @@ func (e *Entry) Fresh(now time.Time) bool {
 // Revalidatable reports whether an expired entry is worth a conditional
 // request rather than a plain refetch.
 func (e *Entry) Revalidatable() bool { return e.ETag != "" || e.LastModified != "" }
+
+// Age is how old this response is, counting from when the origin generated it
+// rather than from when this cache first saw it.
+//
+// RFC 9111 §5.1 requires a cache to send this, and the requirement is not
+// bookkeeping: a downstream cache with no Age to go on restarts the clock from
+// zero and extends the lifetime again, so the error compounds at every hop. A
+// proxy that holds responses and tells nobody how old they are is the reason
+// that rule exists.
+func (e *Entry) Age(now time.Time) time.Duration {
+	age := e.initialAge + now.Sub(e.storedAt)
+	if age < 0 {
+		return 0
+	}
+	return age
+}
 
 // Cache is a bounded in-memory response cache.
 //
@@ -120,17 +143,94 @@ func New(maxBytes, maxEntry int64) *Cache {
 // outcomes, so the handler streams past the limit instead.
 func (c *Cache) MaxEntryBytes() int64 { return c.maxEntry }
 
-// key identifies a stored response.
-func key(method, url, vary string) string {
-	return method + "\x00" + url + "\x00" + vary
+// Scope is a namespaced view of a cache: entries stored through one are only
+// ever found through the same one.
+//
+// Listeners get a scope each, and that is not tidiness. A cache shared across
+// listeners is shared across whatever those listeners do differently, and what
+// they can differ on includes the things that decide whether a client may see a
+// response at all: AllowPrivate, and the client certificate in UpstreamTLS. One
+// listener fetching privileged content with a client certificate would fill a
+// cache another listener — with no certificate, and no right to that content —
+// reads from. Destination rules are handled properly, by checking them before
+// the lookup; these two cannot be, because they are not properties of the
+// request.
+//
+// The cost is hit rate across listeners, which is the right thing to give up.
+type Scope struct {
+	c    *Cache
+	name string
 }
 
-// Get returns a usable entry for a request, or nil.
+// Scope returns a namespaced view. A nil cache yields a nil scope, and every
+// method on it is a no-op, so callers need one nil check rather than two.
+func (c *Cache) Scope(name string) *Scope {
+	if c == nil {
+		return nil
+	}
+	return &Scope{c: c, name: name}
+}
+
+func (s *Scope) Get(r *http.Request) *Entry {
+	if s == nil {
+		return nil
+	}
+	return s.c.get(s.name, r)
+}
+
+func (s *Scope) Store(r *http.Request, resp *http.Response, body []byte, ttl time.Duration) bool {
+	if s == nil {
+		return false
+	}
+	return s.c.store(s.name, r, resp, body, ttl)
+}
+
+func (s *Scope) Refresh(old *Entry, resp *http.Response, ttl time.Duration) *Entry {
+	if s == nil {
+		return old
+	}
+	return s.c.Refresh(old, resp, ttl)
+}
+
+func (s *Scope) MaxEntryBytes() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.c.MaxEntryBytes()
+}
+
+func (s *Scope) Hit() {
+	if s != nil {
+		s.c.Hit()
+	}
+}
+
+func (s *Scope) Miss() {
+	if s != nil {
+		s.c.Miss()
+	}
+}
+
+func (s *Scope) Revalidated() {
+	if s != nil {
+		s.c.Revalidated()
+	}
+}
+
+// key identifies a stored response. The scope leads, so two listeners asking
+// for the same URL are asking two different questions.
+func key(scope, method, url, vary string) string {
+	return scope + "\x00" + method + "\x00" + url + "\x00" + vary
+}
+
+// Get returns a usable entry for a request from the unnamed scope.
 //
 // The returned entry may be stale, or fresh-but-must-revalidate; the caller
 // decides what to do about it. That split is deliberate — freshness is a cache
 // question, but what to do about staleness is a request question.
-func (c *Cache) Get(r *http.Request) *Entry {
+func (c *Cache) Get(r *http.Request) *Entry { return c.get("", r) }
+
+func (c *Cache) get(scope string, r *http.Request) *Entry {
 	if c == nil {
 		return nil
 	}
@@ -140,11 +240,11 @@ func (c *Cache) Get(r *http.Request) *Entry {
 	// The unvaried key first, because it is the common case, then one key per
 	// distinct Vary form currently stored — a set of a handful, not a scan of
 	// every entry.
-	if e := c.lookupLocked(r, ""); e != nil {
+	if e := c.lookupLocked(scope, r, ""); e != nil {
 		return e
 	}
 	for names := range c.varyForms {
-		if e := c.lookupLocked(r, varyKey(names, r.Header)); e != nil {
+		if e := c.lookupLocked(scope, r, varyKey(names, r.Header)); e != nil {
 			return e
 		}
 	}
@@ -152,8 +252,8 @@ func (c *Cache) Get(r *http.Request) *Entry {
 }
 
 // lookupLocked returns a live entry for one variant key. Callers hold mu.
-func (c *Cache) lookupLocked(r *http.Request, vary string) *Entry {
-	k := key(r.Method, r.URL.String(), vary)
+func (c *Cache) lookupLocked(scope string, r *http.Request, vary string) *Entry {
+	k := key(scope, r.Method, r.URL.String(), vary)
 	entry, ok := c.entries[k]
 	if !ok {
 		return nil
@@ -170,8 +270,13 @@ func (c *Cache) lookupLocked(r *http.Request, vary string) *Entry {
 	return entry
 }
 
-// Store adds a response. Returns false when it was not stored.
+// Store adds a response to the unnamed scope. Returns false when it was not
+// stored.
 func (c *Cache) Store(r *http.Request, resp *http.Response, body []byte, ttl time.Duration) bool {
+	return c.store("", r, resp, body, ttl)
+}
+
+func (c *Cache) store(scope string, r *http.Request, resp *http.Response, body []byte, ttl time.Duration) bool {
 	if c == nil {
 		return false
 	}
@@ -182,17 +287,26 @@ func (c *Cache) Store(r *http.Request, resp *http.Response, body []byte, ttl tim
 
 	names := resp.Header.Get("Vary")
 	vary := varyKey(names, r.Header)
-	k := key(r.Method, r.URL.String(), vary)
+	k := key(scope, r.Method, r.URL.String(), vary)
 	etag, lastMod, _ := Validator(resp.Header)
+
+	now := c.now()
+	// ttl is the lifetime the origin declared, measured from when the origin
+	// generated the response. What is left of it is that minus however old the
+	// response already was on arrival — which for anything coming through a CDN
+	// is usually most of it.
+	age := InitialAge(resp.Header, now)
 
 	entry := &Entry{
 		Status:         resp.StatusCode,
 		Header:         resp.Header.Clone(),
 		Body:           body,
-		Expires:        c.now().Add(ttl),
+		Expires:        now.Add(ttl - age),
 		MustRevalidate: directives(resp.Header.Get("Cache-Control")).has("no-cache"),
 		ETag:           etag,
 		LastModified:   lastMod,
+		storedAt:       now,
+		initialAge:     age,
 		vary:           vary,
 		varyNames:      normaliseVaryNames(names),
 		key:            k,
@@ -263,7 +377,13 @@ func (c *Cache) Refresh(old *Entry, resp *http.Response, ttl time.Duration) *Ent
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	fresh.Expires = c.now().Add(ttl)
+	// A 304 is a fresh statement about the entity, so the age restarts from
+	// whatever the 304 itself declares — not from the age the entry had
+	// accumulated, which the origin has just told us no longer matters.
+	now := c.now()
+	fresh.storedAt = now
+	fresh.initialAge = InitialAge(resp.Header, now)
+	fresh.Expires = now.Add(ttl - fresh.initialAge)
 	c.insertLocked(fresh)
 	c.reportSizeLocked()
 	return fresh
@@ -359,7 +479,11 @@ func (c *Cache) Revalidated() {
 	}
 }
 
-// TTL returns how long a response may be cached, and whether it may be at all.
-func TTL(resp *http.Response) (time.Duration, bool) {
-	return freshness(resp, directives(resp.Header.Get("Cache-Control")))
+// TTL returns the lifetime the origin declared for a response, and whether it
+// declared one at all.
+//
+// This is measured from when the origin generated the response, not from now:
+// Store subtracts the age it arrived with. See InitialAge.
+func TTL(resp *http.Response, now time.Time) (time.Duration, bool) {
+	return freshness(resp, directives(resp.Header.Get("Cache-Control")), now)
 }

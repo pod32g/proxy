@@ -41,11 +41,26 @@ type Limit struct {
 func (l Limit) Unlimited() bool { return l.PerSecond <= 0 }
 
 // capacity is the bucket size, defaulting to one second of refill.
+//
+// Floored at one whole unit, and that floor is the whole point of this
+// function. Admission needs a bucket that can hold one token; "one second of
+// refill" is less than one token for any rate below 1/s, so `requests 100/h`
+// used to produce a bucket that could never fill enough to admit anything. Not
+// a slow quota — a permanent refusal, from the configuration that reads as the
+// most generous.
+//
+// The parser already rejects an explicit burst smaller than the rate, for
+// exactly this reason: it "would cap throughput below the rate". This is the
+// same check on the implicit burst, which is the one nobody writes down.
 func (l Limit) capacity() float64 {
+	c := l.PerSecond
 	if l.Burst > 0 {
-		return l.Burst
+		c = l.Burst
 	}
-	return l.PerSecond
+	if c < 1 {
+		return 1
+	}
+	return c
 }
 
 // String renders the limit as written.

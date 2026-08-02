@@ -80,8 +80,9 @@ func RequestWantsRevalidation(r *http.Request) bool {
 	return directives(r.Header.Get("Cache-Control")).has("no-cache")
 }
 
-// StorableResponse reports whether a response may be stored.
-func StorableResponse(resp *http.Response) Reason {
+// StorableResponse reports whether a response may be stored. now is the clock,
+// passed in rather than read, so the whole package answers to one.
+func StorableResponse(resp *http.Response, now time.Time) Reason {
 	if !cacheableStatus[resp.StatusCode] {
 		return ReasonStatus
 	}
@@ -105,7 +106,7 @@ func StorableResponse(resp *http.Response) Reason {
 		// headers at all, so no stored entry can be known to match.
 		return ReasonVaryAll
 	}
-	if _, ok := freshness(resp, cc); !ok {
+	if _, ok := freshness(resp, cc, now); !ok {
 		// Explicit freshness only. Heuristics from Last-Modified would have the
 		// proxy invent a lifetime for content nobody labelled, and start
 		// serving stale pages the origin never authorised.
@@ -114,8 +115,45 @@ func StorableResponse(resp *http.Response) Reason {
 	return ReasonStorable
 }
 
+// InitialAge is how old a response already was when it arrived (RFC 9111 §4.2.3).
+//
+// A forward proxy very often sits in front of a CDN or another cache, so this is
+// the common case rather than the exotic one. Without it, a response arriving
+// with "max-age=3600, Age: 3500" — a hundred seconds of life left — was stored
+// for a further 3600, and served at up to twice the staleness the origin
+// authorised. The origin's control over its own content quietly stopped meaning
+// what it said.
+//
+// Both sources are consulted and the larger wins, as the RFC requires: Age can
+// be missing from a cache that should have sent it, and Date can be skewed.
+func InitialAge(h http.Header, now time.Time) time.Duration {
+	var age time.Duration
+	if v := h.Get("Age"); v != "" {
+		if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
+			age = time.Duration(secs) * time.Second
+		}
+	}
+	if d := h.Get("Date"); d != "" {
+		if sent, err := http.ParseTime(d); err == nil {
+			// Negative when the origin's clock runs ahead of ours, which is not
+			// a reason to treat a response as fresher than it is.
+			if elapsed := now.Sub(sent); elapsed > age {
+				age = elapsed
+			}
+		}
+	}
+	if age < 0 {
+		return 0
+	}
+	return age
+}
+
 // freshness returns how long a response may be served without revalidation.
-func freshness(resp *http.Response, cc directiveSet) (time.Duration, bool) {
+//
+// This is the lifetime the origin declared, measured from when the origin
+// generated the response — not from now. Subtracting the age it arrived with is
+// the caller's job, because only the caller knows when "now" is. See InitialAge.
+func freshness(resp *http.Response, cc directiveSet, now time.Time) (time.Duration, bool) {
 	// s-maxage is addressed to shared caches specifically and wins over maxage.
 	if v, ok := cc.value("s-maxage"); ok {
 		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
@@ -134,7 +172,7 @@ func freshness(resp *http.Response, cc directiveSet) (time.Duration, bool) {
 			// "no opinion" — which is a refusal to store, not a long life.
 			return 0, false
 		}
-		base := time.Now()
+		base := now
 		if d := resp.Header.Get("Date"); d != "" {
 			if parsed, err := http.ParseTime(d); err == nil {
 				base = parsed

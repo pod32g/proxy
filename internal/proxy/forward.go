@@ -52,7 +52,7 @@ type Policy struct {
 
 	// Cache, when set, is a shared response cache. Nil disables caching
 	// entirely — no lookup, no buffering, no storability check.
-	Cache *cache.Cache
+	Cache *cache.Scope
 
 	// HTTP2 says how the proxy speaks HTTP/2 to origins. The zero value is
 	// HTTP2Auto, which is what the default transport already did.
@@ -163,6 +163,25 @@ func (o Observer) trace(out *http.Request, host, path string) (*http.Request, fu
 		return out, func(int, error) {}
 	}
 	return o.Trace(out, host, path)
+}
+
+// traceRefusal records, as its own closed span, a refusal that never reached a
+// round trip.
+//
+// Moving the destination check ahead of the cache lookup took it out from under
+// the span that used to cover the exchange, and a refused request stopped
+// appearing in a trace at all — the client's trace would show a call to the
+// proxy, a 403, and nothing saying why. A refusal is the most interesting thing
+// a proxy does; it should not be the one thing tracing cannot see.
+//
+// The clone happens only here, on the refusal path, and only with tracing on:
+// the hook mutates the request it is handed, and the inbound one is not ours.
+func (o Observer) traceRefusal(r *http.Request, status int, err error) {
+	if o.Trace == nil {
+		return
+	}
+	_, end := o.Trace(r.Clone(r.Context()), r.URL.Host, r.URL.EscapedPath())
+	end(status, err)
 }
 
 func (o Observer) upstream(method string, d time.Duration) {
@@ -470,6 +489,30 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			handleUpgrade(w, r, upgradeTransport, headers, logger, proto, obs, pol)
 			return
 		}
+		// The destination is authorised before the cache is consulted, not after.
+		//
+		// This used to run only when a parent was configured, on the reasoning
+		// that the dialer covers everything else — and the dialer does, for
+		// anything that reaches a dial. A fresh cache hit reaches none: it
+		// answers and returns above every check there is. A destination the
+		// operator had denied kept being served, out of the cache, with the
+		// refusal counter untouched and X-Cache: HIT the only trace. Rules are
+		// read per request precisely so that an edit applies to the next
+		// request; for a cached URL it applied to no request at all.
+		//
+		// Hostname-level only, as it must be — there is no address yet. The
+		// dialer still runs the resolved-address checks that close DNS
+		// rebinding, on every request that goes on to make one.
+		if err := pol.checkDestination(clientIP(r.RemoteAddr), r.URL.Host); err != nil {
+			logger.Warn("Refused destination",
+				log.String("host", r.URL.Host), log.String("client", clientIP(r.RemoteAddr)),
+				log.String("request_id", reqid.FromContext(r.Context())))
+			obs.denied(deniedScope(err))
+			obs.traceRefusal(r, http.StatusForbidden, err)
+			http.Error(w, "Destination not permitted", http.StatusForbidden)
+			return
+		}
+
 		// A fresh hit answers here, before any of the outbound work.
 		// Response rules run on the way out, so a hit carries exactly the headers
 		// a miss would and a rule change reaches cached entries immediately.
@@ -502,21 +545,14 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// origin can answer 304 with headers instead of a body.
 		conditional(outReq, stale)
 
-		// With a parent the transport connects to it, not to the destination,
-		// so the destination check has to happen here instead of in the dialer.
-		if pol.chained(r.URL.Host) {
-			if err := pol.checkDestination(clientIP(r.RemoteAddr), r.URL.Host); err != nil {
-				logger.Warn("Refused destination",
-					log.String("host", r.URL.Host), log.String("client", clientIP(r.RemoteAddr)),
-					log.String("request_id", reqid.FromContext(r.Context())))
-				obs.denied(deniedScope(err))
-				http.Error(w, "Destination not permitted", http.StatusForbidden)
-				return
-			}
-			if auth := pol.parent().AuthHeader(); auth != "" {
-				outReq.Header.Set("Proxy-Authorization", auth)
-			}
-		}
+		// No Proxy-Authorization is set here, deliberately. The transport's Proxy
+		// hook returns the parent with its credentials attached and attaches the
+		// header itself, only for requests it actually routes through the parent
+		// — so the credential cannot end up on a request that goes direct. See
+		// upstream.Proxy.ProxyURL.
+		//
+		// The destination check that used to live here now runs above, before
+		// the cache, and covers this path too.
 
 		// The span covers the round trip, matching the upstream histogram. The
 		// request comes back carrying the span context and whatever propagation
@@ -566,7 +602,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			// Refresh returns a *replacement*; the entry passed in may be being
 			// written to another client right now and is never edited.
 			serve := stale
-			if ttl, ok := cache.TTL(resp); ok {
+			if ttl, ok := cache.TTL(resp, time.Now()); ok {
 				serve = pol.Cache.Refresh(stale, resp, ttl)
 			}
 			pol.Cache.Revalidated()
@@ -818,6 +854,23 @@ func (p Policy) dialThroughParent(d *net.Dialer, logger *log.Logger) func(contex
 			return nil, fmt.Errorf("dialling the upstream proxy %s: %w", parent, err)
 		}
 
+		// An https:// parent is reached over TLS, here as on the ordinary path.
+		//
+		// Taking the dial into our own hands, for the reason above, meant taking
+		// the TLS with it — and it did not. The nested CONNECT went out in
+		// cleartext to a port expecting a handshake, carrying the parent's
+		// credentials in base64 for anyone on the path. The tunnel then failed,
+		// so what an operator saw was a broken parent rather than a disclosure
+		// that had already happened.
+		if p.parent().Secure() {
+			tlsConn := tls.Client(conn, p.parentTLSConfig())
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("TLS handshake with the upstream proxy %s: %w", parent, err)
+			}
+			conn = tlsConn
+		}
+
 		req := &http.Request{
 			Method: http.MethodConnect,
 			URL:    &url.URL{Opaque: addr},
@@ -855,6 +908,27 @@ func (p Policy) dialThroughParent(d *net.Dialer, logger *log.Logger) func(contex
 		}
 		return conn, nil
 	}
+}
+
+// parentTLSConfig is the TLS configuration for the connection to an https://
+// parent.
+//
+// It reuses the configured upstream material — a private CA bundle, a client
+// certificate — because a parent behind a private PKI is the ordinary case for
+// this feature, and having it trust a different set of roots than every other
+// outbound connection would be a surprise. ServerName comes from the parent's
+// own URL, never from the destination being tunnelled: it is the parent's
+// certificate being verified here.
+func (p Policy) parentTLSConfig() *tls.Config {
+	cfg := &tls.Config{}
+	if p.UpstreamTLS != nil {
+		cfg = p.UpstreamTLS.Clone()
+	}
+	cfg.ServerName = p.parent().URL.Hostname()
+	// The parent is spoken to in HTTP/1.1 — this connection carries a CONNECT
+	// written by hand — so it must not come back having agreed on h2.
+	cfg.NextProtos = []string{"http/1.1"}
+	return cfg
 }
 
 // prefixedConn replays bytes already read from the socket before reading more.

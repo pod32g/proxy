@@ -432,8 +432,15 @@ globally, and count both requests and bytes:
 
 Rates are written `<amount>/<s|m|h>`. Byte amounts take `KB`/`MB`/`GB` (decimal)
 or `KiB`/`MiB`/`GiB` (binary) — both spellings are accepted because both are in
-common use. `burst` defaults to one second's worth. `unlimited` is available to
-exempt a client from a default that would otherwise apply to it.
+common use. `unlimited` is available to exempt a client from a default that
+would otherwise apply to it.
+
+`burst` defaults to one second's worth, or one whole unit, whichever is larger.
+The floor matters for anything slower than one per second: a bucket that cannot
+hold a single token can never admit a single request, so `requests 100/h`
+without it is not a slow quota but a permanent refusal. With it, `100/h` admits
+a request straight away and one roughly every thirty-six seconds after — no
+bursting, which is what the rate says. Set `burst` explicitly to allow any.
 
 Per-client entries use **longest prefix wins**, like the client access table,
 and inherit whatever they do not name: an entry that sets only a request rate
@@ -627,6 +634,11 @@ dials the parent and issues a **nested `CONNECT`** for the real destination. The
 parent's response is read and checked — a non-200 is a `502`, not a tunnel that
 silently carries the parent's error page instead of the origin.
 
+An `https://` parent is reached over TLS on both paths, verified against the
+same `-upstream-ca` / system trust the rest of the outbound traffic uses. That
+is the configuration that keeps the credentials below off the wire, so it works
+rather than being refused.
+
 `-no-proxy` takes the `NO_PROXY` forms: exact hosts, domain suffixes with or
 without a leading dot, CIDRs, and `*` to disable the parent entirely. It
 defaults to the `NO_PROXY` environment variable.
@@ -636,6 +648,12 @@ Credentials may be given in the URL, which is what people paste from an existing
 logged and persisted; a credential left in it would travel everywhere it goes.
 They are sealed by `-secret` on the same path as the proxy's own, so one setting
 covers both rather than protecting one and leaving the other in the clear.
+
+They are also attached to the routing decision rather than to the request. On
+the plain-HTTP path the parent's URL is handed to the transport *with* its
+credentials, so `Proxy-Authorization` is set only for requests the transport
+actually routes through the parent — "which parent" and "which credential"
+cannot come apart and send the parent's credentials to an origin.
 
 ### What chaining changes about the destination policy
 
@@ -712,6 +730,33 @@ Heuristic freshness guessed from `Last-Modified` would have the proxy invent a
 lifetime for content nobody labelled, and start serving stale pages the origin
 never authorised.
 
+**Freshness counts from the origin, not from arrival.** A response that reaches
+the proxy with `max-age=3600, Age: 3500` has a hundred seconds left, not another
+hour — this proxy usually sits in front of a CDN, so a response that is already
+most of the way through its life is the common case. Hits and revalidated
+responses carry an `Age` header of their own (RFC 9111 §5.1), because a
+downstream cache given no `Age` restarts the clock from zero and extends the
+lifetime again, and the error compounds at every hop.
+
+### The cache does not bypass the destination policy
+
+A cache hit is subject to the destination rules exactly as a fetch is. The rules
+are evaluated on the requested hostname *before* the lookup, so a rule edited
+through the UI, the API or a reload applies to cached URLs immediately rather
+than whenever the origin's `max-age` happens to run out. A refusal is counted
+and logged as a refusal.
+
+The address-level checks — the private-address default, `cidr` rules, DNS
+rebinding — still run in the dialer, on every request that goes on to make one.
+They cannot run for a hit, because a hit resolves nothing.
+
+**Entries are not shared between listeners.** Each listener gets its own
+namespace out of the one `-cache` budget. Listeners can differ on
+`allow_private` and on the client certificate they present upstream, and neither
+is a property of the request, so a shared entry could be filled by a listener
+entitled to the content and read by one that is not. The cost is hit rate across
+listeners, which is the right thing to give up.
+
 ### Revalidation
 
 A stale entry holding an `ETag` or `Last-Modified` becomes a conditional
@@ -784,6 +829,15 @@ Both are HTTP/1.1-shaped, and they fail differently if this is got wrong:
 
 So the upgrade path has its own transport, pinned to HTTP/1.1 regardless of this
 setting. That is not a workaround; it is what the protocol requires.
+
+### Interaction with a parent proxy
+
+`h2c` governs the hop this proxy makes on its own. A destination reached through
+`-upstream-proxy` is not that hop — the hop is to the parent, and the parent
+decides what it speaks — so those requests use the ordinary transport. The h2c
+transport dials origins itself and carries no parent routing at all; sending a
+chained request to it would bypass the parent silently, in exactly the
+egress-controlled network that is the parent's reason for existing.
 
 ### Interaction with the timeouts
 
