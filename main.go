@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pod32g/proxy/internal/api"
+	"github.com/pod32g/proxy/internal/cache"
 	"github.com/pod32g/proxy/internal/config"
 	"github.com/pod32g/proxy/internal/pac"
 	"github.com/pod32g/proxy/internal/policy"
@@ -178,6 +179,10 @@ func main() {
 		"export per-destination request counts, sampled from the bounded top-N table at scrape time; off by default because hostnames are client-controlled")
 	topDestinations := flag.Int("destination-metrics-top", server.DefaultTopDestinations,
 		"how many destinations -destination-metrics reports; this is the series count, so keep it small")
+	cacheSize := flag.String("cache", env.get("PROXY_CACHE", ""),
+		"enable the shared response cache with this much memory, e.g. 256MB; empty disables it entirely")
+	cacheMaxEntry := flag.String("cache-max-entry", env.get("PROXY_CACHE_MAX_ENTRY", ""),
+		"largest single response the cache will hold; defaults to a tenth of -cache")
 	upstreamHTTP2 := flag.String("upstream-http2", env.get("PROXY_UPSTREAM_HTTP2", "auto"),
 		"how to speak HTTP/2 to origins: auto (negotiate over TLS), off (force HTTP/1.1), h2c (cleartext HTTP/2)")
 	upstreamProxy := flag.String("upstream-proxy", env.get("PROXY_UPSTREAM_PROXY", ""),
@@ -525,6 +530,40 @@ func main() {
 			log.String("note", "sampled from the bounded top-N table; -stats must be on to populate it"))
 	}
 
+	// Off unless a size is given. A cache is the one component here whose
+	// failure mode is serving one client's content to another, so it does not
+	// arrive by default.
+	var responseCache *cache.Cache
+	if *cacheSize != "" {
+		total, err := parseBytes(*cacheSize)
+		if err != nil {
+			fatalf("-cache: %v", err)
+		}
+		var perEntry int64
+		if *cacheMaxEntry != "" {
+			if perEntry, err = parseBytes(*cacheMaxEntry); err != nil {
+				fatalf("-cache-max-entry: %v", err)
+			}
+			if perEntry > total {
+				fatalf("-cache-max-entry (%s) is larger than -cache (%s)", *cacheMaxEntry, *cacheSize)
+			}
+		}
+		responseCache = cache.New(total, perEntry)
+		responseCache.OnHit = func() { metrics.CacheEvents.WithLabelValues("hit").Inc() }
+		responseCache.OnMiss = func() { metrics.CacheEvents.WithLabelValues("miss").Inc() }
+		responseCache.OnRevalidate = func() { metrics.CacheEvents.WithLabelValues("revalidated").Inc() }
+		responseCache.OnStore = func() { metrics.CacheEvents.WithLabelValues("stored").Inc() }
+		responseCache.OnEvict = func() { metrics.CacheEvents.WithLabelValues("evicted").Inc() }
+		responseCache.OnSize = func(b int64, n int) {
+			metrics.CacheBytes.Set(float64(b))
+			metrics.CacheEntries.Set(float64(n))
+		}
+		logger.Info("Response cache enabled",
+			log.String("size", *cacheSize),
+			log.String("max_entry", strconv.FormatInt(responseCache.MaxEntryBytes(), 10)),
+			log.String("note", "authenticated, no-store and private responses are never cached"))
+	}
+
 	// Read through a function so quotas changed in the UI or API take effect
 	// without a restart, the same way credentials and policy rules do.
 	limiter := newLimiter(cfg.QuotaSet, metrics)
@@ -569,6 +608,7 @@ func main() {
 			// Read per request so rules edited through the UI, the API or a
 			// reload take effect without a restart.
 			HeaderRules: cfg.HeaderRules,
+			Cache:       responseCache,
 			HTTP2:       http2Mode,
 			Upstream:    cfg.UpstreamProxy(),
 		}
@@ -1147,4 +1187,36 @@ func overrideNote(has bool) string {
 		return "listener-specific"
 	}
 	return "global"
+}
+
+// parseBytes reads a size like "256MB" or "1GiB".
+//
+// Both spellings are accepted for the same reason the quota parser accepts
+// both: they are both in common use, and guessing which one an operator meant
+// is how you end up off by five per cent on a memory ceiling.
+func parseBytes(s string) (int64, error) {
+	upper := strings.ToUpper(strings.TrimSpace(s))
+	for _, sfx := range []struct {
+		suffix string
+		mult   int64
+	}{
+		{"KIB", 1 << 10}, {"MIB", 1 << 20}, {"GIB", 1 << 30},
+		{"KB", 1e3}, {"MB", 1e6}, {"GB", 1e9},
+		{"K", 1e3}, {"M", 1e6}, {"G", 1e9},
+	} {
+		digits, ok := strings.CutSuffix(upper, sfx.suffix)
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(digits), 10, 64)
+		if err != nil || n <= 0 {
+			return 0, fmt.Errorf("%q is not a positive size", s)
+		}
+		return n * sfx.mult, nil
+	}
+	n, err := strconv.ParseInt(upper, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%q is not a size (try 256MB)", s)
+	}
+	return n, nil
 }

@@ -58,6 +58,8 @@ go build -o proxy
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
 - `-admin-cert` / `-admin-key` – TLS material for the admin listener. `PROXY_ADMIN_CERT_FILE`, `PROXY_ADMIN_KEY_FILE`.
+- `-cache` – Enable the shared response cache with this much memory, e.g. `256MB`. **Off by default.** `PROXY_CACHE`.
+- `-cache-max-entry` – Largest single response to hold. Defaults to a tenth of `-cache`. `PROXY_CACHE_MAX_ENTRY`.
 - `-upstream-http2` – How to speak HTTP/2 to origins: `auto`, `off` or `h2c`. `PROXY_UPSTREAM_HTTP2`.
 - `-upstream-proxy` – Parent proxy all outbound traffic passes through. `PROXY_UPSTREAM_PROXY`.
 - `-no-proxy` – Hosts, domain suffixes and CIDRs reached directly instead. `PROXY_NO_PROXY`, defaults to `NO_PROXY`.
@@ -660,6 +662,79 @@ responsibility now rather than this proxy's:
 Everything else holds unchanged: `-connect-ports`, the client access table and
 quotas are all about what the client asked for, and a parent does not make an
 arbitrary TCP relay acceptable.
+
+## Response cache
+
+Off unless you give it a size:
+
+```sh
+./proxy -cache 256MB -cache-max-entry 32MB
+```
+
+A shared cache is the biggest thing a forward proxy can do for a network of
+clients fetching overlapping content. It is also the one component here whose
+failure mode is **serving one user's content to another**, which is not a
+degraded cache — it is a disclosure with a performance benefit. Everything below
+follows from that.
+
+### What is never cached
+
+A deny-first gate, checked before anything else:
+
+| Condition | Why |
+|---|---|
+| `Authorization` or `Proxy-Authorization` on the request | See below |
+| `Cache-Control: no-store` (request or response) | Explicit refusal |
+| `Cache-Control: private` | A shared cache is exactly what `private` excludes |
+| `Set-Cookie` on the response | A replayed cookie hands someone a session that is not theirs |
+| `Vary: *` | No stored entry can be known to match |
+| Anything but `GET`/`HEAD` | Not cacheable |
+| No **explicit** freshness | See below |
+
+**The `Authorization` rule is stricter than RFC 9111 requires.** The RFC permits
+caching an authenticated response when the origin says `public`, `s-maxage` or
+`must-revalidate`. A shared forward proxy is precisely where getting those
+conditions subtly wrong becomes cross-user disclosure, and the upside is a cache
+hit. Not worth it — an authenticated request is never stored, whatever the
+response says.
+
+**Freshness must be explicit** — `s-maxage`, `max-age` or a future `Expires`.
+Heuristic freshness guessed from `Last-Modified` would have the proxy invent a
+lifetime for content nobody labelled, and start serving stale pages the origin
+never authorised.
+
+### Revalidation
+
+A stale entry holding an `ETag` or `Last-Modified` becomes a conditional
+request. A `304` refreshes the stored entry rather than discarding it — headers
+instead of a body, which is the entire economy of holding a validator.
+
+`X-Cache` on the response says `HIT`, `MISS` or `REVALIDATED`, so the cache is
+visible from outside rather than only by watching the origin.
+
+### Bounds
+
+Bounded by **bytes, not entries** — an entry count bounds nothing useful when
+one response can be a gigabyte. Least-recently-used eviction keeps the total
+under `-cache`. A response over `-cache-max-entry` is streamed through uncached
+rather than buffered, since holding a large body only to decide not to store it
+is the worst of both outcomes, and it stops one large response evicting
+everything to make room for itself.
+
+Occupancy is observable rather than merely promised:
+
+```
+proxy_cache_bytes 57652
+proxy_cache_entries 7
+proxy_cache_events_total{event="hit"} 5
+proxy_cache_events_total{event="miss"} 44
+proxy_cache_events_total{event="stored"} 42
+proxy_cache_events_total{event="evicted"} 35
+proxy_cache_events_total{event="revalidated"} 0
+```
+
+Variants are kept apart by `Vary`, so a gzip body does not reach a client that
+cannot decode it and an English page does not reach one that asked for Japanese.
 
 ## HTTP/2 to upstreams
 

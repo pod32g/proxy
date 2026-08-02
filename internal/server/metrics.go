@@ -42,6 +42,13 @@ type Metrics struct {
 	// with the origin. Two values in practice, so no cardinality risk — and
 	// before this there was no way to tell what had been spoken at all.
 	UpstreamProtocol *prometheus.CounterVec
+	// CacheEvents counts hits, misses, revalidations, stores and evictions.
+	// A cache whose hit rate cannot be seen is one nobody can tell is working.
+	CacheEvents *prometheus.CounterVec
+	// CacheBytes and CacheEntries are current occupancy, so the bound is
+	// observable rather than merely promised.
+	CacheBytes   prometheus.Gauge
+	CacheEntries prometheus.Gauge
 	// PolicyDecisions counts refusals by what refused them, so a spike is
 	// attributable without reading logs. Both labels are closed sets.
 	PolicyDecisions *prometheus.CounterVec
@@ -133,6 +140,21 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 			},
 			[]string{"proto"},
 		),
+		CacheEvents: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "proxy_cache_events_total",
+				Help: "Response cache events by kind: hit, miss, revalidated, stored, evicted",
+			},
+			[]string{"event"},
+		),
+		CacheBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "proxy_cache_bytes",
+			Help: "Bytes currently held in the response cache",
+		}),
+		CacheEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "proxy_cache_entries",
+			Help: "Responses currently held in the cache",
+		}),
 		PolicyDecisions: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "proxy_policy_decisions_total",
@@ -148,6 +170,7 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 		m.Requests, m.Duration, m.Clients, m.AuthFailures,
 		m.QuotaRejected, m.RelayedBytes, m.QuotaClients,
 		m.UpstreamDuration, m.ActiveTunnels, m.PolicyDecisions, m.UpstreamProtocol,
+		m.CacheEvents, m.CacheBytes, m.CacheEntries,
 	} {
 		if err := reg.Register(c); err != nil {
 			return nil, err

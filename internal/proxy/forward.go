@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pod32g/proxy/internal/cache"
 	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/reqid"
@@ -48,6 +49,10 @@ type Policy struct {
 	// request so edits take effect without a restart. Applied after the
 	// hop-by-hop strip, which they cannot precede or undo.
 	HeaderRules func(clientIP string) *header.RuleSet
+
+	// Cache, when set, is a shared response cache. Nil disables caching
+	// entirely — no lookup, no buffering, no storability check.
+	Cache *cache.Cache
 
 	// HTTP2 says how the proxy speaks HTTP/2 to origins. The zero value is
 	// HTTP2Auto, which is what the default transport already did.
@@ -449,6 +454,13 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			handleUpgrade(w, r, upgradeTransport, headers, logger, proto, obs, pol)
 			return
 		}
+		// A fresh hit answers here, before any of the outbound work.
+		served, stale := serveFromCache(w, r, pol.Cache)
+		if served {
+			markServed(w)
+			return
+		}
+
 		outReq := r.Clone(context.WithValue(r.Context(), clientKey{}, clientIP(r.RemoteAddr)))
 		outReq.RequestURI = ""
 		// r.Clone copies every header the client sent to the *proxy*, including
@@ -462,6 +474,9 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// Set after the operator's headers so a stray -header cannot displace it.
 		setRequestID(outReq)
 		applyHeaderRules(pol, outReq.Header, header.Request, clientIP(r.RemoteAddr), r.URL.Host)
+		// A stale entry with a validator becomes a conditional request, so the
+		// origin can answer 304 with headers instead of a body.
+		conditional(outReq, stale)
 
 		// With a parent the transport connects to it, not to the destination,
 		// so the destination check has to happen here instead of in the dialer.
@@ -520,9 +535,26 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		defer resp.Body.Close()
 		removeHopByHop(resp.Header)
 		applyHeaderRules(pol, resp.Header, header.Response, clientIP(r.RemoteAddr), r.URL.Host)
+
+		// A 304 against a stored entry means the entry is still good: refresh
+		// its lifetime and serve it. That exchange cost headers rather than a
+		// body, which is the entire point of holding a validator.
+		if resp.StatusCode == http.StatusNotModified && stale != nil {
+			if ttl, ok := cache.TTL(resp); ok {
+				pol.Cache.Refresh(stale, resp, ttl)
+			}
+			pol.Cache.Revalidated()
+			writeEntry(w, stale, "REVALIDATED")
+			return
+		}
+
+		body := storeResponse(r, resp, pol.Cache)
 		copyHeader(w.Header(), resp.Header)
+		if pol.Cache != nil {
+			w.Header().Set("X-Cache", "MISS")
+		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		io.Copy(w, body)
 	})
 }
 
