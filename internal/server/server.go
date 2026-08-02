@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pod32g/proxy/internal/guard"
 	log "github.com/pod32g/simple-logger"
 )
 
@@ -38,6 +39,11 @@ type Server struct {
 
 	Logger  *log.Logger
 	Clients *ClientTracker
+
+	// Tunnels are the hijacked connections, which Shutdown does not know
+	// about. Closing them is what writes their access records, so they are
+	// closed here rather than left for process exit to sever unrecorded.
+	Tunnels *TunnelRegistry
 }
 
 // Listener is one additional bound address and what it serves.
@@ -214,7 +220,8 @@ func (s *Server) Start() error {
 	for i, spec := range specs {
 		srv := s.newHTTPServer(spec)
 		servers[i] = srv
-		go func(spec listener, srv *http.Server, sock net.Listener) {
+		sock := sockets[i]
+		go guard.Do(s.Logger, "listener "+spec.name, func() {
 			scheme := "HTTP"
 			if spec.tls() {
 				scheme = "HTTPS"
@@ -236,7 +243,7 @@ func (s *Server) Start() error {
 				// connect to is gone.
 				errCh <- fmt.Errorf("%s listener failed: %w", spec.name, err)
 			}
-		}(spec, srv, sockets[i])
+		})
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -259,8 +266,19 @@ func (s *Server) Start() error {
 			s.Logger.Errorf("Shutdown: %v", err)
 		}
 	}
-	// Shutdown does not track hijacked connections, so an established CONNECT
-	// tunnel is closed when the process exits rather than drained here.
+	// Shutdown does not track hijacked connections, so they are closed here.
+	// Not to drain them — the process is going away and a tunnel has no
+	// graceful end — but because closing is what writes their access record.
+	// Left to process exit they were severed unrecorded, so every long-lived
+	// session in flight at a restart vanished from the log.
+	if n := s.Tunnels.CloseAll(); n > 0 {
+		s.Logger.Info("Closing tunnels", log.Int("count", n))
+		s.Tunnels.Wait(ctx)
+		if left := s.Tunnels.Len(); left > 0 {
+			s.Logger.Warn("Tunnels did not report before the deadline",
+				log.Int("unrecorded", left))
+		}
+	}
 	s.Logger.Info("Shutdown complete")
 	return runErr
 }

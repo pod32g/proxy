@@ -91,6 +91,9 @@ func logStructured(logger *log.Logger, e Exchange) {
 	if e.Incomplete {
 		fields = append(fields, log.Bool("incomplete", true))
 	}
+	if e.ShutdownClosed {
+		fields = append(fields, log.Bool("closed_by_shutdown", true))
+	}
 	logger.Info("access", fields...)
 }
 

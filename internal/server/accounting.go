@@ -3,16 +3,19 @@ package server
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pod32g/proxy/internal/reqid"
+	log "github.com/pod32g/simple-logger"
 )
 
 // Exchange is the record of one completed request, as the access log wants it.
@@ -44,6 +47,10 @@ type Exchange struct {
 	// count alone cannot either without a Content-Length to compare it against
 	// — so a truncated download used to be indistinguishable from a served one.
 	Incomplete bool
+	// ShutdownClosed marks a tunnel the proxy closed because it was shutting
+	// down, rather than one either peer ended. Without it a tunnel severed at
+	// restart is indistinguishable in the log from one that finished.
+	ShutdownClosed bool
 	// Tunnel marks an exchange that was hijacked — a CONNECT tunnel or a
 	// protocol upgrade. Its record arrives when the connection closes, not when
 	// it was established, so the byte counts mean something.
@@ -52,6 +59,10 @@ type Exchange struct {
 
 // Accounting is what the middleware does with what it observes.
 type Accounting struct {
+	// Logger, when set, reports a panic in the handler. Optional; without it a
+	// recovered panic is still recorded in the exchange, just not explained.
+	Logger *log.Logger
+
 	// Charge is called as bytes move, possibly many times per exchange, with
 	// the bytes read from and written to the client since the last call. Quotas
 	// need the incremental form: a tunnel that runs for an hour must not escape
@@ -61,6 +72,10 @@ type Accounting struct {
 	// Completed is called once, when the exchange is over. For a hijacked
 	// connection that is on close.
 	Completed func(Exchange)
+	// Tunnels, when set, is told about hijacked connections so shutdown can
+	// close them and collect their records. Nil means they are not tracked,
+	// and a tunnel open at exit goes unrecorded.
+	Tunnels *TunnelRegistry
 }
 
 func (a Accounting) empty() bool { return a.Charge == nil && a.Completed == nil }
@@ -103,6 +118,7 @@ func AccountingMiddleware(next http.Handler, acct Accounting) http.Handler {
 			ResponseWriter: w,
 			client:         client,
 			charge:         acct.Charge,
+			tunnels:        acct.Tunnels,
 		}
 		if r.Body != nil {
 			r.Body = &accountedBody{ReadCloser: r.Body, w: m}
@@ -118,12 +134,43 @@ func AccountingMiddleware(next http.Handler, acct Accounting) http.Handler {
 		m.completed = acct.Completed
 		m.start = start
 
-		next.ServeHTTP(m, r)
-
+		// Deferred, so the exchange is recorded whether the handler returns or
+		// panics. It used to be a plain call after ServeHTTP, which a panic
+		// unwound straight past: net/http recovered, the client got a dropped
+		// connection, and the request left no access record and no charge
+		// against the byte quota. The requests that panic are exactly the ones
+		// worth having a record of.
+		//
 		// A hijacked connection outlives the handler; its own Close reports it.
-		if !m.hijacked.Load() {
-			m.finish()
-		}
+		defer func() {
+			if !m.hijacked.Load() {
+				m.finish()
+			}
+		}()
+		// Registered second, so it runs first and the record above sees the
+		// marks it sets. Recovering here rather than leaving it to net/http
+		// buys three things: the stack, an honest 500 instead of a dropped
+		// connection, and the exchange marked rather than looking like an
+		// ordinary short response.
+		defer func() {
+			rec := recover()
+			if rec == nil {
+				return
+			}
+			m.incomplete.Store(true)
+			if m.status.Load() == 0 {
+				m.WriteHeader(http.StatusInternalServerError)
+			}
+			if acct.Logger != nil {
+				acct.Logger.Error("Handler panicked; this is a bug",
+					log.String("client", client), log.String("method", r.Method),
+					log.String("request_id", id),
+					log.String("panic", fmt.Sprint(rec)),
+					log.String("stack", string(debug.Stack())))
+			}
+		}()
+
+		next.ServeHTTP(m, r)
 	})
 }
 
@@ -212,8 +259,9 @@ func sanitizeHost(host string) string {
 
 type accountedWriter struct {
 	http.ResponseWriter
-	client string
-	charge func(client string, in, out int64)
+	client  string
+	charge  func(client string, in, out int64)
+	tunnels *TunnelRegistry
 
 	in  atomic.Int64
 	out atomic.Int64
@@ -225,6 +273,7 @@ type accountedWriter struct {
 	served     atomic.Bool
 	skipped    atomic.Bool
 	incomplete atomic.Bool
+	shutdown   atomic.Bool
 
 	start time.Time
 	// mu guards exchange, which the handler mutates through SetProtocol while
@@ -384,6 +433,7 @@ func (m *accountedWriter) finish() {
 	e.Tunnel = m.hijacked.Load()
 	e.Served = m.served.Load()
 	e.Incomplete = m.incomplete.Load()
+	e.ShutdownClosed = m.shutdown.Load()
 	m.completed(e)
 }
 
@@ -406,7 +456,9 @@ func (m *accountedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	// Flush what the exchange cost before the switch: the request headers and
 	// any body already read.
 	m.flushCharge()
-	return &accountedConn{Conn: conn, w: m}, buf, nil
+	ac := &accountedConn{Conn: conn, w: m}
+	m.tunnels.add(ac)
+	return ac, buf, nil
 }
 
 // accountedConn is the client side of a hijacked exchange. Read is traffic from
@@ -439,6 +491,7 @@ func (c *accountedConn) Write(b []byte) (int, error) {
 // guards against reporting the same exchange twice.
 func (c *accountedConn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
+		c.w.tunnels.remove(c)
 		c.w.finish()
 	}
 	return c.Conn.Close()

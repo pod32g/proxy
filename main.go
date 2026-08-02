@@ -19,6 +19,7 @@ import (
 	"github.com/pod32g/proxy/internal/api"
 	"github.com/pod32g/proxy/internal/cache"
 	"github.com/pod32g/proxy/internal/config"
+	"github.com/pod32g/proxy/internal/guard"
 	"github.com/pod32g/proxy/internal/pac"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/proxy"
@@ -414,11 +415,27 @@ func main() {
 
 	store, err := config.NewStore(*dbPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to open DB: %v\n", err)
+		fmt.Fprintf(os.Stderr,
+			"Failed to open %s: %v\nStored configuration will be neither read nor written; "+
+				"the proxy will run from flags, environment and -config only.\n", *dbPath, err)
 	} else {
 		defer store.Close()
 		if err := store.Load(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+			// Fatal, not a warning. A read failure used to be printed and
+			// stepped over, which left the proxy running with whatever had
+			// loaded — in practice no destination policy, no client table and
+			// no quotas, since those live only in the database when they were
+			// set through the UI. It fails open: a client table saying
+			// "default deny" becomes one that admits everyone.
+			//
+			// The startup Save then wrote those defaults back over the settings
+			// it had failed to read, so a transient disk error destroyed the
+			// configuration and the audit trail recorded it as a legitimate
+			// change. Refusing to start is the only answer that neither serves
+			// traffic under a policy nobody chose nor overwrites the real one.
+			fatalf("Failed to read the stored configuration from %s: %v\n"+
+				"Refusing to start: continuing would run without the stored policy "+
+				"and overwrite it on the next save.", *dbPath, err)
 		}
 		// flag > env > file > stored > default. The file lands between the
 		// database and the explicit settings: it outranks what a previous UI
@@ -592,6 +609,10 @@ func main() {
 			log.String("note", "authenticated, no-store and private responses are never cached"))
 	}
 
+	// Shared across listeners: it exists so shutdown can find every hijacked
+	// connection, and there is one shutdown.
+	tunnelRegistry := server.NewTunnelRegistry()
+
 	// A quota bounds the rate a client acquires tunnels; nothing bounded how
 	// many it held, and a tunnel is acquired once and kept. Reported either way,
 	// because "unlimited" is a choice an operator should see they have made.
@@ -723,6 +744,8 @@ func main() {
 
 		instrument := func(h http.Handler) http.Handler {
 			return server.AccountingMiddleware(server.MetricsMiddleware(h, metrics), server.Accounting{
+				Logger:  logger,
+				Tunnels: tunnelRegistry,
 				Charge: func(client string, in, out int64) {
 					// The quota is charged the total — bytes cost the same
 					// whichever way they went — while the metric keeps them
@@ -886,6 +909,7 @@ func main() {
 		Handler:   server.WithListener(instrument(mux), "http"),
 		Logger:    logger,
 		Clients:   tracker,
+		Tunnels:   tunnelRegistry,
 	}
 	if adminMux != nil {
 		srv.AdminAddr = *adminAddr
@@ -895,7 +919,9 @@ func main() {
 	}
 
 	if *configPath != "" {
-		go watchReloads(*configPath, cfgFile, cfg, store, logger, set, cli)
+		guard.Go(logger, "reload watcher", func() {
+			watchReloads(*configPath, cfgFile, cfg, store, logger, set, cli)
+		})
 		logger.Info("Configuration file loaded; send SIGHUP to reload",
 			log.String("path", *configPath))
 	}

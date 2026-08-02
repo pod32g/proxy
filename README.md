@@ -277,7 +277,14 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
   Kubernetes secrets already have. The proxy warns when a credential arrives by
   flag or environment, and when a secret file is world-readable. A missing or
   empty secret file is a startup error rather than an empty credential.
-- - **Authentication cannot be enabled without a credential.** Every path refuses
+- - **The proxy refuses to start if it cannot read its stored configuration.** A
+  read failure used to be stepped over, leaving it running with no destination
+  policy and no client table — and the startup save then wrote those defaults
+  over the settings it had failed to read.
+- **A panic is logged, not fatal.** Recovery is in one place every spawned
+  goroutine goes through: `net/http` protects handler goroutines, and a proxy
+  spawns several more that it does not.
+- **Authentication cannot be enabled without a credential.** Every path refuses
   it — startup, reload, API and UI — because the Router fails closed on that
   combination and the admin surface is behind the same gate, so the change
   could not be undone through the interface that made it.
@@ -831,7 +838,10 @@ instead of a body, which is the entire economy of holding a validator.
 visible from outside rather than only by watching the origin.
 
 A relay that ends before the body does is marked `incomplete` in the access
-record and logged with the request id. The status is already on the wire by
+record and logged with the request id. A tunnel still open when the proxy shuts
+down is closed so its record is written, marked `closed_by_shutdown` — left to
+process exit it was severed unrecorded, so every long-lived session at every
+restart went missing from the log. The status is already on the wire by
 then and cannot say so, and the byte count alone cannot either.
 
 Stored entries are **immutable**: a revalidation installs a replacement rather

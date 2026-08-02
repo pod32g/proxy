@@ -281,7 +281,33 @@ func ensureSalt(tx *sql.Tx) ([]byte, error) {
 	return salt, nil
 }
 
+// setting reads one stored setting, distinguishing a value that was never set
+// from one that could not be read.
+//
+// Every read in Load used to be guarded by `if err == nil`, which uses the
+// error only as a presence check — so sql.ErrNoRows and a disk error were the
+// same thing. A database that opened but could not be read produced a proxy
+// with no destination policy, no client table and no quotas, silently, and the
+// startup Save then wrote those defaults back over what it had failed to read.
+// The client table in that state admits everyone.
+func (s *Store) setting(key string) (string, bool, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("reading %s: %w", key, err)
+	}
+	return v, true, nil
+}
+
 // Load populates cfg with data from the store. It overrides fields present in the database.
+//
+// An error here means the stored configuration could not be read in full. The
+// caller must not carry on with what did load: a half-read configuration is
+// indistinguishable from a deliberately sparse one, and the settings most
+// likely to go missing are the ones that restrict things.
 func (s *Store) Load(cfg *Config) error {
 	if s == nil || s.db == nil {
 		return nil
@@ -313,43 +339,57 @@ func (s *Store) Load(cfg *Config) error {
 	}
 
 	// settings
-	var val string
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='log_level'`).Scan(&val); err == nil {
+	if val, ok, err := s.setting("log_level"); err != nil {
+		return err
+	} else if ok {
 		cfg.SetLogLevel(ParseLogLevel(val))
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='auth_enabled'`).Scan(&val); err == nil {
+	if val, ok, err := s.setting("auth_enabled"); err != nil {
+		return err
+	} else if ok {
 		enabled, _ := strconv.ParseBool(val)
 		cfg.SetAuthEnabled(enabled)
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='stats_enabled'`).Scan(&val); err == nil {
+	if val, ok, err := s.setting("stats_enabled"); err != nil {
+		return err
+	} else if ok {
 		enabled, _ := strconv.ParseBool(val)
 		cfg.SetStatsEnabled(enabled)
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='proxy_name'`).Scan(&val); err == nil {
+	if val, ok, err := s.setting("proxy_name"); err != nil {
+		return err
+	} else if ok {
 		cfg.SetProxyName(val)
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='proxy_id'`).Scan(&val); err == nil {
+	if val, ok, err := s.setting("proxy_id"); err != nil {
+		return err
+	} else if ok {
 		cfg.SetProxyID(val)
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='client_rules'`).Scan(&val); err == nil {
+	if val, ok, err := s.setting("client_rules"); err != nil {
+		return err
+	} else if ok {
 		if err := cfg.SetClientRules(val); err != nil {
 			s.warn("stored client rules are invalid and were ignored: %v", err)
 		}
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='policy_rules'`).Scan(&val); err == nil {
+	if val, ok, err := s.setting("policy_rules"); err != nil {
+		return err
+	} else if ok {
 		if err := cfg.SetPolicyRules(val); err != nil {
-			// Refusing to start over a stored rule set would strand the proxy
-			// on a value only the UI can fix. Warn and carry on with no rules,
-			// which leaves the private-address default in place.
 			s.warn("stored policy rules are invalid and were ignored: %v", err)
 		}
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='quota_rules'`).Scan(&val); err == nil {
+	if val, ok, err := s.setting("quota_rules"); err != nil {
+		return err
+	} else if ok {
 		if err := cfg.SetQuotas(val); err != nil {
 			s.warn("stored quota rules are invalid and were ignored: %v", err)
 		}
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='header_rules'`).Scan(&val); err == nil {
+	if val, ok, err := s.setting("header_rules"); err != nil {
+		return err
+	} else if ok {
 		if err := cfg.SetHeaderRules(val); err != nil {
 			s.warn("stored header rules are invalid and were ignored: %v", err)
 		}
@@ -357,12 +397,13 @@ func (s *Store) Load(cfg *Config) error {
 
 	// The parent's URL and bypass list are plaintext; its credentials come back
 	// through the same sealed path as the proxy's own, below.
-	var upURL, upBypass string
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='upstream_proxy'`).Scan(&val); err == nil {
-		upURL = val
+	upURL, _, err := s.setting("upstream_proxy")
+	if err != nil {
+		return err
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='upstream_proxy_bypass'`).Scan(&val); err == nil {
-		upBypass = val
+	upBypass, _, err := s.setting("upstream_proxy_bypass")
+	if err != nil {
+		return err
 	}
 	if upURL != "" {
 		if err := cfg.SetUpstreamProxy(upURL, upBypass); err != nil {
@@ -371,20 +412,28 @@ func (s *Store) Load(cfg *Config) error {
 	}
 
 	_, user, pass := cfg.GetAuth()
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='username'`).Scan(&val); err == nil {
-		user = s.plaintext(cfg.SecretKey, salt, val, user, "username")
+	if v, ok, err := s.setting("username"); err != nil {
+		return err
+	} else if ok {
+		user = s.plaintext(cfg.SecretKey, salt, v, user, "username")
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='password'`).Scan(&val); err == nil {
-		pass = s.plaintext(cfg.SecretKey, salt, val, pass, "password")
+	if v, ok, err := s.setting("password"); err != nil {
+		return err
+	} else if ok {
+		pass = s.plaintext(cfg.SecretKey, salt, v, pass, "password")
 	}
 	cfg.SetCredentials(user, pass)
 
 	upUser, upPass := cfg.UpstreamProxyCredentials()
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='upstream_proxy_user'`).Scan(&val); err == nil {
-		upUser = s.plaintext(cfg.SecretKey, salt, val, upUser, "upstream proxy username")
+	if v, ok, err := s.setting("upstream_proxy_user"); err != nil {
+		return err
+	} else if ok {
+		upUser = s.plaintext(cfg.SecretKey, salt, v, upUser, "upstream proxy username")
 	}
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key='upstream_proxy_password'`).Scan(&val); err == nil {
-		upPass = s.plaintext(cfg.SecretKey, salt, val, upPass, "upstream proxy password")
+	if v, ok, err := s.setting("upstream_proxy_password"); err != nil {
+		return err
+	} else if ok {
+		upPass = s.plaintext(cfg.SecretKey, salt, v, upPass, "upstream proxy password")
 	}
 	if upUser != "" || upPass != "" {
 		cfg.SetUpstreamProxyCredentials(upUser, upPass)

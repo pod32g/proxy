@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pod32g/proxy/internal/cache"
+	"github.com/pod32g/proxy/internal/guard"
 	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/reqid"
@@ -883,7 +884,7 @@ func handleUpgrade(
 	// long-lived, carrying traffic a request counter cannot see, and gone from
 	// the gauge only when it closes.
 	obs.tunnelOpened()
-	go transferPair(pol.idle(upstream), pol.idle(clientConn), release)
+	go transferPair(logger, pol.idle(upstream), pol.idle(clientConn), release)
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, pol Policy, dialer *net.Dialer, obs Observer) {
@@ -957,7 +958,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 		return
 	}
 	obs.tunnelOpened()
-	go transferPair(pol.idle(destConn), pol.idle(clientConn), release)
+	go transferPair(logger, pol.idle(destConn), pol.idle(clientConn), release)
 }
 
 // dialThroughParent connects to the parent proxy and issues a nested CONNECT
@@ -1096,11 +1097,17 @@ func transfer(dst io.WriteCloser, src io.ReadCloser) {
 // transferPair splices two connections and runs done once, when the tunnel is
 // finished. Both directions are pumped; whichever ends first closes both, so
 // waiting for a single one is enough and a sync.Once is not needed.
-func transferPair(a, b io.ReadWriteCloser, done func()) {
-	go transfer(a, b)
-	transfer(b, a)
+//
+// Both goroutines are guarded. done is the accounting layer's completion
+// callback — the access log, the destination counter, the quota release — and
+// it runs here rather than in the handler goroutine, so nothing recovers a
+// panic in it. A panicking sink used to take the whole process down while the
+// identical callback on an ordinary request cost one connection.
+func transferPair(logger *log.Logger, a, b io.ReadWriteCloser, done func()) {
+	guard.Go(logger, "tunnel upstream", func() { transfer(a, b) })
+	guard.Do(logger, "tunnel downstream", func() { transfer(b, a) })
 	if done != nil {
-		done()
+		guard.Do(logger, "tunnel completion", done)
 	}
 }
 
