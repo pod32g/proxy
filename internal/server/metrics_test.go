@@ -1,6 +1,9 @@
 package server
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"net/http"
 	"net/http/httptest"
@@ -152,4 +155,61 @@ func countRequests(t *testing.T, reg *prometheus.Registry) float64 {
 		}
 	}
 	return total
+}
+
+// PROXY-86. The method is a client-chosen token and a metric vector never
+// evicts, so every distinct value used to be a permanent series — minted before
+// the Router had a chance to refuse the request.
+func TestMadeUpMethodsDoNotGrowTheRegistry(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := NewMetrics(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := MetricsMiddleware(okHandler("ok"), m)
+	for i := 0; i < 500; i++ {
+		req := httptest.NewRequest(fmt.Sprintf("BOGUS%d", i), "http://example.com/", nil)
+		req.RemoteAddr = "10.1.2.3:5000"
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	// One real method too, so the test would catch a fix that collapsed
+	// everything to "other" rather than only the unrecognised.
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		switch f.GetName() {
+		case "proxy_http_requests_total", "proxy_http_request_duration_seconds":
+			if n := len(f.GetMetric()); n > 2 {
+				t.Errorf("%s has %d series after 500 made-up methods, want 2", f.GetName(), n)
+			}
+			var seen []string
+			for _, mm := range f.GetMetric() {
+				for _, l := range mm.GetLabel() {
+					if l.GetName() == "method" {
+						seen = append(seen, l.GetValue())
+					}
+				}
+			}
+			t.Logf("%-42s method labels: %v", f.GetName(), seen)
+		}
+	}
+}
+
+func TestMethodLabelKeepsTheStandardSet(t *testing.T) {
+	for _, m := range []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "CONNECT", "OPTIONS", "TRACE"} {
+		if got := MethodLabel(m); got != m {
+			t.Errorf("MethodLabel(%q) = %q, want it unchanged", m, got)
+		}
+	}
+	for _, m := range []string{"BOGUS", "get", "", "PROPFIND", strings.Repeat("A", 400)} {
+		if got := MethodLabel(m); got != "other" {
+			t.Errorf("MethodLabel(%q) = %q, want \"other\"", m, got)
+		}
+	}
 }

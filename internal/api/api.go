@@ -210,10 +210,15 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if req.Name != "" {
+			var err error
 			if req.Client == "" {
-				h.cfg.SetHeader(req.Name, req.Value)
+				err = h.cfg.SetHeader(req.Name, req.Value)
 			} else {
-				h.cfg.SetClientHeader(req.Client, req.Name, req.Value)
+				err = h.cfg.SetClientHeader(req.Client, req.Name, req.Value)
+			}
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
 			}
 			if h.logger != nil {
 				h.logger.Info("Set header", log.String("name", req.Name),

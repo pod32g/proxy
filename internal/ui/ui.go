@@ -605,10 +605,15 @@ func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 	value := r.FormValue("value")
 	client := r.FormValue("client")
 	if name != "" {
+		var err error
 		if client == "" {
-			h.cfg.SetHeader(name, value)
+			err = h.cfg.SetHeader(name, value)
 		} else {
-			h.cfg.SetClientHeader(client, name, value)
+			err = h.cfg.SetClientHeader(client, name, value)
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		if h.logger != nil {
 			h.logger.Info("Set header", log.String("name", name),

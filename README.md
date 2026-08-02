@@ -65,6 +65,9 @@ go build -o proxy
 - `-no-proxy` – Hosts, domain suffixes and CIDRs reached directly instead. `PROXY_NO_PROXY`, defaults to `NO_PROXY`.
 - `-upstream-ca` – Additional CA bundle trusted for upstream TLS, added to the system roots. `PROXY_UPSTREAM_CA`.
 - `-upstream-cert` / `-upstream-key` – Client certificate presented to upstreams that ask for one. `PROXY_UPSTREAM_CERT`, `PROXY_UPSTREAM_KEY`.
+- `-max-tunnels` – Most CONNECT tunnels and upgrades held open at once, across all clients. 0 is unlimited.
+- `-max-tunnels-per-client` – Most one source address may hold. 0 is unlimited.
+- `-tunnel-idle-timeout` – Close a tunnel neither side has moved bytes on for this long. 0 disables it.
 - `-pac` – Serve a proxy auto-configuration file at `/proxy.pac`. **Off by default.** `PROXY_PAC`.
 - `-pac-address` – host:port the PAC advertises. Defaults to the listen address, which is often not what clients reach.
 - `-pac-hint-direct` – Add `DIRECT` hints for refused destinations. **Publishes your deny list.** See below.
@@ -273,6 +276,8 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
   Kubernetes secrets already have. The proxy warns when a credential arrives by
   flag or environment, and when a secret file is world-readable. A missing or
   empty secret file is a startup error rather than an empty credential.
+- - **Bound what clients can hold.** Set `-max-tunnels-per-client`; a request
+  quota limits how fast tunnels are opened, not how many stay open.
 - **Failed logins are logged and throttled.** Ten failures from one address
   within a minute earn a `429` for the rest of that minute, and every failure
   increments `proxy_auth_failures_total`.
@@ -474,6 +479,23 @@ refill window rather than a multi-hour lockout.
 
 `CONNECT` tunnels are accounted for in both directions, so a tunnel cannot move
 unlimited traffic on the strength of being a single request.
+
+**A quota bounds a rate, not a stock, and for a tunnel the stock is what
+matters.** Opening a tunnel is one request; holding it costs two sockets and two
+goroutines for as long as the client likes. At `client requests 50/s` a client
+opens fifty a second forever and reaches a 1024-descriptor limit in about ten
+seconds. `-max-tunnels` and `-max-tunnels-per-client` bound what is held;
+over-limit attempts get `503` and are counted as refusals like any other.
+
+Both default to unlimited, which is what the proxy did before. No default was
+invented: a browser holds a handful and a NAT gateway serving a thousand users
+holds thousands, so a number that fits one breaks the other. In forward mode the
+proxy says at startup which of the two situations it is in.
+
+`-tunnel-idle-timeout` reclaims a tunnel neither side is using. Off by default —
+SSH over `CONNECT`, a long-poll and an open WebSocket are all legitimately quiet
+for long stretches, and a proxy that severs them is worse than one that holds
+them.
 
 Quotas are visible in `proxy_quota_rejected_total{scope}`,
 `proxy_relayed_bytes_total` and `proxy_quota_tracked_clients`. The bucket table

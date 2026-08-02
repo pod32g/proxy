@@ -77,7 +77,14 @@ type Config struct {
 }
 
 // SetHeader adds or updates a header in the config in a thread-safe manner.
-func (c *Config) SetHeader(name, value string) {
+//
+// Validated with the same function the rule parser uses. Without it the two
+// ways of setting a header disagreed about what a header may contain, and the
+// permissive one answered success for a value that then broke every request.
+func (c *Config) SetHeader(name, value string) error {
+	if err := header.Validate(name, value); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.Headers == nil {
@@ -85,10 +92,14 @@ func (c *Config) SetHeader(name, value string) {
 	}
 	c.Headers[name] = value
 	c.rebuildHeaderRulesLocked()
+	return nil
 }
 
 // SetClientHeader sets a header for a specific client.
-func (c *Config) SetClientHeader(client, name, value string) {
+func (c *Config) SetClientHeader(client, name, value string) error {
+	if err := header.Validate(name, value); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.ClientHeaders == nil {
@@ -99,6 +110,7 @@ func (c *Config) SetClientHeader(client, name, value string) {
 	}
 	c.ClientHeaders[client][name] = value
 	c.rebuildHeaderRulesLocked()
+	return nil
 }
 
 // DeleteClientHeader removes a header for a specific client.

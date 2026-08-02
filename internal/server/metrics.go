@@ -176,6 +176,34 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 	return m, nil
 }
 
+// MethodLabel collapses a request method to a bounded set of label values.
+//
+// The method is a token the client chooses, and Go's server validates nothing
+// beyond that it is a token. A metric vector never evicts, so every distinct
+// value is a permanent series — and the middleware runs outside the Router, so
+// a request that fails authentication is counted before it is refused. Two
+// hundred made-up methods from an unauthenticated client produced two hundred
+// histograms and a quarter of a megabyte of scrape output; the auth-failure
+// throttle fired at ten and counted the 429s under the same made-up names.
+//
+// Everything outside the registered set becomes "other". Losing the exact verb
+// of a nonsense request is not a loss: the standard methods are what anyone
+// graphs, and "other" rising is the signal that matters.
+//
+// The sibling labels in this file each carry a note explaining why they are
+// bounded — listener by configuration, protocol by there being two in practice,
+// destinations off by default because hostnames are client-controlled. This was
+// the one that had no such note and needed one most.
+func MethodLabel(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodConnect,
+		http.MethodOptions, http.MethodTrace:
+		return method
+	}
+	return "other"
+}
+
 // MetricsMiddleware records Prometheus metrics for requests.
 func MetricsMiddleware(next http.Handler, m *Metrics) http.Handler {
 	if next == nil || m == nil {
@@ -209,8 +237,9 @@ func MetricsMiddleware(next http.Handler, m *Metrics) http.Handler {
 			code = http.StatusOK
 		}
 		name := ListenerName(r.Context())
-		m.Duration.WithLabelValues(r.Method, name).Observe(dur)
-		m.Requests.WithLabelValues(r.Method, strconv.Itoa(code), name).Inc()
+		method := MethodLabel(r.Method)
+		m.Duration.WithLabelValues(method, name).Observe(dur)
+		m.Requests.WithLabelValues(method, strconv.Itoa(code), name).Inc()
 	})
 }
 

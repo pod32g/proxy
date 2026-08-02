@@ -104,6 +104,33 @@ var forbidden = map[string]string{
 	"content-length":      "the transport owns this; rewriting it corrupts framing",
 }
 
+// Validate reports whether a name and value may be set as a header at all.
+//
+// The same three checks ParseRule makes, exported so the older headers map goes
+// through them too. It did not: a rule refuses a value containing CR, LF or NUL
+// because "a newline in a value is response splitting", while the map — still
+// the UI's editing surface and the API's /headers endpoint — validated nothing.
+// Go's transport refuses to send such a value, so nothing escaped to the wire;
+// what happened instead is that the write reported success and every subsequent
+// request through that listener failed with a 502 whose cause was in a log line
+// somewhere else.
+//
+// One function, called by both, so the two cannot disagree about what a header
+// may contain.
+func Validate(name, value string) error {
+	canonical := http.CanonicalHeaderKey(strings.TrimSpace(name))
+	if err := validHeaderName(canonical); err != nil {
+		return err
+	}
+	if err := validHeaderValue(value); err != nil {
+		return err
+	}
+	if why, blocked := Forbidden(canonical); blocked {
+		return fmt.Errorf("%s may not be set: %s", canonical, why)
+	}
+	return nil
+}
+
 // Forbidden reports whether a rule may set a header, and why not.
 //
 // Exported so the relationship between this list and the hop-by-hop set the

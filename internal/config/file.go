@@ -705,32 +705,6 @@ func listenersStr(f *File) string {
 	return strings.Join(strings.Fields(string(out)), " ")
 }
 
-func sameStr(a, b *string) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
-}
-
-func sameBool(a, b *bool) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
-}
-
-func samePorts(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func deref(s *string) string {
 	if s == nil {
 		return "(unset)"

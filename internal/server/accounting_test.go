@@ -252,3 +252,46 @@ func TestAccountingFlushesPendingBytesOnHijack(t *testing.T) {
 	w.Flush()
 	<-handlerDone
 }
+
+// PROXY-88. The request identifier is capped at 128 with an explicit note about
+// bloating every log line. Host and Path are on the same line, from the same
+// client, and were capped by nothing.
+func TestClientControlledLogFieldsAreBounded(t *testing.T) {
+	long := strings.Repeat("a", 8000)
+	for _, tc := range []struct {
+		name   string
+		target string
+		method string
+	}{
+		{"absolute-form host and path", "http://" + long + ".example.com/" + long, http.MethodGet},
+		{"CONNECT authority", "http://x/", http.MethodConnect},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got Exchange
+			h := AccountingMiddleware(okHandler("ok"), Accounting{
+				Completed: func(e Exchange) { got = e },
+			})
+			req := httptest.NewRequest(tc.method, tc.target, nil)
+			if tc.method == http.MethodConnect {
+				req.Host = long + ".example.com:443"
+			}
+			req.RemoteAddr = "10.1.2.3:5000"
+			req.Header.Set("X-Request-Id", strings.Repeat("z", 8000))
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			for _, f := range []struct {
+				name  string
+				value string
+			}{{"host", got.Host}, {"path", got.Path}, {"request id", got.RequestID}} {
+				if len(f.value) > MaxLoggedField+len("…[truncated]") {
+					t.Errorf("%s is %d chars; nothing bounds it", f.name, len(f.value))
+				}
+			}
+			// Truncation must be visible, or a reader sees a different URL than
+			// was requested and has no way to know.
+			if len(got.Host) > MaxLoggedField && !strings.HasSuffix(got.Host, "[truncated]") {
+				t.Errorf("host was cut without a marker: %q", got.Host[len(got.Host)-20:])
+			}
+		})
+	}
+}

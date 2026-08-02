@@ -71,6 +71,12 @@ type Policy struct {
 	// checkDestination.
 	Upstream func() *upstream.Proxy
 
+	// Tunnels bounds how many hijacked connections may be held at once, and
+	// how long an idle one survives. Nil is unlimited, which is what a request
+	// quota leaves it: a quota bounds the rate of acquisition and a tunnel is
+	// acquired once and held. See TunnelLimit.
+	Tunnels *TunnelLimit
+
 	// UpstreamTLS configures outbound TLS: an additional trust bundle, a client
 	// certificate, or both. Nil uses the system trust store.
 	//
@@ -230,14 +236,19 @@ func (o Observer) tunnelClosed() {
 type DeniedScope string
 
 const (
-	ScopeDestination DeniedScope = "destination"
-	ScopeConnectPort DeniedScope = "connect-port"
-	ScopePrivateAddr DeniedScope = "private-address"
+	ScopeDestination  DeniedScope = "destination"
+	ScopeConnectPort  DeniedScope = "connect-port"
+	ScopePrivateAddr  DeniedScope = "private-address"
+	ScopeTunnelClient DeniedScope = "tunnel-client-limit"
+	ScopeTunnelGlobal DeniedScope = "tunnel-global-limit"
 )
 
 // DeniedScopes is every value the scope label can take, for whatever reports
 // on them.
-var DeniedScopes = []DeniedScope{ScopeDestination, ScopeConnectPort, ScopePrivateAddr}
+var DeniedScopes = []DeniedScope{
+	ScopeDestination, ScopeConnectPort, ScopePrivateAddr,
+	ScopeTunnelClient, ScopeTunnelGlobal,
+}
 
 // DefaultConnectPorts is the allowlist used when none is configured.
 var DefaultConnectPorts = []int{443}
@@ -754,14 +765,34 @@ func handleUpgrade(
 		http.Error(w, "Bad gateway", http.StatusBadGateway)
 		return
 	}
+	// An upgraded connection is a tunnel by every measure that matters here, and
+	// the ceiling counts it as one. Taken after the origin agreed to switch,
+	// because before that it is an ordinary request that may yet be relayed as
+	// one.
+	client := clientIP(r.RemoteAddr)
+	if ok, scope := pol.Tunnels.Acquire(client); !ok {
+		upstream.Close()
+		logger.Warn("Refused upgrade: too many open tunnels",
+			log.String("client", client), log.String("limit", string(scope)),
+			log.String("request_id", reqid.FromContext(r.Context())))
+		obs.denied(scope)
+		http.Error(w, "Too many open tunnels", http.StatusServiceUnavailable)
+		return
+	}
+	release := func() {
+		pol.Tunnels.Release(client)
+		obs.tunnelClosed()
+	}
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
+		pol.Tunnels.Release(client)
 		upstream.Close()
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 	clientConn, clientBuf, err := hijacker.Hijack()
 	if err != nil {
+		pol.Tunnels.Release(client)
 		upstream.Close()
 		logger.Errorf("Upgrade hijack error: %v", err)
 		return
@@ -772,12 +803,14 @@ func handleUpgrade(
 	var head bytes.Buffer
 	fmt.Fprintf(&head, "HTTP/1.1 %d %s\r\n", resp.StatusCode, http.StatusText(resp.StatusCode))
 	if err := resp.Header.Write(&head); err != nil {
+		pol.Tunnels.Release(client)
 		upstream.Close()
 		clientConn.Close()
 		return
 	}
 	head.WriteString("\r\n")
 	if _, err := clientConn.Write(head.Bytes()); err != nil {
+		pol.Tunnels.Release(client)
 		upstream.Close()
 		clientConn.Close()
 		return
@@ -799,7 +832,7 @@ func handleUpgrade(
 	// long-lived, carrying traffic a request counter cannot see, and gone from
 	// the gauge only when it closes.
 	obs.tunnelOpened()
-	go transferPair(upstream, clientConn, obs.tunnelClosed)
+	go transferPair(pol.idle(upstream), pol.idle(clientConn), release)
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, pol Policy, dialer *net.Dialer, obs Observer) {
@@ -814,10 +847,28 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 		dial = pol.dialThroughParent(dialer, logger)
 	}
 
+	// A slot before a socket. Taken before the dial so a client at its ceiling
+	// costs nothing upstream, and released by the same callback that reports
+	// the tunnel closed, so the two can never disagree about how many are held.
+	client := clientIP(r.RemoteAddr)
+	if ok, scope := pol.Tunnels.Acquire(client); !ok {
+		logger.Warn("Refused CONNECT: too many open tunnels",
+			log.String("client", client), log.String("limit", string(scope)),
+			log.String("request_id", reqid.FromContext(r.Context())))
+		obs.denied(scope)
+		http.Error(w, "Too many open tunnels", http.StatusServiceUnavailable)
+		return
+	}
+	release := func() {
+		pol.Tunnels.Release(client)
+		obs.tunnelClosed()
+	}
+
 	// The same policy-aware dial the plain-HTTP path uses, so a tunnel cannot
 	// reach anywhere an ordinary request could not.
 	destConn, err := dial(r.Context(), "tcp", r.Host)
 	if err != nil {
+		pol.Tunnels.Release(client)
 		if denied(err) {
 			logger.Warn("Refused CONNECT destination",
 				log.String("host", r.Host), log.String("client", clientIP(r.RemoteAddr)),
@@ -838,12 +889,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 	markServed(w)
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
+		pol.Tunnels.Release(client)
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		destConn.Close()
 		return
 	}
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
+		pol.Tunnels.Release(client)
 		logger.Errorf("Hijack error: %v", err)
 		http.Error(w, "Hijack failed", http.StatusInternalServerError)
 		destConn.Close()
@@ -851,12 +904,13 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 	}
 	_, err = io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 	if err != nil {
+		pol.Tunnels.Release(client)
 		destConn.Close()
 		clientConn.Close()
 		return
 	}
 	obs.tunnelOpened()
-	go transferPair(destConn, clientConn, obs.tunnelClosed)
+	go transferPair(pol.idle(destConn), pol.idle(clientConn), release)
 }
 
 // dialThroughParent connects to the parent proxy and issues a nested CONNECT

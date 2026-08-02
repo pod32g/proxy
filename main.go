@@ -195,6 +195,12 @@ func main() {
 		"client certificate presented to upstreams that ask for one")
 	upstreamKey := flag.String("upstream-key", env.get("PROXY_UPSTREAM_KEY", ""),
 		"key for -upstream-cert")
+	maxTunnels := flag.Int("max-tunnels", 0,
+		"most CONNECT tunnels and protocol upgrades held open at once across all clients; 0 is unlimited")
+	maxTunnelsPerClient := flag.Int("max-tunnels-per-client", 0,
+		"most tunnels one source address may hold open at once; 0 is unlimited")
+	tunnelIdle := flag.Duration("tunnel-idle-timeout", 0,
+		"close a tunnel neither side has moved bytes on for this long; 0 disables it")
 	pacEnabled := flag.Bool("pac", env.get("PROXY_PAC", "") == "true",
 		"serve a proxy auto-configuration file at "+pac.Path+"; off by default, and unauthenticated by necessity")
 	pacAddress := flag.String("pac-address", env.get("PROXY_PAC_ADDRESS", ""),
@@ -576,6 +582,24 @@ func main() {
 			log.String("note", "authenticated, no-store and private responses are never cached"))
 	}
 
+	// A quota bounds the rate a client acquires tunnels; nothing bounded how
+	// many it held, and a tunnel is acquired once and kept. Reported either way,
+	// because "unlimited" is a choice an operator should see they have made.
+	tunnelLimit := &proxy.TunnelLimit{
+		Global:      *maxTunnels,
+		PerClient:   *maxTunnelsPerClient,
+		IdleTimeout: *tunnelIdle,
+	}
+	if tunnelLimit.Unlimited() && cfg.Mode == "forward" {
+		logger.Info("Tunnels are unlimited",
+			log.String("note", "set -max-tunnels and -max-tunnels-per-client; a request quota "+
+				"bounds how fast a client opens tunnels, not how many it holds"))
+	} else if !tunnelLimit.Unlimited() {
+		logger.Info("Tunnel limits active",
+			log.Int("global", *maxTunnels), log.Int("per_client", *maxTunnelsPerClient),
+			log.String("idle_timeout", tunnelIdle.String()))
+	}
+
 	// Read through a function so quotas changed in the UI or API take effect
 	// without a restart, the same way credentials and policy rules do.
 	limiter := newLimiter(cfg.QuotaSet, metrics)
@@ -614,6 +638,10 @@ func main() {
 
 		listenerPol := proxy.Policy{
 			AllowPrivate: allowPrivate,
+			// Shared across listeners on purpose: the ceiling bounds this
+			// process's descriptors and goroutines, which listeners do not have
+			// their own supply of.
+			Tunnels:      tunnelLimit,
 			ConnectPorts: ports,
 			Rules:        scope.DestinationRulesFor,
 			UpstreamTLS:  upstreamTLS,
@@ -639,7 +667,7 @@ func main() {
 		if forwardMode {
 			handler = proxy.NewForward(logger, cfg.GetHeadersForClient, listenerPol, proxy.Observer{
 				Upstream: func(method string, d time.Duration) {
-					metrics.UpstreamDuration.WithLabelValues(method).Observe(d.Seconds())
+					metrics.UpstreamDuration.WithLabelValues(server.MethodLabel(method)).Observe(d.Seconds())
 				},
 				TunnelOpened: func() { metrics.ActiveTunnels.Inc() },
 				TunnelClosed: func() { metrics.ActiveTunnels.Dec() },

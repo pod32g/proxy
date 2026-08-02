@@ -141,6 +141,29 @@ func ListenerName(ctx context.Context) string {
 	return name
 }
 
+// MaxLoggedField bounds a client-controlled field in the access record.
+//
+// reqid.MaxLength already caps the request identifier at 128, for a stated
+// reason: it "is about to be written into every log line for the request", so a
+// very long one "could bloat every entry". Host and Path are written into the
+// same line, come from the same client, on the same request — and were bounded
+// by nothing but Go's one-megabyte header limit. One request could put a
+// megabyte in the log, as many times as the client liked.
+//
+// Larger than the identifier's cap because a real URL path can legitimately be
+// long, and small enough that a line stays a line.
+const MaxLoggedField = 1024
+
+// clamp truncates a client-controlled value and marks that it did, so a reader
+// can tell a long path from a trimmed one rather than silently seeing a
+// different URL than was requested.
+func clamp(s string) string {
+	if len(s) <= MaxLoggedField {
+		return s
+	}
+	return s[:MaxLoggedField] + "…[truncated]"
+}
+
 // destination reports where a request was headed, with anything credential-ish
 // removed.
 //
@@ -152,17 +175,17 @@ func ListenerName(ctx context.Context) string {
 func destination(r *http.Request) (host, path string) {
 	if r.Method == http.MethodConnect {
 		// CONNECT carries its target in the request line, not the URL.
-		return sanitizeHost(r.Host), ""
+		return clamp(sanitizeHost(r.Host)), ""
 	}
 	u := r.URL
 	if u == nil {
-		return sanitizeHost(r.Host), ""
+		return clamp(sanitizeHost(r.Host)), ""
 	}
 	host = u.Host
 	if host == "" {
 		host = r.Host
 	}
-	return sanitizeHost(host), redactPath(u)
+	return clamp(sanitizeHost(host)), clamp(redactPath(u))
 }
 
 func redactPath(u *url.URL) string {

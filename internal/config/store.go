@@ -296,7 +296,12 @@ func (s *Store) Load(cfg *Config) error {
 		if err := rows.Scan(&name, &value); err != nil {
 			return err
 		}
-		cfg.SetHeader(name, value)
+		if err := cfg.SetHeader(name, value); err != nil {
+			// Written by an older build, before the map path was validated.
+			// Refusing to start over it would strand the proxy on a value only
+			// the UI can fix; the next save drops it.
+			s.warn("stored header %q is invalid and was ignored: %v", name, err)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
