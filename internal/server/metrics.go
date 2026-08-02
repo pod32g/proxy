@@ -38,6 +38,10 @@ type Metrics struct {
 	// ActiveTunnels counts established CONNECT tunnels. They are long-lived and
 	// invisible to a request counter, which sees each one exactly once.
 	ActiveTunnels prometheus.Gauge
+	// UpstreamProtocol counts round trips by the protocol actually negotiated
+	// with the origin. Two values in practice, so no cardinality risk — and
+	// before this there was no way to tell what had been spoken at all.
+	UpstreamProtocol *prometheus.CounterVec
 	// PolicyDecisions counts refusals by what refused them, so a spike is
 	// attributable without reading logs. Both labels are closed sets.
 	PolicyDecisions *prometheus.CounterVec
@@ -122,6 +126,13 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 				Help: "Number of established CONNECT tunnels",
 			},
 		),
+		UpstreamProtocol: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "proxy_upstream_protocol_total",
+				Help: "Upstream round trips by the protocol negotiated with the origin",
+			},
+			[]string{"proto"},
+		),
 		PolicyDecisions: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "proxy_policy_decisions_total",
@@ -136,7 +147,7 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 	for _, c := range []prometheus.Collector{
 		m.Requests, m.Duration, m.Clients, m.AuthFailures,
 		m.QuotaRejected, m.RelayedBytes, m.QuotaClients,
-		m.UpstreamDuration, m.ActiveTunnels, m.PolicyDecisions,
+		m.UpstreamDuration, m.ActiveTunnels, m.PolicyDecisions, m.UpstreamProtocol,
 	} {
 		if err := reg.Register(c); err != nil {
 			return nil, err
@@ -185,6 +196,13 @@ type statusRecorder struct {
 // A protocol switch is written directly to a hijacked connection, so without
 // this the exchange would be counted as a 200 like any other.
 func (r *statusRecorder) SetStatus(code int) { r.status = code }
+
+// SetProtocol passes the negotiated protocol down to the accounting layer.
+func (r *statusRecorder) SetProtocol(proto string) {
+	if s, ok := r.ResponseWriter.(interface{ SetProtocol(string) }); ok {
+		s.SetProtocol(proto)
+	}
+}
 
 // SkipAccounting passes the exclusion signal down to the accounting layer.
 func (r *statusRecorder) SkipAccounting() {

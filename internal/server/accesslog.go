@@ -80,6 +80,9 @@ func logStructured(logger *log.Logger, e Exchange) {
 	if e.Listener != "" {
 		fields = append(fields, log.String("listener", e.Listener))
 	}
+	if e.Protocol != "" {
+		fields = append(fields, log.String("upstream_proto", e.Protocol))
+	}
 	if e.Tunnel {
 		fields = append(fields, log.Bool("tunnel", true))
 	}

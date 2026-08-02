@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,8 @@ type Exchange struct {
 	Duration time.Duration
 	// RequestID identifies this exchange across the hop.
 	RequestID string
+	// Protocol is what was negotiated with the origin, when one was reached.
+	Protocol string
 	// Listener names the bound address this arrived on, so a deployment with
 	// several listeners can tell which one served a request without inferring
 	// it from the destination.
@@ -101,10 +104,12 @@ func AccountingMiddleware(next http.Handler, acct Accounting) http.Handler {
 		}
 
 		host, path := destination(r)
+		m.mu.Lock()
 		m.exchange = Exchange{
 			Client: client, Method: r.Method, Host: host, Path: path,
 			RequestID: id, Listener: ListenerName(r.Context()),
 		}
+		m.mu.Unlock()
 		m.completed = acct.Completed
 		m.start = start
 
@@ -192,7 +197,10 @@ type accountedWriter struct {
 	served     atomic.Bool
 	skipped    atomic.Bool
 
-	start     time.Time
+	start time.Time
+	// mu guards exchange, which the handler mutates through SetProtocol while
+	// the tunnel goroutines may be finishing.
+	mu        sync.Mutex
 	exchange  Exchange
 	completed func(Exchange)
 	done      atomic.Bool
@@ -233,6 +241,17 @@ func (m *accountedWriter) SkipAccounting() {
 
 // Skipped reports whether this exchange was excluded.
 func (m *accountedWriter) Skipped() bool { return m.skipped.Load() }
+
+// SetProtocol records the protocol negotiated with the origin, which only the
+// handler sees.
+func (m *accountedWriter) SetProtocol(proto string) {
+	m.mu.Lock()
+	m.exchange.Protocol = proto
+	m.mu.Unlock()
+	if s, ok := m.ResponseWriter.(interface{ SetProtocol(string) }); ok {
+		s.SetProtocol(proto)
+	}
+}
 
 // SetServed marks the exchange as having reached a destination. Only the proxy
 // handler knows this, and it knows it exactly: after a successful round trip,
@@ -311,7 +330,9 @@ func (m *accountedWriter) finish() {
 	if m.completed == nil || m.skipped.Load() {
 		return
 	}
+	m.mu.Lock()
 	e := m.exchange
+	m.mu.Unlock()
 	e.Status = int(m.status.Load())
 	if e.Status == 0 {
 		// The handler neither wrote nor set a code. As far as the client is

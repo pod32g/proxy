@@ -111,6 +111,15 @@ header_rules: |
 #   password: ""                 # prefer setting this through the API or UI
 #   no_proxy: "internal.example.com,10.0.0.0/8"
 
+# --- restart: HTTP/2 to origins ----------------------------------------------
+#
+# auto (default) negotiates over TLS and uses HTTP/1.1 in cleartext.
+# off forces HTTP/1.1. h2c speaks HTTP/2 on a plain connection, which is usually
+# the point of a reverse proxy in front of a modern backend.
+#
+# Upgrades always use HTTP/1.1 regardless: Connection: Upgrade does not exist in
+# HTTP/2. Set with -upstream-http2.
+
 # --- restart: TLS the proxy uses when connecting OUTWARD ---------------------
 #
 # Distinct from cert/key above, which is what the proxy presents to its own

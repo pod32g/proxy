@@ -58,6 +58,7 @@ go build -o proxy
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
 - `-admin-cert` / `-admin-key` – TLS material for the admin listener. `PROXY_ADMIN_CERT_FILE`, `PROXY_ADMIN_KEY_FILE`.
+- `-upstream-http2` – How to speak HTTP/2 to origins: `auto`, `off` or `h2c`. `PROXY_UPSTREAM_HTTP2`.
 - `-upstream-proxy` – Parent proxy all outbound traffic passes through. `PROXY_UPSTREAM_PROXY`.
 - `-no-proxy` – Hosts, domain suffixes and CIDRs reached directly instead. `PROXY_NO_PROXY`, defaults to `NO_PROXY`.
 - `-upstream-ca` – Additional CA bundle trusted for upstream TLS, added to the system roots. `PROXY_UPSTREAM_CA`.
@@ -659,6 +660,65 @@ responsibility now rather than this proxy's:
 Everything else holds unchanged: `-connect-ports`, the client access table and
 quotas are all about what the client asked for, and a parent does not make an
 arbitrary TCP relay acceptable.
+
+## HTTP/2 to upstreams
+
+```sh
+./proxy -upstream-http2 h2c      # cleartext HTTP/2 to a modern backend
+./proxy -upstream-http2 off      # force HTTP/1.1
+```
+
+| Mode | Behaviour |
+|---|---|
+| `auto` (default) | Negotiate over TLS via ALPN; HTTP/1.1 in cleartext. What the default transport already did, now explicit and measurable. |
+| `off` | HTTP/1.1 everywhere, for an origin whose HTTP/2 is broken or a middlebox that mangles it. |
+| `h2c` | HTTP/2 without TLS. Usually the point of putting a reverse proxy in front of a modern backend. |
+
+`h2c` has no negotiation — the client simply speaks HTTP/2 on a plain connection
+because it was told the server does — which is why it is an explicit setting
+rather than something detectable.
+
+**The negotiated protocol is now visible**, which it previously was not:
+`resp.Proto` was discarded, so there was no way to tell what had actually been
+spoken. It appears as `upstream_proto` in the access log and in
+`proxy_upstream_protocol_total{proto}`.
+
+### CONNECT and upgrades are unaffected
+
+Both are HTTP/1.1-shaped, and they fail differently if this is got wrong:
+
+- **`CONNECT`** does its own raw dialling and never touches a transport.
+- **Upgrades** go through the transport, and `Connection: Upgrade` does not
+  exist in HTTP/2 — the mechanism was replaced by extended CONNECT. Forcing h2
+  would break WebSockets, and break them *quietly*, since a stripped upgrade
+  comes back as an ordinary response rather than an error.
+
+So the upgrade path has its own transport, pinned to HTTP/1.1 regardless of this
+setting. That is not a workaround; it is what the protocol requires.
+
+### Interaction with the timeouts
+
+The timeouts chosen for a proxy — no `ReadTimeout` or `WriteTimeout`, a bounded
+`ReadHeaderTimeout`, and a 120s `IdleTimeout` — interact with HTTP/2 in one way
+worth knowing.
+
+HTTP/2 multiplexes many streams onto **one** connection. `IdleTimeout` therefore
+governs a connection that may be carrying many requests rather than one, and
+closing it tears down every stream on it at once rather than ending a single
+exchange. The 120s default is generous enough that this does not arise in
+practice, but a deployment tuning it downward should know it is now a
+multi-request decision.
+
+Nothing else changes: bodies are still unbounded in duration, because a proxy
+cannot know whether a response is a small JSON reply or an hours-long stream.
+
+### HTTP/3
+
+Not implemented, deliberately. It needs a QUIC stack, which is a substantial
+permanent dependency, and there is no recorded demand for it. The tracing work
+already added a large dependency tree; adding another speculatively to satisfy a
+heading rather than a need is not a trade worth making. If a real need appears,
+the transport selection here is the place it would go.
 
 ## Upstream TLS
 

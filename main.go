@@ -178,6 +178,8 @@ func main() {
 		"export per-destination request counts, sampled from the bounded top-N table at scrape time; off by default because hostnames are client-controlled")
 	topDestinations := flag.Int("destination-metrics-top", server.DefaultTopDestinations,
 		"how many destinations -destination-metrics reports; this is the series count, so keep it small")
+	upstreamHTTP2 := flag.String("upstream-http2", env.get("PROXY_UPSTREAM_HTTP2", "auto"),
+		"how to speak HTTP/2 to origins: auto (negotiate over TLS), off (force HTTP/1.1), h2c (cleartext HTTP/2)")
 	upstreamProxy := flag.String("upstream-proxy", env.get("PROXY_UPSTREAM_PROXY", ""),
 		"parent proxy all outbound traffic passes through, e.g. http://user:pass@proxy.corp:3128")
 	noProxy := flag.String("no-proxy", env.get("PROXY_NO_PROXY", os.Getenv("NO_PROXY")),
@@ -286,6 +288,10 @@ func main() {
 	accessFormat, err := server.ParseAccessLogFormat(*accessLogStr)
 	if err != nil {
 		fatalf("invalid -access-log: %v", err)
+	}
+	http2Mode, err := proxy.ParseUpstreamHTTP2(*upstreamHTTP2)
+	if err != nil {
+		fatalf("invalid -upstream-http2: %v", err)
 	}
 	if cfg.Mode == "reverse" {
 		if _, err := url.Parse(cfg.TargetURL); err != nil {
@@ -563,6 +569,7 @@ func main() {
 			// Read per request so rules edited through the UI, the API or a
 			// reload take effect without a restart.
 			HeaderRules: cfg.HeaderRules,
+			HTTP2:       http2Mode,
 			Upstream:    cfg.UpstreamProxy(),
 		}
 
@@ -577,6 +584,7 @@ func main() {
 				TunnelOpened: func() { metrics.ActiveTunnels.Inc() },
 				TunnelClosed: func() { metrics.ActiveTunnels.Dec() },
 				Denied:       func(s string) { metrics.PolicyDecisions.WithLabelValues(s).Inc() },
+				Protocol:     func(p string) { metrics.UpstreamProtocol.WithLabelValues(p).Inc() },
 				// nil when tracing is off, which is what makes it free.
 				Trace: tracer.Hook(),
 			})
@@ -646,6 +654,9 @@ func main() {
 			logger.Info("Refusing to proxy to loopback/private addresses; pass -allow-private to permit them")
 		}
 		logger.Infof("CONNECT allowed to ports %s", *connectPorts)
+	}
+	if http2Mode != proxy.HTTP2Auto {
+		logger.Info("Upstream HTTP/2 mode set", log.String("mode", string(http2Mode)))
 	}
 	handler, instrument, err := buildChain("http", cfg, cfg.Mode, cfg.TargetURL,
 		*allowPrivate, ports, limiter, config.UpstreamTLS{})

@@ -49,6 +49,10 @@ type Policy struct {
 	// hop-by-hop strip, which they cannot precede or undo.
 	HeaderRules func(clientIP string) *header.RuleSet
 
+	// HTTP2 says how the proxy speaks HTTP/2 to origins. The zero value is
+	// HTTP2Auto, which is what the default transport already did.
+	HTTP2 UpstreamHTTP2
+
 	// Upstream, when configured, is a parent proxy every request is forwarded
 	// through rather than dialling origins directly.
 	//
@@ -119,6 +123,9 @@ type Observer struct {
 	TunnelClosed func()
 	// Denied records a refusal and which check made it.
 	Denied func(scope string)
+	// Protocol records what was actually negotiated with the origin. Before
+	// this the answer was simply unavailable: resp.Proto was discarded.
+	Protocol func(proto string)
 
 	// Trace, when set, brackets the upstream round trip with a span. It is given
 	// the outbound request and returns it, so a tracer can attach both a span
@@ -149,6 +156,12 @@ func (o Observer) trace(out *http.Request, host, path string) (*http.Request, fu
 func (o Observer) upstream(method string, d time.Duration) {
 	if o.Upstream != nil {
 		o.Upstream(method, d)
+	}
+}
+
+func (o Observer) protocol(proto string) {
+	if o.Protocol != nil && proto != "" {
+		o.Protocol(proto)
 	}
 }
 
@@ -401,23 +414,14 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		obs = observer[0]
 	}
 	dialer := pol.dialer()
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
-	transport.DialContext = pol.dialContext(dialer)
-	if pol.UpstreamTLS != nil {
-		transport.TLSClientConfig = pol.UpstreamTLS.Clone()
-	}
-	if pol.Upstream.Configured() {
-		// The transport handles the plain-HTTP path: it makes the request to
-		// the parent rather than the origin. CONNECT cannot use this, because
-		// the handler does its own dialling — see handleConnect.
-		transport.Proxy = func(r *http.Request) (*url.URL, error) {
-			if pol.Upstream.Bypass(r.URL.Host) {
-				return nil, nil
-			}
-			return pol.Upstream.URL, nil
-		}
-	}
+	// Two transports. The h2 setting governs ordinary requests; upgrades are
+	// pinned to HTTP/1.1 because the protocol requires it. CONNECT uses
+	// neither — it dials for itself.
+	//
+	// The parent-proxy hook lives on the ordinary transport for the same
+	// reason: it makes the request to the parent rather than the origin, which
+	// a hijacked tunnel cannot do.
+	transport, upgradeTransport, h2Transport := pol.buildTransport(dialer)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
@@ -442,7 +446,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// strip below removes the handshake and a ws:// request comes back as
 		// an ordinary response — quietly, which is the worst part.
 		if proto := requestedUpgrade(r.Header); proto != "" {
-			handleUpgrade(w, r, transport, headers, logger, proto, obs, pol)
+			handleUpgrade(w, r, upgradeTransport, headers, logger, proto, obs, pol)
 			return
 		}
 		outReq := r.Clone(context.WithValue(r.Context(), clientKey{}, clientIP(r.RemoteAddr)))
@@ -484,7 +488,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// Timed around the round trip alone, which is the origin's contribution
 		// and nothing else. The middleware histogram already covers the total.
 		upstreamStart := time.Now()
-		resp, err := transport.RoundTrip(outReq)
+		resp, err := pol.roundTripper(transport, h2Transport, outReq).RoundTrip(outReq)
 		obs.upstream(r.Method, time.Since(upstreamStart))
 		if err != nil {
 			// A policy rejection is the client asking for somewhere it is not
@@ -507,6 +511,12 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		}
 		endSpan(resp.StatusCode, nil)
 		markServed(w)
+		// The negotiated protocol was previously discarded, so there was no way
+		// to tell what had actually been spoken to an origin.
+		obs.protocol(resp.Proto)
+		if s, ok := w.(interface{ SetProtocol(string) }); ok {
+			s.SetProtocol(resp.Proto)
+		}
 		defer resp.Body.Close()
 		removeHopByHop(resp.Header)
 		applyHeaderRules(pol, resp.Header, header.Response, clientIP(r.RemoteAddr), r.URL.Host)
