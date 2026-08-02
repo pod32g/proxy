@@ -10,6 +10,7 @@ package cache
 
 import (
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ const (
 	ReasonNoStore        Reason = "no-store"
 	ReasonPrivate        Reason = "private"
 	ReasonAuthorization  Reason = "authorization"
+	ReasonCookie         Reason = "cookie"
 	ReasonSetCookie      Reason = "set-cookie"
 	ReasonVaryAll        Reason = "vary-*"
 	ReasonNoFreshness    Reason = "no-explicit-freshness"
@@ -42,11 +44,17 @@ const (
 
 // StorableRequest reports whether a request may produce a cache entry.
 //
-// The Authorization rule is stricter than RFC 9111 requires. The RFC permits
-// caching an authenticated response when the origin says public, s-maxage or
-// must-revalidate — but a shared forward proxy is exactly the place where
-// getting those conditions subtly wrong turns into one user being served
-// another's data, and the upside is a cache hit. Not worth it.
+// One rule, applied twice: a request that identifies a user does not produce a
+// shared cache entry. Authorization, Proxy-Authorization and Cookie all
+// identify a user, so all three are refused.
+//
+// This is stricter than RFC 9111 requires, deliberately and in both cases. The
+// RFC permits caching an authenticated response when the origin says public,
+// s-maxage or must-revalidate, and permits caching a response to a cookie-
+// bearing request whenever the origin has not said otherwise. Both defences
+// amount to "the origin should have told us" — and a shared forward proxy is
+// exactly where an origin's omission becomes one user being served another's
+// data. The upside on offer is a cache hit.
 func StorableRequest(r *http.Request) Reason {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return ReasonMethod
@@ -54,10 +62,22 @@ func StorableRequest(r *http.Request) Reason {
 	if r.Header.Get("Authorization") != "" || r.Header.Get("Proxy-Authorization") != "" {
 		return ReasonAuthorization
 	}
+	if r.Header.Get("Cookie") != "" {
+		return ReasonCookie
+	}
 	if directives(r.Header.Get("Cache-Control")).has("no-store") {
 		return ReasonRequestNoStore
 	}
 	return ReasonStorable
+}
+
+// RequestWantsRevalidation reports whether a client demanded a fresh check.
+//
+// A client sending no-cache is asking to be told the entity is still current,
+// not to be handed whatever the proxy happens to hold. Serving it a stored copy
+// answers a question it did not ask.
+func RequestWantsRevalidation(r *http.Request) bool {
+	return directives(r.Header.Get("Cache-Control")).has("no-cache")
 }
 
 // StorableResponse reports whether a response may be stored.
@@ -163,6 +183,19 @@ func (d directiveSet) value(name string) (string, bool) {
 	return v, ok
 }
 
+// normaliseVaryNames renders a Vary header as a stable, comparable list, so the
+// same set written two ways counts as one form in the candidate set.
+func normaliseVaryNames(vary string) string {
+	var names []string
+	for _, name := range strings.Split(vary, ",") {
+		if name = strings.ToLower(strings.TrimSpace(name)); name != "" && name != "*" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
+}
+
 // varyKey renders the request headers a stored entry varies on, so a variant is
 // only served to a request that matches it.
 //
@@ -174,12 +207,13 @@ func varyKey(vary string, reqHeaders http.Header) string {
 		return ""
 	}
 	var b strings.Builder
-	for _, name := range strings.Split(vary, ",") {
-		name = strings.TrimSpace(name)
+	// Sorted, so "Accept-Encoding, Accept-Language" and the reverse produce the
+	// same fingerprint and therefore the same cache key.
+	for _, name := range strings.Split(normaliseVaryNames(vary), ",") {
 		if name == "" {
 			continue
 		}
-		b.WriteString(strings.ToLower(name))
+		b.WriteString(name)
 		b.WriteByte('=')
 		b.WriteString(reqHeaders.Get(name))
 		b.WriteByte('\n')

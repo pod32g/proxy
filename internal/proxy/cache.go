@@ -21,7 +21,7 @@ func serveFromCache(w http.ResponseWriter, r *http.Request, c *cache.Cache) (ser
 		return false, nil
 	}
 	if reason := cache.StorableRequest(r); reason != cache.ReasonStorable {
-		// Not cacheable in either direction: a request carrying credentials
+		// Not cacheable in either direction: a request that identifies a user
 		// must neither be served from the cache nor stored in it.
 		return false, nil
 	}
@@ -31,21 +31,33 @@ func serveFromCache(w http.ResponseWriter, r *http.Request, c *cache.Cache) (ser
 		c.Miss()
 		return false, nil
 	}
-	if !entry.Fresh(time.Now()) {
+	// A client asking for no-cache wants the entity confirmed current, not
+	// whatever the proxy happens to hold — so it takes the revalidation path
+	// even against an entry that is otherwise fresh.
+	if !entry.Fresh(time.Now()) || cache.RequestWantsRevalidation(r) {
 		return false, entry
 	}
-
-	writeEntry(w, entry, "HIT")
-	c.Hit()
-	return true, nil
+	return true, entry
 }
 
 // writeEntry replays a stored response.
-func writeEntry(w http.ResponseWriter, e *cache.Entry, status string) {
+//
+// The stored headers are copied out rather than served in place, which is what
+// lets response header rules apply to a hit exactly as they do to a miss — the
+// stored entry stays the origin's own, and the rules run on the way out. A hit
+// and a miss are indistinguishable to the client, which is the property that
+// makes turning the cache on safe.
+func writeEntry(w http.ResponseWriter, e *cache.Entry, status string, rewrite func(http.Header)) {
 	for name, values := range e.Header {
 		for _, v := range values {
 			w.Header().Add(name, v)
 		}
+	}
+	// Applied to the copy, before anything is written — a rule that ran after
+	// WriteHeader would have no effect at all, which is the quiet kind of
+	// wrong.
+	if rewrite != nil {
+		rewrite(w.Header())
 	}
 	// So a client — or an operator with curl — can tell a hit from a fetch.
 	// Without it the cache is invisible from outside and the only way to know

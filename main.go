@@ -383,7 +383,10 @@ func main() {
 		setFlagsExtra["header-rule"] = true
 	}
 
-	cfg.Headers = headers
+	// Through the accessor, not by assignment: the merged rule sets are rebuilt
+	// on change, and a direct write would leave them empty — every header rule
+	// silently inert.
+	cfg.ReplaceHeaders(headers)
 	cfg.LogLevel = logLevel
 
 	for k := range setFlagsExtra {
@@ -610,7 +613,7 @@ func main() {
 			HeaderRules: cfg.HeaderRules,
 			Cache:       responseCache,
 			HTTP2:       http2Mode,
-			Upstream:    cfg.UpstreamProxy(),
+			Upstream:    cfg.UpstreamProxy,
 		}
 
 		var handler http.Handler

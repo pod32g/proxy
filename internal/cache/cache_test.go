@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -213,6 +214,10 @@ func TestExpiredEntryWithValidatorIsKeptForRevalidation(t *testing.T) {
 }
 
 // A 304 refreshes rather than discards — the whole economy of a validator.
+//
+// Refresh returns a *replacement*. The entry passed in is never edited, because
+// another goroutine may be writing it to a client without the mutex; see the
+// concurrency test below for what editing it costs.
 func TestRefreshExtendsAndUpdatesHeaders(t *testing.T) {
 	c, now := newTestCache(t, 1<<20, 1<<16)
 	r := request(t, "http://example.com/a")
@@ -225,20 +230,112 @@ func TestRefreshExtendsAndUpdatesHeaders(t *testing.T) {
 		t.Fatal("no entry")
 	}
 
-	c.Refresh(entry, response(304, "Cache-Control", "max-age=300", "ETag", `"v2"`, "X-Old", "2"),
+	fresh := c.Refresh(entry, response(304, "Cache-Control", "max-age=300", "ETag", `"v2"`, "X-Old", "2"),
 		5*time.Minute)
 
-	if !entry.Fresh(*now) {
-		t.Error("the entry was not refreshed")
+	if fresh == entry {
+		t.Fatal("Refresh edited the entry in place; it must return a replacement")
 	}
-	if entry.ETag != `"v2"` {
-		t.Errorf("ETag = %q, want the updated one", entry.ETag)
+	if !fresh.Fresh(*now) {
+		t.Error("the replacement is not fresh")
 	}
-	if entry.Header.Get("X-Old") != "2" {
-		t.Errorf("headers were not updated: %v", entry.Header)
+	if fresh.ETag != `"v2"` {
+		t.Errorf("ETag = %q, want the updated one", fresh.ETag)
 	}
-	if string(entry.Body) != "body" {
+	if fresh.Header.Get("X-Old") != "2" {
+		t.Errorf("headers were not updated: %v", fresh.Header)
+	}
+	if string(fresh.Body) != "body" {
 		t.Error("the body was lost; a 304 carries none, so the stored one is authoritative")
+	}
+
+	// And the entry a concurrent request may still be writing is untouched.
+	if entry.Header.Get("X-Old") != "1" || entry.ETag != `"v1"` {
+		t.Error("the superseded entry was mutated; a reader holding it would race")
+	}
+	// The replacement is what a later lookup finds.
+	if got := c.Get(r); got != fresh {
+		t.Error("the replacement was not installed")
+	}
+}
+
+// The bug this design exists to prevent. Get hands out a pointer and releases
+// the mutex, so a request replaying an entry can overlap a request revalidating
+// it. Editing the shared Header map there is a concurrent map read and write,
+// which aborts the process — no recover, no 500.
+func TestConcurrentReadAndRefreshIsSafe(t *testing.T) {
+	c := New(1<<20, 1<<16)
+	r := request(t, "http://example.com/a")
+	c.Store(r, response(200, "Cache-Control", "max-age=600", "ETag", `"v1"`, "X-A", "1"),
+		[]byte("body"), time.Minute)
+	entry := c.Get(r)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 300; j++ {
+				if i%2 == 0 {
+					c.Refresh(c.Get(r), response(304, "X-A", fmt.Sprint(j)), time.Minute)
+					continue
+				}
+				// A request replaying the entry it was handed, as writeEntry does.
+				for name, values := range entry.Header {
+					_, _ = name, values
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// no-cache is not a refusal to store: it means "keep this, but check with me
+// before every use". Serving it for its max-age inverts the instruction.
+func TestNoCacheIsStoredButNeverFresh(t *testing.T) {
+	c, now := newTestCache(t, 1<<20, 1<<16)
+	r := request(t, "http://example.com/a")
+	resp := response(200, "Cache-Control", "no-cache, max-age=300", "ETag", `"v1"`)
+
+	if got := StorableResponse(resp); got != ReasonStorable {
+		t.Fatalf("no-cache was refused outright (%q); it should be stored and revalidated", got)
+	}
+	if !c.Store(r, resp, []byte("body"), 5*time.Minute) {
+		t.Fatal("not stored")
+	}
+
+	entry := c.Get(r)
+	if entry == nil {
+		t.Fatal("not retrievable — it must be, so it can be revalidated")
+	}
+	if entry.Fresh(*now) {
+		t.Error("a no-cache entry reported itself fresh; it would be served without checking")
+	}
+	if !entry.Revalidatable() {
+		t.Error("no validator, so it can never be used at all")
+	}
+}
+
+// A client asking for no-cache wants the entity confirmed, not whatever the
+// proxy holds.
+func TestRequestNoCacheDemandsRevalidation(t *testing.T) {
+	if !RequestWantsRevalidation(request(t, "http://x/", "Cache-Control", "no-cache")) {
+		t.Error("a client's no-cache was ignored")
+	}
+	if RequestWantsRevalidation(request(t, "http://x/")) {
+		t.Error("an ordinary request was treated as demanding revalidation")
+	}
+}
+
+// One rule applied twice: a request that identifies a user does not produce a
+// shared entry. Cookie identifies a user as squarely as Authorization does.
+func TestCookieBearingRequestsAreNotStorable(t *testing.T) {
+	if got := StorableRequest(request(t, "http://x/", "Cookie", "session=abc")); got != ReasonCookie {
+		t.Errorf("StorableRequest with a Cookie = %q, want %q", got, ReasonCookie)
+	}
+	// And the strictness matches Authorization, which is the point.
+	if got := StorableRequest(request(t, "http://x/", "Authorization", "Basic x")); got != ReasonAuthorization {
+		t.Errorf("Authorization = %q", got)
 	}
 }
 

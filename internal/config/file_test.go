@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -297,5 +298,95 @@ func TestNilFileIsHarmless(t *testing.T) {
 	}
 	if c := f.RestartRequired(nil); c != nil {
 		t.Errorf("got %v", c)
+	}
+}
+
+// The class of bug PROXY-67 was an instance of: a setting reported as applied
+// that a handler never re-reads is a reload which logs success and changes
+// nothing — the exact failure the restart-required reporting exists to prevent.
+//
+// Live settings are reachable through an accessor the request path calls per
+// request. This asserts the accessor answers the *new* value after a change,
+// which is what "applied" has to mean.
+func TestEverySettingReportedAsAppliedIsReadLive(t *testing.T) {
+	cfg := &Config{}
+	first := mustLoad(t, `
+proxy_name: first
+proxy_id: id-first
+stats: false
+log:
+  level: INFO
+headers:
+  X-A: "1"
+header_rules: |
+  set X-R: first
+policy: |
+  allow domain first.example.com
+clients: |
+  allow 10.0.0.0/8
+quotas: |
+  client requests 10/s
+upstream_proxy:
+  url: http://first.corp:3128
+`)
+	if _, err := first.ApplyTo(cfg); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+
+	// What a handler holds: the accessors the request path actually calls.
+	live := map[string]func() string{
+		"proxy_name":     func() string { n, _ := cfg.GetIdentity(); return n },
+		"proxy_id":       func() string { _, i := cfg.GetIdentity(); return i },
+		"stats":          func() string { return fmt.Sprint(cfg.StatsEnabledState()) },
+		"log.level":      func() string { return LevelString(cfg.GetLogLevel()) },
+		"policy":         func() string { return cfg.PolicyRuleSet().String() },
+		"clients":        func() string { return cfg.ClientRuleSet().String() },
+		"quotas":         func() string { return cfg.QuotaSet().String() },
+		"header_rules":   func() string { return cfg.HeaderRules("10.1.2.3").String() },
+		"upstream_proxy": func() string { return cfg.UpstreamProxy().String() },
+	}
+	before := map[string]string{}
+	for name, read := range live {
+		before[name] = read()
+	}
+
+	second := mustLoad(t, `
+proxy_name: second
+proxy_id: id-second
+stats: true
+log:
+  level: DEBUG
+headers:
+  X-A: "2"
+header_rules: |
+  set X-R: second
+policy: |
+  allow domain second.example.com
+clients: |
+  allow 172.16.0.0/12
+quotas: |
+  client requests 99/s
+upstream_proxy:
+  url: http://second.corp:3128
+`)
+	changed, err := second.ApplyTo(cfg)
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if len(changed) == 0 {
+		t.Fatal("nothing was reported as applied")
+	}
+
+	for _, setting := range changed {
+		// headers and auth.credentials are reported by names that do not map
+		// one-to-one onto an accessor; both are covered by their own tests.
+		read, ok := live[setting]
+		if !ok {
+			continue
+		}
+		if got := read(); got == before[setting] {
+			t.Errorf("%q was reported as applied but a handler still reads %q — "+
+				"the reload logged success and changed nothing", setting, got)
+		}
 	}
 }

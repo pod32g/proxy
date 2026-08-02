@@ -683,7 +683,7 @@ A deny-first gate, checked before anything else:
 
 | Condition | Why |
 |---|---|
-| `Authorization` or `Proxy-Authorization` on the request | See below |
+| `Authorization`, `Proxy-Authorization` or `Cookie` on the request | See below |
 | `Cache-Control: no-store` (request or response) | Explicit refusal |
 | `Cache-Control: private` | A shared cache is exactly what `private` excludes |
 | `Set-Cookie` on the response | A replayed cookie hands someone a session that is not theirs |
@@ -691,12 +691,21 @@ A deny-first gate, checked before anything else:
 | Anything but `GET`/`HEAD` | Not cacheable |
 | No **explicit** freshness | See below |
 
-**The `Authorization` rule is stricter than RFC 9111 requires.** The RFC permits
-caching an authenticated response when the origin says `public`, `s-maxage` or
-`must-revalidate`. A shared forward proxy is precisely where getting those
-conditions subtly wrong becomes cross-user disclosure, and the upside is a cache
-hit. Not worth it — an authenticated request is never stored, whatever the
+**One rule, applied to all three headers that identify a user, and stricter than
+RFC 9111 requires.** The RFC permits caching an authenticated response when the
+origin says `public`, `s-maxage` or `must-revalidate`, and permits caching a
+response to a cookie-bearing request whenever the origin has not said otherwise.
+Both defences amount to *"the origin should have told us"* — and a shared forward
+proxy is precisely where an origin's omission becomes one user being served
+another's data. The upside on offer is a cache hit. A request carrying
+`Authorization`, `Proxy-Authorization` or `Cookie` is never stored, whatever the
 response says.
+
+**`no-cache` is stored but never served without checking.** It does not mean
+"do not store" — it means "you may keep this, but revalidate before every use",
+which is how an origin says the content changes unpredictably but has a
+validator worth using. A client sending `no-cache` likewise gets a revalidation
+rather than whatever the proxy holds.
 
 **Freshness must be explicit** — `s-maxage`, `max-age` or a future `Expires`.
 Heuristic freshness guessed from `Last-Modified` would have the proxy invent a
@@ -711,6 +720,11 @@ instead of a body, which is the entire economy of holding a validator.
 
 `X-Cache` on the response says `HIT`, `MISS` or `REVALIDATED`, so the cache is
 visible from outside rather than only by watching the origin.
+
+Stored entries are **immutable**: a revalidation installs a replacement rather
+than editing the entry a concurrent request may be writing to a client. Response
+header rules are applied on the way out, to a copy, so a hit and a miss carry
+identical headers and a rule change reaches cached entries immediately.
 
 ### Bounds
 

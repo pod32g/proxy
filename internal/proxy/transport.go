@@ -58,12 +58,16 @@ func (p Policy) buildTransport(dialer *net.Dialer) (ordinary, upgrade *http.Tran
 	if p.UpstreamTLS != nil {
 		base.TLSClientConfig = p.UpstreamTLS.Clone()
 	}
-	if p.Upstream.Configured() {
+	// Resolved per request rather than at build time, so a reload that
+	// repoints the parent reaches traffic already in flight through this
+	// transport rather than only new processes.
+	if p.Upstream != nil {
 		base.Proxy = func(r *http.Request) (*url.URL, error) {
-			if p.Upstream.Bypass(r.URL.Host) {
+			parent := p.parent()
+			if !parent.Configured() || parent.Bypass(r.URL.Host) {
 				return nil, nil
 			}
-			return p.Upstream.URL, nil
+			return parent.URL, nil
 		}
 	}
 

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/pod32g/proxy/internal/policy"
@@ -135,7 +136,7 @@ func chainedProxy(t *testing.T, parentURL, noProxy string, rules func(string) *p
 	if err != nil {
 		t.Fatalf("upstream.Parse: %v", err)
 	}
-	pol := Policy{AllowPrivate: true, ConnectPorts: allPorts(), Upstream: up, Rules: rules}
+	pol := Policy{AllowPrivate: true, ConnectPorts: allPorts(), Upstream: func() *upstream.Proxy { return up }, Rules: rules}
 	return NewForward(newLogger(), func(string) map[string]string { return nil }, pol)
 }
 
@@ -384,7 +385,7 @@ func TestConnectPortRestrictionStillAppliesWhenChained(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := NewForward(newLogger(), func(string) map[string]string { return nil },
-		Policy{AllowPrivate: true, ConnectPorts: []int{443}, Upstream: up})
+		Policy{AllowPrivate: true, ConnectPorts: []int{443}, Upstream: func() *upstream.Proxy { return up }})
 
 	req := httptest.NewRequest(http.MethodConnect, "example.com:25", nil)
 	req.Host = "example.com:25"
@@ -397,5 +398,112 @@ func TestConnectPortRestrictionStillAppliesWhenChained(t *testing.T) {
 	}
 	if connects, _, _ := parent.seen(); len(connects) != 0 {
 		t.Error("a disallowed CONNECT port still reached the parent")
+	}
+}
+
+// The bug PROXY-67 actually was: the handler captured the parent proxy by value
+// at startup, so a reload reported upstream_proxy applied while traffic kept
+// flowing to the old parent.
+//
+// This asserts it where it broke — a handler built once, then a configuration
+// change, then a request. A test at the config layer would have passed against
+// the broken code, because the accessor was always live; it was the capture
+// that was not.
+func TestParentProxyIsRereadPerRequest(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ORIGIN")
+	}))
+	defer origin.Close()
+
+	first := newParentProxy(t, "")
+	second := newParentProxy(t, "")
+
+	// What main does: hand the Policy a function, not a value.
+	var current atomic.Pointer[upstream.Proxy]
+	set := func(u string) {
+		p, err := upstream.Parse(u, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		current.Store(p)
+	}
+	set(first.url())
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{
+			AllowPrivate: true, ConnectPorts: allPorts(),
+			Upstream: func() *upstream.Proxy { return current.Load() },
+		})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	client := proxyClient(t, srv.URL)
+
+	resp, err := client.Get(origin.URL + "/one")
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	resp.Body.Close()
+
+	// The reload.
+	set(second.url())
+
+	resp, err = client.Get(origin.URL + "/two")
+	if err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+	resp.Body.Close()
+
+	_, firstSaw, _ := first.seen()
+	_, secondSaw, _ := second.seen()
+	if len(firstSaw) != 1 {
+		t.Errorf("the original parent saw %d requests, want 1", len(firstSaw))
+	}
+	if len(secondSaw) != 1 {
+		t.Errorf("the new parent saw %d requests, want 1 — the handler kept the old parent", len(secondSaw))
+	}
+}
+
+// And the same for a parent being removed entirely: traffic must go direct
+// rather than to a parent that may no longer exist.
+func TestRemovingTheParentTakesEffect(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ORIGIN")
+	}))
+	defer origin.Close()
+
+	parent := newParentProxy(t, "")
+	var current atomic.Pointer[upstream.Proxy]
+	p, _ := upstream.Parse(parent.url(), "")
+	current.Store(p)
+
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{
+			AllowPrivate: true, ConnectPorts: allPorts(),
+			Upstream: func() *upstream.Proxy { return current.Load() },
+		})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	client := proxyClient(t, srv.URL)
+
+	resp, _ := client.Get(origin.URL + "/via-parent")
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	none, _ := upstream.Parse("", "")
+	current.Store(none)
+
+	resp, err := client.Get(origin.URL + "/direct")
+	if err != nil {
+		t.Fatalf("request after removing the parent: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ORIGIN" {
+		t.Errorf("body = %q", body)
+	}
+
+	if _, requests, _ := parent.seen(); len(requests) != 1 {
+		t.Errorf("the parent saw %d requests, want only the first", len(requests))
 	}
 }

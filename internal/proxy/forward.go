@@ -58,11 +58,18 @@ type Policy struct {
 	// HTTP2Auto, which is what the default transport already did.
 	HTTP2 UpstreamHTTP2
 
-	// Upstream, when configured, is a parent proxy every request is forwarded
-	// through rather than dialling origins directly.
+	// Upstream resolves the parent proxy every request is forwarded through
+	// rather than dialling origins directly, or nil for none.
 	//
-	// It moves where the destination policy is enforced. See checkDestination.
-	Upstream *upstream.Proxy
+	// A function, like Rules, HeaderRules and the quota set, because it is
+	// reloadable: holding the value would mean a SIGHUP repointing the parent
+	// reported success while traffic kept flowing to the old one — a config
+	// file that says one thing while the process does another, which is the
+	// failure the reload reporting exists to prevent.
+	//
+	// It also moves where the destination policy is enforced. See
+	// checkDestination.
+	Upstream func() *upstream.Proxy
 
 	// UpstreamTLS configures outbound TLS: an additional trust bundle, a client
 	// certificate, or both. Nil uses the system trust store.
@@ -289,7 +296,16 @@ func (p Policy) dialer() *net.Dialer {
 
 // chained reports whether a destination goes through the parent proxy.
 func (p Policy) chained(hostport string) bool {
-	return p.Upstream.Configured() && !p.Upstream.Bypass(hostport)
+	parent := p.parent()
+	return parent.Configured() && !parent.Bypass(hostport)
+}
+
+// parent resolves the configured parent proxy, or nil.
+func (p Policy) parent() *upstream.Proxy {
+	if p.Upstream == nil {
+		return nil
+	}
+	return p.Upstream()
 }
 
 // checkDestination evaluates the destination policy against the hostname the
@@ -455,11 +471,19 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			return
 		}
 		// A fresh hit answers here, before any of the outbound work.
-		served, stale := serveFromCache(w, r, pol.Cache)
-		if served {
+		// Response rules run on the way out, so a hit carries exactly the headers
+		// a miss would and a rule change reaches cached entries immediately.
+		rewrite := func(h http.Header) {
+			applyHeaderRules(pol, h, header.Response, clientIP(r.RemoteAddr), r.URL.Host)
+		}
+		hit, cached := serveFromCache(w, r, pol.Cache)
+		if hit {
+			writeEntry(w, cached, "HIT", rewrite)
 			markServed(w)
+			pol.Cache.Hit()
 			return
 		}
+		stale := cached
 
 		outReq := r.Clone(context.WithValue(r.Context(), clientKey{}, clientIP(r.RemoteAddr)))
 		outReq.RequestURI = ""
@@ -489,7 +513,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 				http.Error(w, "Destination not permitted", http.StatusForbidden)
 				return
 			}
-			if auth := pol.Upstream.AuthHeader(); auth != "" {
+			if auth := pol.parent().AuthHeader(); auth != "" {
 				outReq.Header.Set("Proxy-Authorization", auth)
 			}
 		}
@@ -534,21 +558,28 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		}
 		defer resp.Body.Close()
 		removeHopByHop(resp.Header)
-		applyHeaderRules(pol, resp.Header, header.Response, clientIP(r.RemoteAddr), r.URL.Host)
 
 		// A 304 against a stored entry means the entry is still good: refresh
 		// its lifetime and serve it. That exchange cost headers rather than a
 		// body, which is the entire point of holding a validator.
 		if resp.StatusCode == http.StatusNotModified && stale != nil {
+			// Refresh returns a *replacement*; the entry passed in may be being
+			// written to another client right now and is never edited.
+			serve := stale
 			if ttl, ok := cache.TTL(resp); ok {
-				pol.Cache.Refresh(stale, resp, ttl)
+				serve = pol.Cache.Refresh(stale, resp, ttl)
 			}
 			pol.Cache.Revalidated()
-			writeEntry(w, stale, "REVALIDATED")
+			writeEntry(w, serve, "REVALIDATED", rewrite)
 			return
 		}
 
+		// Stored before the response rules run, so the entry holds what the
+		// origin sent rather than this proxy's rewrite of it. The rules are
+		// applied to the outgoing copy below, and to a hit on the way out, so
+		// changing a rule takes effect on cached entries immediately.
 		body := storeResponse(r, resp, pol.Cache)
+		applyHeaderRules(pol, resp.Header, header.Response, clientIP(r.RemoteAddr), r.URL.Host)
 		copyHeader(w.Header(), resp.Header)
 		if pol.Cache != nil {
 			w.Header().Set("X-Cache", "MISS")
@@ -781,7 +812,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 // that silently carries the parent's error page instead of the origin.
 func (p Policy) dialThroughParent(d *net.Dialer, logger *log.Logger) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		parent := p.Upstream.Addr()
+		parent := p.parent().Addr()
 		conn, err := d.DialContext(ctx, network, parent)
 		if err != nil {
 			return nil, fmt.Errorf("dialling the upstream proxy %s: %w", parent, err)
@@ -793,7 +824,7 @@ func (p Policy) dialThroughParent(d *net.Dialer, logger *log.Logger) func(contex
 			Host:   addr,
 			Header: make(http.Header),
 		}
-		if auth := p.Upstream.AuthHeader(); auth != "" {
+		if auth := p.parent().AuthHeader(); auth != "" {
 			req.Header.Set("Proxy-Authorization", auth)
 		}
 		if err := req.Write(conn); err != nil {

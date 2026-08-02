@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/pod32g/proxy/internal/cache"
+	"github.com/pod32g/proxy/internal/header"
 )
 
 // cachingProxy wires a real cache into a real handler. The predicates are unit
@@ -242,3 +243,166 @@ func TestVaryIsHonouredEndToEnd(t *testing.T) {
 		t.Errorf("the English variant was not cached: X-Cache = %q", got)
 	}
 }
+
+// A hit and a miss must be indistinguishable to the client. Rules used to be
+// applied before storing, so a hit replayed whatever the rules said when the
+// entry was created and a rule change never reached cached URLs.
+func TestResponseRulesApplyToHitsAndMisses(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=300")
+		w.Header().Set("X-Origin", "yes")
+		io.WriteString(w, "BODY")
+	}))
+	defer origin.Close()
+
+	rules := &atomicRules{}
+	rules.set(t, "response set X-Via: first")
+
+	c := cache.New(1<<20, 1<<16)
+	h := NewForward(newLogger(), func(string) map[string]string { return nil },
+		Policy{
+			AllowPrivate: true, ConnectPorts: allPorts(), Cache: c,
+			HeaderRules: rules.get,
+		})
+
+	miss := fetch(t, h, origin.URL+"/a")
+	if got := miss.Header().Get("X-Via"); got != "first" {
+		t.Fatalf("miss X-Via = %q", got)
+	}
+
+	hit := fetch(t, h, origin.URL+"/a")
+	if hit.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("expected a hit, got %q", hit.Header().Get("X-Cache"))
+	}
+	if got := hit.Header().Get("X-Via"); got != "first" {
+		t.Errorf("hit X-Via = %q — rules did not apply to a hit", got)
+	}
+
+	// Change the rule. A cached entry must follow it immediately.
+	rules.set(t, "response set X-Via: second")
+
+	after := fetch(t, h, origin.URL+"/a")
+	if after.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("expected a hit, got %q", after.Header().Get("X-Cache"))
+	}
+	if got := after.Header().Get("X-Via"); got != "second" {
+		t.Errorf("hit X-Via = %q after a rule change — the rule was baked in at store time", got)
+	}
+	// And the origin's own header still comes through.
+	if after.Header().Get("X-Origin") != "yes" {
+		t.Error("the stored entry lost the origin's headers")
+	}
+}
+
+// A cookie-bearing request identifies a user just as an Authorization header
+// does, and must not produce an entry another client can be served.
+func TestCookieBearingResponseIsNotShared(t *testing.T) {
+	var hits atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=31536000")
+		if c := r.Header.Get("Cookie"); c != "" {
+			io.WriteString(w, "PERSONAL FOR "+c)
+			return
+		}
+		io.WriteString(w, "ANONYMOUS")
+	}))
+	defer origin.Close()
+
+	h := cachingProxy(t, cache.New(1<<20, 1<<16))
+
+	personal := fetch(t, h, origin.URL+"/dashboard", "Cookie", "session=alice")
+	if personal.Body.String() != "PERSONAL FOR session=alice" {
+		t.Fatalf("cookied fetch: %q", personal.Body.String())
+	}
+	anon := fetch(t, h, origin.URL+"/dashboard")
+	if anon.Body.String() != "ANONYMOUS" {
+		t.Fatalf("one user was served another's page: %q", anon.Body.String())
+	}
+	if n := hits.Load(); n != 2 {
+		t.Errorf("origin hits = %d, want 2", n)
+	}
+}
+
+// no-cache means "keep this, but check with me first". Serving it for its
+// max-age inverts the instruction.
+func TestNoCacheRevalidatesEveryTime(t *testing.T) {
+	var conditionals, full atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Cache-Control", "no-cache, max-age=300")
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			conditionals.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		full.Add(1)
+		io.WriteString(w, "BODY")
+	}))
+	defer origin.Close()
+
+	h := cachingProxy(t, cache.New(1<<20, 1<<16))
+
+	fetch(t, h, origin.URL+"/a")
+	for i := 0; i < 3; i++ {
+		got := fetch(t, h, origin.URL+"/a")
+		if got.Body.String() != "BODY" {
+			t.Errorf("body = %q", got.Body.String())
+		}
+		if got.Header().Get("X-Cache") == "HIT" {
+			t.Fatal("a no-cache response was served without checking the origin")
+		}
+	}
+	if conditionals.Load() != 3 {
+		t.Errorf("conditional requests = %d, want 3", conditionals.Load())
+	}
+	if full.Load() != 1 {
+		t.Errorf("full fetches = %d, want 1 — the body was refetched", full.Load())
+	}
+}
+
+// A client asking for no-cache wants the entity confirmed, not whatever is held.
+func TestClientNoCacheForcesRevalidation(t *testing.T) {
+	var conditionals atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Cache-Control", "max-age=300")
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			conditionals.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		io.WriteString(w, "BODY")
+	}))
+	defer origin.Close()
+
+	h := cachingProxy(t, cache.New(1<<20, 1<<16))
+	fetch(t, h, origin.URL+"/a")
+
+	if got := fetch(t, h, origin.URL+"/a"); got.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("an ordinary second fetch should hit, got %q", got.Header().Get("X-Cache"))
+	}
+	forced := fetch(t, h, origin.URL+"/a", "Cache-Control", "no-cache")
+	if forced.Header().Get("X-Cache") == "HIT" {
+		t.Error("a client's no-cache was ignored")
+	}
+	if conditionals.Load() != 1 {
+		t.Errorf("conditional requests = %d, want 1", conditionals.Load())
+	}
+}
+
+// atomicRules stands in for configuration that changes under a running handler.
+type atomicRules struct {
+	v atomic.Pointer[header.RuleSet]
+}
+
+func (a *atomicRules) set(t *testing.T, text string) {
+	t.Helper()
+	set, err := header.Parse(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.v.Store(set)
+}
+
+func (a *atomicRules) get(string) *header.RuleSet { return a.v.Load() }
