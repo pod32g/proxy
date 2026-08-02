@@ -38,6 +38,14 @@ type Entry struct {
 	ETag         string
 	LastModified string
 
+	// Method is the request method this entry answers. GET and HEAD are stored
+	// separately — the key includes the method — and they are not
+	// interchangeable: a HEAD entry has no body to give a GET, and a GET
+	// entry's body must not be sent in reply to a HEAD.
+	//
+	// It is exported because the difference reaches the wire. See Bodyless.
+	Method string
+
 	// storedAt and initialAge are what Age is computed from: how old the
 	// response already was when it arrived, plus how long it has sat here.
 	// Both are needed — a response from a CDN is not new just because this
@@ -68,6 +76,16 @@ func (e *Entry) Fresh(now time.Time) bool {
 // Revalidatable reports whether an expired entry is worth a conditional
 // request rather than a plain refetch.
 func (e *Entry) Revalidatable() bool { return e.ETag != "" || e.LastModified != "" }
+
+// Bodyless reports whether this entry was stored from a response that carried
+// no body, and therefore whose stored length says nothing about the entity.
+//
+// A HEAD is exactly that. Recomputing Content-Length from the stored body —
+// correct and necessary for a GET, where the stored body is authoritative —
+// turned a HEAD hit into "Content-Length: 0" while the miss before it reported
+// the real size. Nothing errors on that; the client simply believes the
+// resource is empty, which is most of what HEAD is asked for.
+func (e *Entry) Bodyless() bool { return e.Method == http.MethodHead }
 
 // Age is how old this response is, counting from when the origin generated it
 // rather than from when this cache first saw it.
@@ -301,6 +319,7 @@ func (c *Cache) store(scope string, r *http.Request, resp *http.Response, body [
 		Status:         resp.StatusCode,
 		Header:         resp.Header.Clone(),
 		Body:           body,
+		Method:         r.Method,
 		Expires:        now.Add(ttl - age),
 		MustRevalidate: directives(resp.Header.Get("Cache-Control")).has("no-cache"),
 		ETag:           etag,
@@ -363,6 +382,7 @@ func (c *Cache) Refresh(old *Entry, resp *http.Response, ttl time.Duration) *Ent
 		Status:         old.Status,
 		Header:         header,
 		Body:           old.Body, // never written after construction, so shared safely
+		Method:         old.Method,
 		MustRevalidate: directives(resp.Header.Get("Cache-Control")).has("no-cache"),
 		ETag:           old.ETag,
 		LastModified:   old.LastModified,

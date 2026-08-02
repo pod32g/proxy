@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/pod32g/proxy/internal/header"
@@ -114,24 +115,24 @@ type File struct {
 // falls back to the top-level configuration, so an entry that differs only in
 // address and policy says only that.
 type ListenerFile struct {
-	Name string `yaml:"name"`
-	Addr string `yaml:"address"`
-	Cert string `yaml:"cert"`
-	Key  string `yaml:"key"`
+	Name string `yaml:"name,omitempty"`
+	Addr string `yaml:"address,omitempty"`
+	Cert string `yaml:"cert,omitempty"`
+	Key  string `yaml:"key,omitempty"`
 
-	Mode   *string `yaml:"mode"`
-	Target *string `yaml:"target"`
+	Mode   *string `yaml:"mode,omitempty"`
+	Target *string `yaml:"target,omitempty"`
 
-	AllowPrivate *bool `yaml:"allow_private"`
-	ConnectPorts []int `yaml:"connect_ports"`
+	AllowPrivate *bool `yaml:"allow_private,omitempty"`
+	ConnectPorts []int `yaml:"connect_ports,omitempty"`
 	UpstreamTLS  *struct {
-		CA   *string `yaml:"ca"`
-		Cert *string `yaml:"cert"`
-		Key  *string `yaml:"key"`
-	} `yaml:"upstream_tls"`
-	Policy  *string `yaml:"policy"`
-	Clients *string `yaml:"clients"`
-	Quotas  *string `yaml:"quotas"`
+		CA   *string `yaml:"ca,omitempty"`
+		Cert *string `yaml:"cert,omitempty"`
+		Key  *string `yaml:"key,omitempty"`
+	} `yaml:"upstream_tls,omitempty"`
+	Policy  *string `yaml:"policy,omitempty"`
+	Clients *string `yaml:"clients,omitempty"`
+	Quotas  *string `yaml:"quotas,omitempty"`
 }
 
 // LoadFile reads and fully validates a configuration file.
@@ -510,6 +511,161 @@ type Change struct {
 	To      string
 }
 
+// restartOnly is the single source for both the list of settings a reload
+// cannot apply and the comparison that reports them.
+//
+// One table because there used to be two: a RestartOnly slice, quoted in the
+// README, and a hand-written run of comparisons in RestartRequired. They had
+// already drifted. Seven settings the list named were compared by nothing, and
+// `listeners` and `upstream_tls` were in neither — so editing a listener's
+// policy and sending SIGHUP applied nothing and warned about nothing, which is
+// precisely the outcome RestartRequired exists to prevent.
+//
+// Every reader renders an absent value the same way whether the field is unset
+// or its whole block is. Returning "" for a missing block and "(unset)" for a
+// missing field inside a present one meant adding any tracing key at all
+// reported a tracing.endpoint change that had not happened.
+var restartOnly = []struct {
+	name string
+	read func(*File) string
+}{
+	{"mode", func(f *File) string { return deref(f.Mode) }},
+	{"target", func(f *File) string { return deref(f.Target) }},
+	{"http", func(f *File) string { return deref(f.HTTP) }},
+	{"https", func(f *File) string { return deref(f.HTTPS) }},
+	{"cert", func(f *File) string { return deref(f.Cert) }},
+	{"key", func(f *File) string { return deref(f.Key) }},
+	{"db", func(f *File) string { return deref(f.DB) }},
+	{"health_path", func(f *File) string { return deref(f.HealthPath) }},
+	{"secret", func(f *File) string { return redactedStr(f.Secret) }},
+	{"secret_file", func(f *File) string { return deref(f.SecretFile) }},
+	{"allow_private", func(f *File) string { return boolStr(f.AllowPrivate) }},
+	{"metrics_public", func(f *File) string { return boolStr(f.MetricsPublic) }},
+	{"connect_ports", func(f *File) string { return portsStr(f.ConnectPorts) }},
+
+	{"admin.http", func(f *File) string {
+		if f.Admin == nil {
+			return deref(nil)
+		}
+		return deref(f.Admin.HTTP)
+	}},
+	{"admin.cert", func(f *File) string {
+		if f.Admin == nil {
+			return deref(nil)
+		}
+		return deref(f.Admin.Cert)
+	}},
+	{"admin.key", func(f *File) string {
+		if f.Admin == nil {
+			return deref(nil)
+		}
+		return deref(f.Admin.Key)
+	}},
+
+	{"log.format", func(f *File) string {
+		if f.Log == nil {
+			return deref(nil)
+		}
+		return deref(f.Log.Format)
+	}},
+
+	{"access_log.format", func(f *File) string {
+		if f.AccessLog == nil {
+			return deref(nil)
+		}
+		return deref(f.AccessLog.Format)
+	}},
+	{"access_log.file", func(f *File) string {
+		if f.AccessLog == nil {
+			return deref(nil)
+		}
+		return deref(f.AccessLog.File)
+	}},
+
+	{"tracing.endpoint", func(f *File) string {
+		if f.Tracing == nil {
+			return deref(nil)
+		}
+		return deref(f.Tracing.Endpoint)
+	}},
+	{"tracing.insecure", func(f *File) string {
+		if f.Tracing == nil {
+			return boolStr(nil)
+		}
+		return boolStr(f.Tracing.Insecure)
+	}},
+	{"tracing.sample", func(f *File) string {
+		if f.Tracing == nil {
+			return floatStr(nil)
+		}
+		return floatStr(f.Tracing.Sample)
+	}},
+
+	{"destination_metrics.enabled", func(f *File) string {
+		if f.DestinationMetrics == nil {
+			return boolStr(nil)
+		}
+		return boolStr(f.DestinationMetrics.Enabled)
+	}},
+	{"destination_metrics.top", func(f *File) string {
+		if f.DestinationMetrics == nil {
+			return intStr(nil)
+		}
+		return intStr(f.DestinationMetrics.Top)
+	}},
+
+	{"upstream_tls.ca", func(f *File) string {
+		if f.UpstreamTLS == nil {
+			return deref(nil)
+		}
+		return deref(f.UpstreamTLS.CA)
+	}},
+	{"upstream_tls.cert", func(f *File) string {
+		if f.UpstreamTLS == nil {
+			return deref(nil)
+		}
+		return deref(f.UpstreamTLS.Cert)
+	}},
+	{"upstream_tls.key", func(f *File) string {
+		if f.UpstreamTLS == nil {
+			return deref(nil)
+		}
+		return deref(f.UpstreamTLS.Key)
+	}},
+
+	{"listeners", listenersStr},
+}
+
+// RestartOnly names the settings a reload cannot apply, for the documentation
+// and for the error message. Derived from the table above rather than written
+// out again, which is how the two came apart in the first place.
+var RestartOnly = restartOnlyNames()
+
+// Reloadable names the settings ApplyTo puts into effect.
+//
+// It exists so that Reloadable and RestartOnly together can be checked against
+// the File struct itself: a field in neither is a setting the reload would
+// silently ignore, which is what happened to `listeners` and `upstream_tls`.
+// The test that walks the struct is what turns "every setting is either applied
+// or reported" from an intention into a property, and it is the reason to
+// tolerate a second list rather than just fixing the first.
+var Reloadable = []string{
+	"auth.enabled", "auth.password", "auth.password_file", "auth.username",
+	"clients", "header_rules", "headers", "log.level", "policy",
+	"proxy_id", "proxy_name", "quotas", "stats",
+	"upstream_proxy.no_proxy", "upstream_proxy.password",
+	"upstream_proxy.url", "upstream_proxy.username",
+}
+
+func restartOnlyNames() []string {
+	out := make([]string, 0, len(restartOnly))
+	for _, s := range restartOnly {
+		out = append(out, s.name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // RestartRequired reports settings that differ from the running configuration
 // and cannot be changed without a restart.
 //
@@ -522,44 +678,31 @@ func (f *File) RestartRequired(prev *File) []Change {
 		return nil
 	}
 	var out []Change
-	cmp := func(name string, a, b *string) {
-		if !sameStr(a, b) {
-			out = append(out, Change{name, deref(a), deref(b)})
+	for _, s := range restartOnly {
+		if before, after := s.read(prev), s.read(f); before != after {
+			out = append(out, Change{s.name, before, after})
 		}
-	}
-	cmp("mode", prev.Mode, f.Mode)
-	cmp("target", prev.Target, f.Target)
-	cmp("http", prev.HTTP, f.HTTP)
-	cmp("https", prev.HTTPS, f.HTTPS)
-	cmp("cert", prev.Cert, f.Cert)
-	cmp("key", prev.Key, f.Key)
-	cmp("db", prev.DB, f.DB)
-	cmp("health_path", prev.HealthPath, f.HealthPath)
-	cmp("secret_file", prev.SecretFile, f.SecretFile)
-
-	if !sameBool(prev.AllowPrivate, f.AllowPrivate) {
-		out = append(out, Change{"allow_private", boolStr(prev.AllowPrivate), boolStr(f.AllowPrivate)})
-	}
-	if !sameBool(prev.MetricsPublic, f.MetricsPublic) {
-		out = append(out, Change{"metrics_public", boolStr(prev.MetricsPublic), boolStr(f.MetricsPublic)})
-	}
-	if !samePorts(prev.ConnectPorts, f.ConnectPorts) {
-		out = append(out, Change{"connect_ports", portsStr(prev.ConnectPorts), portsStr(f.ConnectPorts)})
-	}
-	if prevAdmin, next := adminAddr(prev), adminAddr(f); prevAdmin != next {
-		out = append(out, Change{"admin.http", prevAdmin, next})
-	}
-	if prevA, next := accessLogFormat(prev), accessLogFormat(f); prevA != next {
-		out = append(out, Change{"access_log.format", prevA, next})
-	}
-	if prevT, next := tracingEndpoint(prev), tracingEndpoint(f); prevT != next {
-		out = append(out, Change{"tracing.endpoint", prevT, next})
-	}
-	if prevL, next := logFormat(prev), logFormat(f); prevL != next {
-		out = append(out, Change{"log.format", prevL, next})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Setting < out[j].Setting })
 	return out
+}
+
+// listenersStr renders the listener block so that any change to it is both
+// detectable and legible in a warning. ListenerFile's yaml tags carry
+// omitempty for this: without it the warning is mostly "null".
+//
+// Marshalled rather than hand-formatted, so a field added to ListenerFile later
+// is covered without anyone remembering to extend this — which is the failure
+// this whole table is fixing.
+func listenersStr(f *File) string {
+	if f == nil || len(f.Listeners) == 0 {
+		return "(none)"
+	}
+	out, err := yaml.Marshal(f.Listeners)
+	if err != nil {
+		return fmt.Sprintf("(%d listeners)", len(f.Listeners))
+	}
+	return strings.Join(strings.Fields(string(out)), " ")
 }
 
 func sameStr(a, b *string) bool {
@@ -595,6 +738,32 @@ func deref(s *string) string {
 	return *s
 }
 
+func floatStr(f *float64) string {
+	if f == nil {
+		return "(unset)"
+	}
+	return strconv.FormatFloat(*f, 'g', -1, 64)
+}
+
+func intStr(n *int) string {
+	if n == nil {
+		return "(unset)"
+	}
+	return strconv.Itoa(*n)
+}
+
+// redactedStr compares a secret without printing it. The comparison has to see
+// the value; the warning must not.
+func redactedStr(s *string) string {
+	if s == nil {
+		return "(unset)"
+	}
+	if *s == "" {
+		return "(empty)"
+	}
+	return "(set:" + strconv.Itoa(len(*s)) + ")"
+}
+
 func boolStr(b *bool) string {
 	if b == nil {
 		return "(unset)"
@@ -611,45 +780,4 @@ func portsStr(p []int) string {
 		parts[i] = fmt.Sprint(v)
 	}
 	return strings.Join(parts, ",")
-}
-
-func adminAddr(f *File) string {
-	if f == nil || f.Admin == nil {
-		return ""
-	}
-	return deref(f.Admin.HTTP)
-}
-
-func accessLogFormat(f *File) string {
-	if f == nil || f.AccessLog == nil {
-		return ""
-	}
-	return deref(f.AccessLog.Format)
-}
-
-func tracingEndpoint(f *File) string {
-	if f == nil || f.Tracing == nil {
-		return ""
-	}
-	return deref(f.Tracing.Endpoint)
-}
-
-func logFormat(f *File) string {
-	if f == nil || f.Log == nil {
-		return ""
-	}
-	return deref(f.Log.Format)
-}
-
-// RestartOnly names the settings a reload cannot apply, for the documentation
-// and for the error message. Enumerated here rather than left for users to
-// discover by finding that a change did nothing.
-var RestartOnly = []string{
-	"mode", "target", "http", "https", "cert", "key", "db",
-	"admin.http", "admin.cert", "admin.key",
-	"allow_private", "connect_ports", "health_path", "metrics_public",
-	"log.format", "access_log.format", "access_log.file",
-	"tracing.endpoint", "tracing.insecure", "tracing.sample",
-	"destination_metrics.enabled", "destination_metrics.top",
-	"secret", "secret_file",
 }

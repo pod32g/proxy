@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -686,5 +687,108 @@ func TestParentCredentialsNeverReachTheOrigin(t *testing.T) {
 				t.Errorf("the parent saw auth %v, want %q", auth, want)
 			}
 		})
+	}
+}
+
+// PROXY-76. There are three routes out of this proxy and each used to arrange
+// its own destination check. Upgrades arranged none, and their transport
+// inherits the parent hook — so with a parent configured the dialer evaluated
+// the rules against the *parent's* hostname and let everything through.
+//
+// Both halves are asserted together, because the without-parent case passed
+// throughout: the bug was only ever visible when the two differed.
+func TestUpgradeHonoursTheDestinationPolicy(t *testing.T) {
+	for _, chained := range []bool{false, true} {
+		name := "direct"
+		if chained {
+			name = "through a parent"
+		}
+		t.Run(name, func(t *testing.T) {
+			parent := newParentProxy(t, "")
+			up, err := upstream.Parse(parent.url(), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules, err := policy.Parse("deny domain blocked.example.com\nallow all")
+			if err != nil {
+				t.Fatal(err)
+			}
+			pol := Policy{
+				AllowPrivate: true, ConnectPorts: allPorts(),
+				Rules: func(string) *policy.RuleSet { return rules },
+			}
+			if chained {
+				pol.Upstream = func() *upstream.Proxy { return up }
+			}
+			srv := httptest.NewServer(NewForward(newLogger(),
+				func(string) map[string]string { return nil }, pol))
+			defer srv.Close()
+
+			conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			io.WriteString(conn, "GET http://blocked.example.com/ws HTTP/1.1\r\n"+
+				"Host: blocked.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+			buf := make([]byte, 128)
+			n, _ := conn.Read(buf)
+			status := strings.SplitN(string(buf[:n]), "\r\n", 2)[0]
+
+			if !strings.Contains(status, "403") {
+				t.Errorf("upgrade to a denied destination answered %q, want 403", status)
+			}
+			// The stronger assertion: the request must not have left the proxy
+			// at all. A 403 produced downstream of a forwarded request would
+			// still be a bypass.
+			if _, requests, _ := parent.seen(); len(requests) != 0 {
+				t.Errorf("the parent received a request for a denied destination: %v", requests)
+			}
+		})
+	}
+}
+
+// PROXY-80. Upstream is a function so a reload is picked up per request, which
+// means a dial that reads it four times can see four different parents. The
+// sharp version: clearing the parent stores a Proxy with a nil URL, and the
+// read between the Secure check and the TLS config dereferenced it.
+func TestParentTLSConfigWithNoParent(t *testing.T) {
+	cleared, err := upstream.Parse("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		parent *upstream.Proxy
+	}{
+		{"cleared", cleared},
+		{"nil", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked on a %s parent: %v", tc.name, r)
+				}
+			}()
+			cfg := Policy{}.parentTLSConfig(tc.parent)
+			if cfg.ServerName != "" {
+				t.Errorf("ServerName = %q, want empty", cfg.ServerName)
+			}
+		})
+	}
+}
+
+// And the dial itself must fail cleanly rather than panicking or silently
+// dialling nowhere when the parent goes away underneath it.
+func TestDialThroughParentAfterTheParentIsCleared(t *testing.T) {
+	cleared, _ := upstream.Parse("", "")
+	pol := Policy{Upstream: func() *upstream.Proxy { return cleared }}
+	_, err := pol.dialThroughParent(&net.Dialer{}, newLogger())(
+		context.Background(), "tcp", "example.com:443")
+	if err == nil {
+		t.Fatal("dialling through a removed parent returned no error")
+	}
+	if !strings.Contains(err.Error(), "removed") {
+		t.Errorf("error = %v, want it to say the parent was removed", err)
 	}
 }

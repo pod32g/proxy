@@ -127,13 +127,26 @@ restart produces a proxy whose configuration says one thing and whose behaviour
 says another, and nobody finds out until a restart applies changes nobody
 remembers making, at a moment nobody chose.
 
-**Applied live:** `policy`, `clients`, `quotas`, `headers`, `stats`,
-`proxy_name`, `proxy_id`, `log.level`, and the `auth` block.
+**Applied live:** `policy`, `clients`, `quotas`, `headers`, `header_rules`,
+`stats`, `proxy_name`, `proxy_id`, `log.level`, and the `auth` and
+`upstream_proxy` blocks.
 
 **Requires a restart:** `mode`, `target`, `http`, `https`, `cert`, `key`, `db`,
-the `admin` block, `allow_private`, `connect_ports`, `health_path`,
-`metrics_public`, `log.format`, the `access_log` block, the `tracing` block, the
-`destination_metrics` block, and `secret` / `secret_file`.
+`allow_private`, `connect_ports`, `health_path`, `metrics_public`,
+`log.format`, `secret` / `secret_file`, and the `admin`, `access_log`,
+`tracing`, `destination_metrics`, `upstream_tls` and `listeners` blocks.
+
+**`listeners` needs a restart, including its per-listener rule sets.** A
+listener's `policy`, `clients` and `quotas` take the same text the top-level
+ones do, and the top-level ones *are* live — so this is the one asymmetry in the
+file worth knowing about. Changing one is reported as needing a restart rather
+than quietly doing nothing, which is what it used to do.
+
+Every setting in the file is in exactly one of those two lists, and that is
+checked by a test that walks the `File` struct rather than by anyone keeping the
+lists in step. It has to be: `listeners` and `upstream_tls` were in neither, so
+editing them applied nothing and warned about nothing — the exact outcome the
+warning exists to prevent.
 
 Reloading is safe under traffic: everything in the live set is read through
 locked accessors on each request, and a reload replaces values wholesale rather
@@ -729,6 +742,10 @@ rather than whatever the proxy holds.
 Heuristic freshness guessed from `Last-Modified` would have the proxy invent a
 lifetime for content nobody labelled, and start serving stale pages the origin
 never authorised.
+
+**A `HEAD` is cached separately from a `GET`** — the key includes the method, so
+neither answers the other — and a `HEAD` hit reports the `Content-Length` the
+origin gave for the entity, not the zero-length body that was actually stored.
 
 **Freshness counts from the origin, not from arrival.** A response that reaches
 the proxy with `max-age=3600, Age: 3500` has a hundred seconds left, not another

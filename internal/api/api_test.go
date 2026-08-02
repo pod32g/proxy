@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -353,5 +355,57 @@ func TestPolicyTestRequiresAHost(t *testing.T) {
 	rec := doReq(t, h, "POST", "/policy/test", map[string]string{})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+// PROXY-78. Save returns an error and every call site here used to discard it,
+// so a change that could not be written answered 204 and logged nothing. The
+// setting reverts at the next restart, and the audit entry — written inside the
+// same transaction on purpose — is never made either.
+func TestAFailedSaveIsNotReportedAsSuccess(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.db")
+	store, err := config.NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	if err := store.Save(cfg, config.Actor{Via: config.ViaStartup}); err != nil {
+		t.Fatal(err)
+	}
+	// A read-only volume, or a full disk.
+	for _, p := range []struct {
+		path string
+		mode os.FileMode
+	}{{path, 0o444}, {dir, 0o555}} {
+		if err := os.Chmod(p.path, p.mode); err != nil {
+			t.Skipf("cannot chmod: %v", err)
+		}
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755); os.Chmod(path, 0o644) })
+	if store.Save(cfg, config.Actor{Via: config.ViaStartup}) == nil {
+		t.Skip("the database is still writable; cannot exercise the failure")
+	}
+
+	h := New(cfg, store, nil, nil)
+	for _, tc := range []struct{ method, path, body string }{
+		{"PUT", "/policy", `{"destinations":"deny all"}`},
+		{"POST", "/auth", `{"enabled":true,"username":"a","password":"b"}`},
+		{"POST", "/loglevel", `{"level":"DEBUG"}`},
+		{"POST", "/identity", `{"name":"n","id":"i"}`},
+		{"POST", "/stats", `{"enabled":true}`},
+		{"POST", "/headers", `{"name":"X-A","value":"1"}`},
+		{"DELETE", "/headers", `{"name":"X-A"}`},
+	} {
+		t.Run(tc.method+tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusInternalServerError {
+				t.Errorf("%s %s answered %d while the change could not be persisted, want 500",
+					tc.method, tc.path, rec.Code)
+			}
+		})
 	}
 }

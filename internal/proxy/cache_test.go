@@ -547,3 +547,90 @@ func TestAgeSurvivesResponseHeaderRules(t *testing.T) {
 		t.Error("a rule overwrote Age; downstream caches would treat the entry as new")
 	}
 }
+
+// PROXY-79. A HEAD is stored with no body, by definition. Recomputing
+// Content-Length from that body — right and necessary for a GET, where the
+// stored body is what will be written — reported 0 for every HEAD hit while the
+// miss before it reported the real size. Nothing errors on that; the client
+// simply believes the resource is empty, which is most of what HEAD is for.
+func TestHeadHitReportsTheEntitysLength(t *testing.T) {
+	const body = "SECRET-FROM-ORIGIN"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=300")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		io.WriteString(w, body)
+	}))
+	defer origin.Close()
+
+	h := cachingProxy(t, cache.New(1<<20, 1<<16))
+	head := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodHead, origin.URL+"/a", nil)
+		req.RemoteAddr = "10.1.2.3:5000"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	miss := head()
+	if got := miss.Header().Get("X-Cache"); got != "MISS" {
+		t.Fatalf("first HEAD X-Cache = %q, want MISS", got)
+	}
+	hit := head()
+	if got := hit.Header().Get("X-Cache"); got != "HIT" {
+		t.Fatalf("second HEAD X-Cache = %q, want HIT", got)
+	}
+	if got, want := hit.Header().Get("Content-Length"), miss.Header().Get("Content-Length"); got != want {
+		t.Errorf("HEAD hit Content-Length = %q, miss = %q — RFC 9110 §9.3.2 wants what a GET would report", got, want)
+	}
+	if hit.Body.Len() != 0 {
+		t.Errorf("HEAD hit wrote %d body bytes", hit.Body.Len())
+	}
+}
+
+// The other half of the same rule: GET and HEAD entries are distinct and must
+// not answer each other. A HEAD entry has no body to give a GET, and a GET
+// entry's body must not be sent in reply to a HEAD.
+func TestHeadAndGetDoNotShareAnEntry(t *testing.T) {
+	const body = "SECRET-FROM-ORIGIN"
+	var heads, gets atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=300")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		if r.Method == http.MethodHead {
+			heads.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		gets.Add(1)
+		io.WriteString(w, body)
+	}))
+	defer origin.Close()
+
+	h := cachingProxy(t, cache.New(1<<20, 1<<16))
+	do := func(method string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, origin.URL+"/a", nil)
+		req.RemoteAddr = "10.1.2.3:5000"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	do(http.MethodHead)
+	// A GET after a HEAD must reach the origin: the HEAD entry has no body.
+	get := do(http.MethodGet)
+	if get.Body.String() != body {
+		t.Errorf("GET after HEAD returned %q, want %q", get.Body.String(), body)
+	}
+	if gets.Load() != 1 {
+		t.Errorf("the origin saw %d GETs, want 1 — a HEAD entry answered a GET", gets.Load())
+	}
+	// And the GET entry must not answer a HEAD with a body.
+	hd := do(http.MethodHead)
+	if hd.Body.Len() != 0 {
+		t.Errorf("HEAD returned %d body bytes from the GET entry", hd.Body.Len())
+	}
+}

@@ -168,6 +168,35 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// persist writes the configuration through to the store, and reports whether
+// the caller may answer success.
+//
+// Save returns an error and every call site here used to discard it, so a
+// change that could not be written answered 204 and logged nothing at all. Two
+// things went with it. The setting is live in memory but gone at the next
+// restart — at a moment nobody chose, which is the failure this codebase names
+// elsewhere. And the audit entry is written inside the same transaction, put
+// there by PROXY-56 so that coverage would be "a property of the code rather
+// than of everyone's diligence"; discarding the error moved the diligence from
+// remembering to audit to remembering to check whether the audit happened.
+//
+// A helper rather than an error check at each site, because fourteen sites each
+// responsible for remembering is the arrangement that failed.
+func (h *handler) persist(w http.ResponseWriter, r *http.Request) bool {
+	if h.store == nil {
+		return true
+	}
+	if err := h.store.Save(h.cfg, h.actor(r)); err != nil {
+		if h.logger != nil {
+			h.logger.Errorf("Could not persist the configuration change: %v", err)
+		}
+		http.Error(w, "the change is in effect but could not be saved; it will be lost on restart",
+			http.StatusInternalServerError)
+		return false
+	}
+	return true
+}
+
 func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -190,8 +219,8 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 				h.logger.Info("Set header", log.String("name", req.Name),
 					log.String("value", config.RedactHeaderValue(req.Name, req.Value)))
 			}
-			if h.store != nil {
-				h.store.Save(h.cfg, h.actor(r))
+			if !h.persist(w, r) {
+				return
 			}
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -209,8 +238,8 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request) {
 			if h.logger != nil {
 				h.logger.Info("Deleted header", log.String("name", req.Name))
 			}
-			if h.store != nil {
-				h.store.Save(h.cfg, h.actor(r))
+			if !h.persist(w, r) {
+				return
 			}
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -239,8 +268,8 @@ func (h *handler) logLevel(w http.ResponseWriter, r *http.Request) {
 			h.logger.SetLevel(lvl)
 			h.logger.Info("Set log level", log.String("level", req.Level))
 		}
-		if h.store != nil {
-			h.store.Save(h.cfg, h.actor(r))
+		if !h.persist(w, r) {
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -266,8 +295,8 @@ func (h *handler) auth(w http.ResponseWriter, r *http.Request) {
 		if h.logger != nil {
 			h.logger.Info("updated auth settings")
 		}
-		if h.store != nil {
-			h.store.Save(h.cfg, h.actor(r))
+		if !h.persist(w, r) {
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -289,8 +318,8 @@ func (h *handler) identity(w http.ResponseWriter, r *http.Request) {
 		if h.logger != nil {
 			h.logger.Info("updated identity")
 		}
-		if h.store != nil {
-			h.store.Save(h.cfg, h.actor(r))
+		if !h.persist(w, r) {
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -353,8 +382,8 @@ func (h *handler) policy(w http.ResponseWriter, r *http.Request) {
 		if h.logger != nil {
 			h.logger.Info("Updated policy")
 		}
-		if h.store != nil {
-			h.store.Save(h.cfg, h.actor(r))
+		if !h.persist(w, r) {
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -442,8 +471,8 @@ func (h *handler) statsHandler(w http.ResponseWriter, r *http.Request) {
 		if h.logger != nil {
 			h.logger.Info("Set stats enabled", log.Bool("enabled", *req.Enabled))
 		}
-		if h.store != nil {
-			h.store.Save(h.cfg, h.actor(r))
+		if !h.persist(w, r) {
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:

@@ -464,6 +464,40 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 	transport, upgradeTransport, h2Transport := pol.buildTransport(dialer)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// One destination check, above the dispatch, for every route out of
+		// this proxy.
+		//
+		// There are three — ordinary requests, CONNECT, and protocol upgrades —
+		// and each used to arrange its own. Ordinary requests and CONNECT
+		// checked here only when a parent was configured, on the reasoning that
+		// the dialer covers everything else; upgrades checked nowhere at all,
+		// and their transport inherits the parent hook, so the dialer evaluated
+		// the rules against the *parent's* hostname and let everything through.
+		// PROXY-71 then found a fourth way past: a fresh cache hit answers
+		// before any dial happens, so no dialer check runs either.
+		//
+		// Three paths each responsible for remembering is how the third one got
+		// missed and stayed missed. One call, before the dispatch that chooses
+		// between them, is the only arrangement where a fourth path added later
+		// is covered by default rather than by whoever writes it.
+		//
+		// Hostname-level only, as it must be — there is no address yet. The
+		// dialer still runs the resolved-address checks that close DNS
+		// rebinding, on every request that goes on to make one.
+		target := r.Host
+		if r.Method != http.MethodConnect && r.URL != nil && r.URL.Host != "" {
+			target = r.URL.Host
+		}
+		if err := pol.checkDestination(clientIP(r.RemoteAddr), target); err != nil {
+			logger.Warn("Refused destination",
+				log.String("host", target), log.String("client", clientIP(r.RemoteAddr)),
+				log.String("request_id", reqid.FromContext(r.Context())))
+			obs.denied(deniedScope(err))
+			obs.traceRefusal(r, http.StatusForbidden, err)
+			http.Error(w, "Destination not permitted", http.StatusForbidden)
+			return
+		}
+
 		if r.Method == http.MethodConnect {
 			logger.Debugf("CONNECT request %s", r.Host)
 			if err := pol.connectAllowed(r.Host); err != nil {
@@ -487,29 +521,6 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 		// an ordinary response — quietly, which is the worst part.
 		if proto := requestedUpgrade(r.Header); proto != "" {
 			handleUpgrade(w, r, upgradeTransport, headers, logger, proto, obs, pol)
-			return
-		}
-		// The destination is authorised before the cache is consulted, not after.
-		//
-		// This used to run only when a parent was configured, on the reasoning
-		// that the dialer covers everything else — and the dialer does, for
-		// anything that reaches a dial. A fresh cache hit reaches none: it
-		// answers and returns above every check there is. A destination the
-		// operator had denied kept being served, out of the cache, with the
-		// refusal counter untouched and X-Cache: HIT the only trace. Rules are
-		// read per request precisely so that an edit applies to the next
-		// request; for a cached URL it applied to no request at all.
-		//
-		// Hostname-level only, as it must be — there is no address yet. The
-		// dialer still runs the resolved-address checks that close DNS
-		// rebinding, on every request that goes on to make one.
-		if err := pol.checkDestination(clientIP(r.RemoteAddr), r.URL.Host); err != nil {
-			logger.Warn("Refused destination",
-				log.String("host", r.URL.Host), log.String("client", clientIP(r.RemoteAddr)),
-				log.String("request_id", reqid.FromContext(r.Context())))
-			obs.denied(deniedScope(err))
-			obs.traceRefusal(r, http.StatusForbidden, err)
-			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return
 		}
 
@@ -779,17 +790,10 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 
 	dial := pol.dialContext(dialer)
 	if pol.chained(r.Host) {
-		// The policy is checked here rather than in the dialer, because the
-		// dialer is about to connect to the parent and would evaluate the rules
-		// against the parent's address rather than the destination's.
-		if err := pol.checkDestination(clientIP(r.RemoteAddr), r.Host); err != nil {
-			logger.Warn("Refused CONNECT destination",
-				log.String("host", r.Host), log.String("client", clientIP(r.RemoteAddr)),
-				log.String("request_id", reqid.FromContext(r.Context())))
-			obs.denied(deniedScope(err))
-			http.Error(w, "Destination not permitted", http.StatusForbidden)
-			return
-		}
+		// The destination has already been checked against the hostname, above
+		// the dispatch in NewForward — which is where it has to happen for a
+		// chained request, since the dialer below is about to connect to the
+		// parent and would evaluate the rules against the parent's address.
 		dial = pol.dialThroughParent(dialer, logger)
 	}
 
@@ -848,10 +852,24 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 // that silently carries the parent's error page instead of the origin.
 func (p Policy) dialThroughParent(d *net.Dialer, logger *log.Logger) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		parent := p.parent().Addr()
-		conn, err := d.DialContext(ctx, network, parent)
+		// Resolved once, and everything below uses this value.
+		//
+		// Upstream is a function so a reload is picked up per request, which
+		// means reading it four times in one dial can see four different
+		// parents. The mild version is handshaking against one parent's
+		// certificate and authenticating with another's credentials. The sharp
+		// version is that clearing the parent stores a Proxy with a nil URL, so
+		// a read between the Secure check and the TLS config dereferenced nil
+		// and panicked. checkDestination resolves its rule set once for exactly
+		// this reason, and says so; this did not follow it.
+		parent := p.parent()
+		if !parent.Configured() {
+			return nil, fmt.Errorf("the upstream proxy was removed while dialling %s", addr)
+		}
+		parentAddr := parent.Addr()
+		conn, err := d.DialContext(ctx, network, parentAddr)
 		if err != nil {
-			return nil, fmt.Errorf("dialling the upstream proxy %s: %w", parent, err)
+			return nil, fmt.Errorf("dialling the upstream proxy %s: %w", parentAddr, err)
 		}
 
 		// An https:// parent is reached over TLS, here as on the ordinary path.
@@ -862,11 +880,11 @@ func (p Policy) dialThroughParent(d *net.Dialer, logger *log.Logger) func(contex
 		// credentials in base64 for anyone on the path. The tunnel then failed,
 		// so what an operator saw was a broken parent rather than a disclosure
 		// that had already happened.
-		if p.parent().Secure() {
-			tlsConn := tls.Client(conn, p.parentTLSConfig())
+		if parent.Secure() {
+			tlsConn := tls.Client(conn, p.parentTLSConfig(parent))
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				conn.Close()
-				return nil, fmt.Errorf("TLS handshake with the upstream proxy %s: %w", parent, err)
+				return nil, fmt.Errorf("TLS handshake with the upstream proxy %s: %w", parentAddr, err)
 			}
 			conn = tlsConn
 		}
@@ -877,7 +895,7 @@ func (p Policy) dialThroughParent(d *net.Dialer, logger *log.Logger) func(contex
 			Host:   addr,
 			Header: make(http.Header),
 		}
-		if auth := p.parent().AuthHeader(); auth != "" {
+		if auth := parent.AuthHeader(); auth != "" {
 			req.Header.Set("Proxy-Authorization", auth)
 		}
 		if err := req.Write(conn); err != nil {
@@ -919,12 +937,17 @@ func (p Policy) dialThroughParent(d *net.Dialer, logger *log.Logger) func(contex
 // outbound connection would be a surprise. ServerName comes from the parent's
 // own URL, never from the destination being tunnelled: it is the parent's
 // certificate being verified here.
-func (p Policy) parentTLSConfig() *tls.Config {
+//
+// The parent is a parameter rather than something read here, so it is the same
+// one the caller decided to dial. See dialThroughParent.
+func (p Policy) parentTLSConfig(parent *upstream.Proxy) *tls.Config {
 	cfg := &tls.Config{}
 	if p.UpstreamTLS != nil {
 		cfg = p.UpstreamTLS.Clone()
 	}
-	cfg.ServerName = p.parent().URL.Hostname()
+	if parent.Configured() {
+		cfg.ServerName = parent.URL.Hostname()
+	}
 	// The parent is spoken to in HTTP/1.1 — this connection carries a CONNECT
 	// written by hand — so it must not come back having agreed on h2.
 	cfg.NextProtos = []string{"http/1.1"}

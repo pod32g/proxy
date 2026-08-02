@@ -59,6 +59,32 @@ func (h *handler) actor(r *http.Request) config.Actor {
 	}
 }
 
+// persist writes the configuration through to the store, and reports whether
+// the caller may redirect as though the change stuck.
+//
+// Save returns an error and every call site here used to discard it, so a
+// change that could not be written redirected to a page showing the new value
+// while nothing had been saved and nothing logged. The setting reverts at the
+// next restart, and the audit entry — written inside the same transaction on
+// purpose — is never made either.
+//
+// A helper rather than an error check at each site: seven sites here and seven
+// in the API each responsible for remembering is the arrangement that failed.
+func (h *handler) persist(w http.ResponseWriter, r *http.Request) bool {
+	if h.store == nil {
+		return true
+	}
+	if err := h.store.Save(h.cfg, h.actor(r)); err != nil {
+		if h.logger != nil {
+			h.logger.Errorf("Could not persist the configuration change: %v", err)
+		}
+		http.Error(w, "the change is in effect but could not be saved; it will be lost on restart",
+			http.StatusInternalServerError)
+		return false
+	}
+	return true
+}
+
 type pageData struct {
 	Headers       map[string]string
 	ClientHeaders map[string]map[string]string
@@ -538,8 +564,8 @@ func (h *handler) setPolicy(w http.ResponseWriter, r *http.Request) {
 	if h.logger != nil {
 		h.logger.Info("Updated policy")
 	}
-	if h.store != nil {
-		h.store.Save(h.cfg, h.actor(r))
+	if !h.persist(w, r) {
+		return
 	}
 	http.Redirect(w, r, "/ui/policy", http.StatusSeeOther)
 }
@@ -588,8 +614,8 @@ func (h *handler) addHeader(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("Set header", log.String("name", name),
 				log.String("value", config.RedactHeaderValue(name, value)))
 		}
-		if h.store != nil {
-			h.store.Save(h.cfg, h.actor(r))
+		if !h.persist(w, r) {
+			return
 		}
 	}
 	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
@@ -614,8 +640,8 @@ func (h *handler) deleteHeader(w http.ResponseWriter, r *http.Request) {
 		if h.logger != nil {
 			h.logger.Info("Deleted header", log.String("name", name))
 		}
-		if h.store != nil {
-			h.store.Save(h.cfg, h.actor(r))
+		if !h.persist(w, r) {
+			return
 		}
 	}
 	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
@@ -640,8 +666,8 @@ func (h *handler) setLogLevel(w http.ResponseWriter, r *http.Request) {
 		h.logger.SetLevel(level)
 		h.logger.Info("Set log level", log.String("level", levelStr))
 	}
-	if h.store != nil {
-		h.store.Save(h.cfg, h.actor(r))
+	if !h.persist(w, r) {
+		return
 	}
 	http.Redirect(w, r, "/ui/general", http.StatusSeeOther)
 }
@@ -660,8 +686,8 @@ func (h *handler) setIdentity(w http.ResponseWriter, r *http.Request) {
 	if h.logger != nil {
 		h.logger.Info("Updated identity", log.String("name", name), log.String("id", id))
 	}
-	if h.store != nil {
-		h.store.Save(h.cfg, h.actor(r))
+	if !h.persist(w, r) {
+		return
 	}
 	http.Redirect(w, r, "/ui/identity", http.StatusSeeOther)
 }
@@ -688,8 +714,8 @@ func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
 	if h.logger != nil {
 		h.logger.Info("Updated auth settings", log.Bool("enabled", enabled), log.String("user", user))
 	}
-	if h.store != nil {
-		h.store.Save(h.cfg, h.actor(r))
+	if !h.persist(w, r) {
+		return
 	}
 	http.Redirect(w, r, "/ui/auth", http.StatusSeeOther)
 }
@@ -704,8 +730,8 @@ func (h *handler) setStats(w http.ResponseWriter, r *http.Request) {
 	}
 	enabled := r.FormValue("enabled") == "on"
 	h.cfg.SetStatsEnabled(enabled)
-	if h.store != nil {
-		h.store.Save(h.cfg, h.actor(r))
+	if !h.persist(w, r) {
+		return
 	}
 	http.Redirect(w, r, "/ui/analytics", http.StatusSeeOther)
 }

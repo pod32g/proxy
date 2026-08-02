@@ -68,7 +68,15 @@ func writeEntry(w http.ResponseWriter, e *cache.Entry, status string, rewrite fu
 	// would be misreporting the age of the content to everyone downstream, and
 	// a downstream cache would extend the lifetime on the strength of it.
 	w.Header().Set("Age", strconv.FormatInt(int64(e.Age(time.Now()).Seconds()), 10))
-	w.Header().Set("Content-Length", strconv.Itoa(len(e.Body)))
+	// The stored body is authoritative for a GET — it is what will be written,
+	// and a 304's Content-Length is deliberately not copied over it. For a HEAD
+	// there is no stored body to be authoritative about, and the origin's own
+	// Content-Length describes the entity a GET would have returned, which is
+	// exactly what RFC 9110 §9.3.2 says a HEAD must report. Recomputing it there
+	// turned every HEAD hit into "Content-Length: 0".
+	if !e.Bodyless() {
+		w.Header().Set("Content-Length", strconv.Itoa(len(e.Body)))
+	}
 	w.WriteHeader(e.Status)
 	_, _ = w.Write(e.Body)
 }
