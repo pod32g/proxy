@@ -85,3 +85,71 @@ func TestMetricsDefaultsToOK(t *testing.T) {
 		t.Errorf("got %v, want 1", got)
 	}
 }
+
+// PROXY-85. Every wrapper between a handler and the layer that consumes a
+// signal has to forward it, and statusRecorder forwarded SkipAccounting
+// without Skipped. It worked only because MetricsMiddleware read the flag off
+// the writer it was *given* rather than the one it created — so accounting
+// happening to wrap metrics was load-bearing. Flip the order and every liveness
+// probe lands in the request counter, silently and forever.
+func TestSkipAccountingSurvivesEitherNestingOrder(t *testing.T) {
+	skip := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s, ok := w.(interface{ SkipAccounting() }); ok {
+			s.SkipAccounting()
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	for _, tc := range []struct {
+		name  string
+		build func(*Metrics, *int) http.Handler
+	}{
+		{"accounting outside metrics", func(m *Metrics, logged *int) http.Handler {
+			return AccountingMiddleware(MetricsMiddleware(skip, m), Accounting{
+				Completed: func(Exchange) { *logged++ },
+			})
+		}},
+		{"metrics outside accounting", func(m *Metrics, logged *int) http.Handler {
+			return MetricsMiddleware(AccountingMiddleware(skip, Accounting{
+				Completed: func(Exchange) { *logged++ },
+			}), m)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			m, err := NewMetrics(reg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logged := 0
+			req := httptest.NewRequest("GET", "/healthz", nil)
+			req.RemoteAddr = "10.1.2.3:5000"
+			tc.build(m, &logged).ServeHTTP(httptest.NewRecorder(), req)
+
+			if logged != 0 {
+				t.Errorf("a skipped exchange reached the access log %d times", logged)
+			}
+			if n := countRequests(t, reg); n != 0 {
+				t.Errorf("a skipped exchange was counted %v times in proxy_http_requests_total", n)
+			}
+		})
+	}
+}
+
+func countRequests(t *testing.T, reg *prometheus.Registry) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total float64
+	for _, f := range families {
+		if f.GetName() != "proxy_http_requests_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			total += m.GetCounter().GetValue()
+		}
+	}
+	return total
+}

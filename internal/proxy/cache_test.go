@@ -459,7 +459,7 @@ func TestACacheHitIsStillSubjectToTheDestinationPolicy(t *testing.T) {
 			Cache: cache.New(1<<20, 1<<16).Scope("test"),
 			Rules: rules.get,
 		},
-		Observer{Denied: func(string) { refusals.Add(1) }})
+		Observer{Denied: func(DeniedScope) { refusals.Add(1) }})
 
 	if got := fetch(t, h, origin.URL+"/a"); got.Code != http.StatusOK {
 		t.Fatalf("the priming fetch got %d", got.Code)

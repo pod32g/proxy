@@ -792,3 +792,147 @@ func TestDialThroughParentAfterTheParentIsCleared(t *testing.T) {
 		t.Errorf("error = %v, want it to say the parent was removed", err)
 	}
 }
+
+// PROXY-81. Reverse mode used to be built from four loose parameters instead of
+// the Policy, so a parent proxy, the HTTP/2 mode and the cache were all
+// silently inert here while the startup log announced each as enabled.
+func TestReverseModeGoesThroughTheParent(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "BACKEND-DIRECT")
+	}))
+	defer backend.Close()
+
+	const user, pass = "pu", "ps"
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+	parent := newParentProxy(t, want)
+	up, err := upstream.Parse("http://"+user+":"+pass+"@"+parent.addr(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target, _ := url.Parse(backend.URL)
+	rp := New(target, newLogger(), func(string) map[string]string { return nil },
+		Policy{Upstream: func() *upstream.Proxy { return up }})
+	srv := httptest.NewServer(rp)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/somepath")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	io.ReadAll(resp.Body)
+
+	_, requests, auth := parent.seen()
+	if len(requests) != 1 {
+		t.Fatalf("the parent saw %d requests, want 1 — reverse mode went direct", len(requests))
+	}
+	// The request-line must name the *backend*. ReverseProxy preserves the
+	// client's Host, and net/http builds a proxied request-line from Host
+	// rather than URL.Host — so without the correction the parent is asked to
+	// fetch from this proxy's own address, which is a loop.
+	if !strings.Contains(requests[0], target.Host) {
+		t.Errorf("the parent was asked for %q, want the backend at %s", requests[0], target.Host)
+	}
+	if len(auth) == 0 || auth[len(auth)-1] != want {
+		t.Errorf("the parent saw auth %v, want %q", auth, want)
+	}
+}
+
+// The bypass list still applies, so a backend named in -no-proxy is reached
+// directly. Without this the fix above would make the parent mandatory.
+func TestReverseModeHonoursTheBypassList(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "BACKEND-DIRECT")
+	}))
+	defer backend.Close()
+
+	parent := newParentProxy(t, "")
+	target, _ := url.Parse(backend.URL)
+	host, _, _ := net.SplitHostPort(target.Host)
+	up, err := upstream.Parse(parent.url(), host)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rp := New(target, newLogger(), func(string) map[string]string { return nil },
+		Policy{Upstream: func() *upstream.Proxy { return up }})
+	srv := httptest.NewServer(rp)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "BACKEND-DIRECT" {
+		t.Errorf("body = %q, want BACKEND-DIRECT", body)
+	}
+	if _, requests, _ := parent.seen(); len(requests) != 0 {
+		t.Errorf("a bypassed backend went through the parent: %v", requests)
+	}
+}
+
+// And the h2c half.
+func TestReverseModeHonoursH2C(t *testing.T) {
+	backend := httptest.NewServer(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, r.Proto)
+	}), &http2.Server{}))
+	defer backend.Close()
+
+	target, _ := url.Parse(backend.URL)
+	for _, tc := range []struct {
+		mode UpstreamHTTP2
+		want string
+	}{
+		{HTTP2Cleartext, "HTTP/2.0"},
+		{HTTP2Auto, "HTTP/1.1"},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			rp := New(target, newLogger(), func(string) map[string]string { return nil },
+				Policy{HTTP2: tc.mode})
+			srv := httptest.NewServer(rp)
+			defer srv.Close()
+
+			resp, err := http.Get(srv.URL + "/x")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if string(body) != tc.want {
+				t.Errorf("backend saw %q, want %q", body, tc.want)
+			}
+		})
+	}
+}
+
+// The destination policy is deliberately not enforced in reverse mode: the
+// target is the operator's, not a client's. Enforcing the private-address
+// default against it would refuse the default configuration.
+func TestReverseModeReachesAPrivateTarget(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "BACKEND")
+	}))
+	defer backend.Close()
+
+	target, _ := url.Parse(backend.URL)
+	rp := New(target, newLogger(), func(string) map[string]string { return nil },
+		Policy{AllowPrivate: false, Rules: func(string) *policy.RuleSet {
+			set, _ := policy.Parse("deny all")
+			return set
+		}})
+	srv := httptest.NewServer(rp)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "BACKEND" {
+		t.Errorf("body = %q, want BACKEND — the operator's own target was refused", body)
+	}
+}

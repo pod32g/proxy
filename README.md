@@ -58,7 +58,7 @@ go build -o proxy
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
 - `-admin-cert` / `-admin-key` – TLS material for the admin listener. `PROXY_ADMIN_CERT_FILE`, `PROXY_ADMIN_KEY_FILE`.
-- `-cache` – Enable the shared response cache with this much memory, e.g. `256MB`. **Off by default.** `PROXY_CACHE`.
+- `-cache` – Enable the shared response cache with this much memory, e.g. `256MB`. **Off by default; forward mode only** — reverse mode refuses to start with it rather than ignoring it. `PROXY_CACHE`.
 - `-cache-max-entry` – Largest single response to hold. Defaults to a tenth of `-cache`. `PROXY_CACHE_MAX_ENTRY`.
 - `-upstream-http2` – How to speak HTTP/2 to origins: `auto`, `off` or `h2c`. `PROXY_UPSTREAM_HTTP2`.
 - `-upstream-proxy` – Parent proxy all outbound traffic passes through. `PROXY_UPSTREAM_PROXY`.
@@ -647,6 +647,20 @@ dials the parent and issues a **nested `CONNECT`** for the real destination. The
 parent's response is read and checked — a non-200 is a `502`, not a tunnel that
 silently carries the parent's error page instead of the origin.
 
+**Both proxy modes honour it.** Reverse mode used to ignore `-upstream-proxy`,
+`-upstream-http2` and `-cache` entirely while logging each as enabled, because
+it was built from loose parameters rather than from the same policy value the
+forward path uses. It now takes that value, so a setting added to one mode
+cannot miss the other.
+
+Two things follow for reverse mode specifically. The backend goes through the
+parent unless it is named in `-no-proxy`, which is usually what you want for
+`-target` on another host and usually not for one on `localhost`. And the
+request the parent receives names the target, not this proxy — a reverse proxy
+preserves the client's `Host` header, and Go builds a proxied request-line from
+`Host` rather than from the URL, so preserving it would ask the parent to fetch
+from us and loop.
+
 An `https://` parent is reached over TLS on both paths, verified against the
 same `-upstream-ca` / system trust the rest of the outbound traffic uses. That
 is the configuration that keeps the credentials below off the wire, so it works
@@ -755,6 +769,12 @@ responses carry an `Age` header of their own (RFC 9111 §5.1), because a
 downstream cache given no `Age` restarts the clock from zero and extends the
 lifetime again, and the error compounds at every hop.
 
+### Forward mode only
+
+The cache lives in the forward handler. Reverse mode **refuses to start** with
+`-cache` rather than accepting it and doing nothing, which is what it used to
+do — complete with a `Response cache enabled` line in the log.
+
 ### The cache does not bypass the destination policy
 
 A cache hit is subject to the destination rules exactly as a fetch is. The rules
@@ -823,7 +843,7 @@ cannot decode it and an English page does not reach one that asked for Japanese.
 |---|---|
 | `auto` (default) | Negotiate over TLS via ALPN; HTTP/1.1 in cleartext. What the default transport already did, now explicit and measurable. |
 | `off` | HTTP/1.1 everywhere, for an origin whose HTTP/2 is broken or a middlebox that mangles it. |
-| `h2c` | HTTP/2 without TLS. Usually the point of putting a reverse proxy in front of a modern backend. |
+| `h2c` | HTTP/2 without TLS. Usually the point of putting a reverse proxy in front of a modern backend — and it works in reverse mode, which it did not until PROXY-81. |
 
 `h2c` has no negotiation — the client simply speaks HTTP/2 on a plain connection
 because it was told the server does — which is why it is an explicit setting

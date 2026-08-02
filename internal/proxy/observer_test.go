@@ -36,10 +36,10 @@ func (r *recorder) observer() Observer {
 			r.upstream = append(r.upstream, d)
 			r.methods = append(r.methods, method)
 		},
-		Denied: func(scope string) {
+		Denied: func(scope DeniedScope) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			r.denials = append(r.denials, scope)
+			r.denials = append(r.denials, string(scope))
 		},
 		TunnelOpened: func() {
 			r.mu.Lock()
@@ -109,28 +109,28 @@ func TestObserverAttributesRefusals(t *testing.T) {
 		pol    Policy
 		method string
 		target string
-		want   string
+		want   DeniedScope
 	}{
 		{
 			name:   "destination rule",
 			pol:    Policy{AllowPrivate: true, Rules: rules(t, "deny all")},
 			method: http.MethodGet,
 			target: "http://example.com/",
-			want:   scopeDestination,
+			want:   ScopeDestination,
 		},
 		{
 			name:   "private address default",
 			pol:    Policy{},
 			method: http.MethodGet,
 			target: "http://127.0.0.1:9/",
-			want:   scopePrivateAddr,
+			want:   ScopePrivateAddr,
 		},
 		{
 			name:   "connect port",
 			pol:    Policy{AllowPrivate: true},
 			method: http.MethodConnect,
 			target: "example.com:25",
-			want:   scopeConnectPort,
+			want:   ScopeConnectPort,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -148,7 +148,7 @@ func TestObserverAttributesRefusals(t *testing.T) {
 			if len(denials) != 1 {
 				t.Fatalf("got %d denials, want 1: %v", len(denials), denials)
 			}
-			if denials[0] != tc.want {
+			if denials[0] != string(tc.want) {
 				t.Errorf("scope = %q, want %q", denials[0], tc.want)
 			}
 		})
@@ -645,5 +645,24 @@ func TestHeaderRulesCannotLeakProxyCredentials(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("origin never received the request")
+	}
+}
+
+// PROXY-82. The scope label is a closed set, and the type now enforces that at
+// every call site. DeniedScopes is the other half — the list anything reporting
+// on these reads — and a constant added without extending it would leave a
+// series the documented set does not mention.
+func TestEveryRefusalScopeIsListed(t *testing.T) {
+	listed := map[DeniedScope]bool{}
+	for _, s := range DeniedScopes {
+		listed[s] = true
+	}
+	for _, s := range []DeniedScope{ScopeDestination, ScopeConnectPort, ScopePrivateAddr} {
+		if !listed[s] {
+			t.Errorf("%q is a refusal scope but is missing from DeniedScopes", s)
+		}
+	}
+	if len(DeniedScopes) != len(listed) {
+		t.Errorf("DeniedScopes has %d entries but %d distinct values", len(DeniedScopes), len(listed))
 	}
 }

@@ -453,8 +453,11 @@ func (h *handler) policyTest(w http.ResponseWriter, r *http.Request) {
 func (h *handler) statsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		data := map[string]interface{}{"enabled": h.cfg.StatsEnabledState()}
-		if h.stats != nil && h.cfg.StatsEnabledState() {
+		// Read once: a toggle between two reads would answer enabled:false with
+		// a populated top list, or the reverse.
+		enabled := h.cfg.StatsEnabledState()
+		data := map[string]interface{}{"enabled": enabled}
+		if h.stats != nil && enabled {
 			data["top"] = h.stats.Top(10)
 		}
 		writeJSON(w, data)

@@ -538,6 +538,15 @@ func main() {
 	// arrive by default.
 	var responseCache *cache.Cache
 	if *cacheSize != "" {
+		// Refused rather than ignored. The cache lives in the forward handler;
+		// reverse mode has no lookup, no store and no X-Cache header, and used
+		// to log "Response cache enabled" and then send every request to the
+		// backend. A flag that does nothing while announcing that it does is
+		// worse than one that is unsupported, and this codebase refuses to
+		// start over half-configured TLS for the same reason.
+		if cfg.Mode == "reverse" {
+			fatalf("-cache is not supported in reverse mode: the response cache is part of the forward proxy")
+		}
 		total, err := parseBytes(*cacheSize)
 		if err != nil {
 			fatalf("-cache: %v", err)
@@ -623,6 +632,9 @@ func main() {
 
 		var handler http.Handler
 		forwardMode := mode == "forward"
+		if !forwardMode && responseCache != nil {
+			return nil, nil, fmt.Errorf("listener %q is in reverse mode, which does not support -cache", name)
+		}
 		var reverseTarget *url.URL
 		if forwardMode {
 			handler = proxy.NewForward(logger, cfg.GetHeadersForClient, listenerPol, proxy.Observer{
@@ -631,7 +643,7 @@ func main() {
 				},
 				TunnelOpened: func() { metrics.ActiveTunnels.Inc() },
 				TunnelClosed: func() { metrics.ActiveTunnels.Dec() },
-				Denied:       func(s string) { metrics.PolicyDecisions.WithLabelValues(s).Inc() },
+				Denied:       func(s proxy.DeniedScope) { metrics.PolicyDecisions.WithLabelValues(string(s)).Inc() },
 				Protocol:     func(p string) { metrics.UpstreamProtocol.WithLabelValues(p).Inc() },
 				// nil when tracing is off, which is what makes it free.
 				Trace: tracer.Hook(),
@@ -642,7 +654,7 @@ func main() {
 				return nil, nil, fmt.Errorf("listener %q: invalid target %q: %v", name, targetURL, err)
 			}
 			reverseTarget = u
-			handler = proxy.New(u, logger, cfg.GetHeadersForClient, cfg.HeaderRules, upstreamTLS)
+			handler = proxy.New(u, logger, cfg.GetHeadersForClient, listenerPol)
 		}
 		inner := handler
 		// Accounting wraps outermost so it sees the connection before anything else

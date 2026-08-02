@@ -102,7 +102,7 @@ type hostKey struct{}
 // refusal can be attributed without parsing the message.
 type errDenied struct {
 	reason string
-	scope  string
+	scope  DeniedScope
 }
 
 func (e *errDenied) Error() string { return e.reason }
@@ -114,7 +114,7 @@ func denied(err error) bool {
 
 // deniedScope reports which check refused, or "" when the error is not a
 // refusal.
-func deniedScope(err error) string {
+func deniedScope(err error) DeniedScope {
 	var d *errDenied
 	if errors.As(err, &d) {
 		return d.scope
@@ -134,7 +134,7 @@ type Observer struct {
 	TunnelOpened func()
 	TunnelClosed func()
 	// Denied records a refusal and which check made it.
-	Denied func(scope string)
+	Denied func(scope DeniedScope)
 	// Protocol records what was actually negotiated with the origin. Before
 	// this the answer was simply unavailable: resp.Proto was discarded.
 	Protocol func(proto string)
@@ -196,7 +196,7 @@ func (o Observer) protocol(proto string) {
 	}
 }
 
-func (o Observer) denied(scope string) {
+func (o Observer) denied(scope DeniedScope) {
 	if o.Denied != nil && scope != "" {
 		o.Denied(scope)
 	}
@@ -214,13 +214,30 @@ func (o Observer) tunnelClosed() {
 	}
 }
 
-// Refusal scopes. A closed set, so anything counting them has bounded
-// cardinality by construction rather than by whatever gets passed in.
+// DeniedScope says which check refused a request.
+//
+// A named type, not a string, and exported so the metric that counts these can
+// name the same set the proxy produces. It used to be a private set here and an
+// exported copy in the metrics package that nothing referenced — two closed
+// sets, each with a comment claiming the cardinality was "a property of the
+// code", and the one the labels actually came from was the one nobody could
+// see. A fourth scope added here would have produced a series the package
+// documenting the set had never heard of.
+//
+// The type is what makes it a closed set: Observer.Denied takes a DeniedScope,
+// so a value from outside this list is a compile error rather than a new
+// timeseries.
+type DeniedScope string
+
 const (
-	scopeDestination = "destination"
-	scopeConnectPort = "connect-port"
-	scopePrivateAddr = "private-address"
+	ScopeDestination DeniedScope = "destination"
+	ScopeConnectPort DeniedScope = "connect-port"
+	ScopePrivateAddr DeniedScope = "private-address"
 )
+
+// DeniedScopes is every value the scope label can take, for whatever reports
+// on them.
+var DeniedScopes = []DeniedScope{ScopeDestination, ScopeConnectPort, ScopePrivateAddr}
 
 // DefaultConnectPorts is the allowlist used when none is configured.
 var DefaultConnectPorts = []int{443}
@@ -295,7 +312,7 @@ func (p Policy) dialer() *net.Dialer {
 				if decision == policy.Deny {
 					return &errDenied{
 						reason: fmt.Sprintf("destination %s is not permitted by policy (%s)", requested, rule),
-						scope:  scopeDestination,
+						scope:  ScopeDestination,
 					}
 				}
 				// An explicit allow overrides the private-address default:
@@ -305,7 +322,7 @@ func (p Policy) dialer() *net.Dialer {
 			if p.blockedIP(ip) {
 				return &errDenied{
 					reason: fmt.Sprintf("destination %s is not permitted (use -allow-private to allow it)", ip),
-					scope:  scopePrivateAddr,
+					scope:  ScopePrivateAddr,
 				}
 			}
 			return nil
@@ -360,13 +377,13 @@ func (p Policy) checkDestination(client, hostport string) error {
 	if decision == policy.Deny {
 		return &errDenied{
 			reason: fmt.Sprintf("destination %s is not permitted by policy (%s)", host, rule),
-			scope:  scopeDestination,
+			scope:  ScopeDestination,
 		}
 	}
 	if decision == policy.Undecided && set != nil && set.Default == policy.Deny {
 		return &errDenied{
 			reason: fmt.Sprintf("destination %s is not permitted by policy (default deny)", host),
-			scope:  scopeDestination,
+			scope:  ScopeDestination,
 		}
 	}
 	return nil
@@ -384,7 +401,7 @@ func (p Policy) dialContext(d *net.Dialer) func(context.Context, string, string)
 		if decision, rule := p.ruleSet(client).Match(host, nil); decision == policy.Deny {
 			return nil, &errDenied{
 				reason: fmt.Sprintf("destination %s is not permitted by policy (%s)", host, rule),
-				scope:  scopeDestination,
+				scope:  ScopeDestination,
 			}
 		}
 		return d.DialContext(context.WithValue(ctx, hostKey{}, host), network, addr)
@@ -502,7 +519,7 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			logger.Debugf("CONNECT request %s", r.Host)
 			if err := pol.connectAllowed(r.Host); err != nil {
 				logger.Warnf("Refused CONNECT: %v", err)
-				obs.denied(scopeConnectPort)
+				obs.denied(ScopeConnectPort)
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}

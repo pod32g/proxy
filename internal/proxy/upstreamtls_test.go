@@ -142,7 +142,7 @@ func TestReverseProxyReachesAnMTLSBackend(t *testing.T) {
 	}
 
 	target, _ := url.Parse(backend.URL)
-	rp := New(target, newLogger(), func(string) map[string]string { return nil }, nil, tlsCfg)
+	rp := New(target, newLogger(), func(string) map[string]string { return nil }, Policy{UpstreamTLS: tlsCfg})
 	front := httptest.NewServer(rp)
 	defer front.Close()
 
@@ -179,7 +179,7 @@ func TestMTLSBackendIsUnreachableWithoutTheMaterial(t *testing.T) {
 				t.Fatalf("BuildTLSConfig: %v", err)
 			}
 			target, _ := url.Parse(backend.URL)
-			rp := New(target, newLogger(), func(string) map[string]string { return nil }, nil, tlsCfg)
+			rp := New(target, newLogger(), func(string) map[string]string { return nil }, Policy{UpstreamTLS: tlsCfg})
 			front := httptest.NewServer(rp)
 			defer front.Close()
 

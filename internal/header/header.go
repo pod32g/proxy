@@ -104,6 +104,18 @@ var forbidden = map[string]string{
 	"content-length":      "the transport owns this; rewriting it corrupts framing",
 }
 
+// Forbidden reports whether a rule may set a header, and why not.
+//
+// Exported so the relationship between this list and the hop-by-hop set the
+// proxy strips can be asserted rather than trusted. The two are separate lists
+// by necessity — this one also covers Content-Length, which is not hop-by-hop —
+// but every header the proxy strips must appear here, or a rule could put back
+// what the strip exists to remove. Nothing enforced that; a test does now.
+func Forbidden(name string) (why string, blocked bool) {
+	why, blocked = forbidden[strings.ToLower(name)]
+	return why, blocked
+}
+
 // ParseRule reads one rule.
 //
 //	set X-Internal: 1
@@ -199,7 +211,7 @@ func ParseRule(line string) (Rule, error) {
 	// take effect should fail where it is written, naming the header — not
 	// silently do nothing and leave somebody debugging why their configuration
 	// has no effect.
-	if why, blocked := forbidden[strings.ToLower(rule.Name)]; blocked {
+	if why, blocked := Forbidden(rule.Name); blocked {
 		return Rule{}, fmt.Errorf("rule %q: %s may not be set by a rule: %s", original, rule.Name, why)
 	}
 	return rule, nil
@@ -351,7 +363,7 @@ func FromMap(m map[string]string) *RuleSet {
 	sortStrings(names)
 	for _, name := range names {
 		canonical := http.CanonicalHeaderKey(name)
-		if _, blocked := forbidden[strings.ToLower(canonical)]; blocked {
+		if _, blocked := Forbidden(canonical); blocked {
 			// Silently dropped rather than rejected: this path converts
 			// configuration that already exists, and refusing to start because
 			// of a value somebody set long ago would be a worse outcome than

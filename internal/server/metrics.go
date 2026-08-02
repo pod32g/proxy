@@ -54,14 +54,11 @@ type Metrics struct {
 	PolicyDecisions *prometheus.CounterVec
 }
 
-// PolicyScopes are the values PolicyDecisions takes for its "scope" label. A
-// closed set, listed here so the cardinality is a property of the code rather
-// than of what happens to get passed in.
-const (
-	ScopeDestination = "destination"
-	ScopeConnectPort = "connect-port"
-	ScopePrivateAddr = "private-address"
-)
+// The values PolicyDecisions takes for its "scope" label are proxy.DeniedScope,
+// declared where the refusals are made. They were also declared here once, as a
+// second closed set that nothing referenced — so this package documented a
+// cardinality guarantee it had no part in enforcing. One declaration, in the
+// package that produces the values.
 
 // NewMetrics builds the collectors and registers them with reg. Taking a
 // registerer rather than reaching for the global default means a second
@@ -193,7 +190,14 @@ func MetricsMiddleware(next http.Handler, m *Metrics) http.Handler {
 		// Liveness probes and the admin surface are not proxy traffic, and
 		// counting them would put a constant floor under every request-rate
 		// graph and make "requests to the proxy" mean two different things.
-		if s, ok := w.(interface{ Skipped() bool }); ok && s.Skipped() {
+		//
+		// Read from rec, the writer this middleware created, like every other
+		// signal here. It used to read from w, which worked only because
+		// accounting happens to wrap metrics: with the nesting the other way w
+		// is the bare ResponseWriter, the assertion fails, and every probe
+		// lands in the counter. That is the failure SkipAccounting exists to
+		// prevent, reintroduced by the order two middlewares are composed in.
+		if rec.Skipped() {
 			return
 		}
 		dur := time.Since(start).Seconds()
@@ -212,7 +216,8 @@ func MetricsMiddleware(next http.Handler, m *Metrics) http.Handler {
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status  int
+	skipped bool
 }
 
 // SetStatus records a status the handler could not report through WriteHeader.
@@ -229,9 +234,24 @@ func (r *statusRecorder) SetProtocol(proto string) {
 
 // SkipAccounting passes the exclusion signal down to the accounting layer.
 func (r *statusRecorder) SkipAccounting() {
+	r.skipped = true
 	if s, ok := r.ResponseWriter.(interface{ SkipAccounting() }); ok {
 		s.SkipAccounting()
 	}
+}
+
+// Skipped reports whether this exchange was excluded, by this layer or by any
+// below it.
+//
+// Both halves are needed. A handler may call SkipAccounting on this writer, and
+// an outer layer may already have been told; forwarding the setter without the
+// getter left this wrapper unable to answer a question it had been asked.
+func (r *statusRecorder) Skipped() bool {
+	if r.skipped {
+		return true
+	}
+	s, ok := r.ResponseWriter.(interface{ Skipped() bool })
+	return ok && s.Skipped()
 }
 
 // SetServed passes the handler's "this reached a destination" signal down to
