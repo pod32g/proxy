@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pod32g/proxy/internal/pac"
 	log "github.com/pod32g/simple-logger"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -42,6 +43,11 @@ type Router struct {
 	// It is configurable because in reverse mode the proxy would otherwise
 	// shadow a backend that serves the same path.
 	HealthPath string
+
+	// PAC, when set, serves the proxy auto-configuration file. Answered before
+	// the auth gate by necessity: a browser fetches it before it has anywhere to
+	// send credentials. Nil disables the endpoint entirely.
+	PAC http.Handler
 
 	// MetricsPublic exempts the metrics endpoint from authentication, so a
 	// scraper that sends no credentials keeps working when auth is enabled.
@@ -100,6 +106,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
+		return
+	}
+
+	// The PAC file answers alongside the health check, before authentication,
+	// because a client fetching it has nothing to authenticate with yet. That is
+	// why the file's contents are the operator's decision: see internal/pac.
+	if direct && r.PAC != nil && req.URL.Path == pac.Path {
+		skipAccounting(w)
+		r.PAC.ServeHTTP(w, req)
 		return
 	}
 

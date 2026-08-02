@@ -18,6 +18,7 @@ import (
 
 	"github.com/pod32g/proxy/internal/api"
 	"github.com/pod32g/proxy/internal/config"
+	"github.com/pod32g/proxy/internal/pac"
 	"github.com/pod32g/proxy/internal/policy"
 	"github.com/pod32g/proxy/internal/proxy"
 	"github.com/pod32g/proxy/internal/quota"
@@ -187,6 +188,12 @@ func main() {
 		"client certificate presented to upstreams that ask for one")
 	upstreamKey := flag.String("upstream-key", env.get("PROXY_UPSTREAM_KEY", ""),
 		"key for -upstream-cert")
+	pacEnabled := flag.Bool("pac", env.get("PROXY_PAC", "") == "true",
+		"serve a proxy auto-configuration file at "+pac.Path+"; off by default, and unauthenticated by necessity")
+	pacAddress := flag.String("pac-address", env.get("PROXY_PAC_ADDRESS", ""),
+		"host:port the PAC file advertises; defaults to the proxy's listen address, which is often not what clients can reach")
+	pacHintDirect := flag.Bool("pac-hint-direct", env.get("PROXY_PAC_HINT_DIRECT", "") == "true",
+		"add DIRECT hints for refused destinations to the PAC file; this publishes your deny list to anyone who can fetch it")
 	metricsPublic := flag.Bool("metrics-public", env.get("PROXY_METRICS_PUBLIC", "") == "true",
 		"serve /metrics without authentication so scrapers that send no credentials keep working")
 	authPassFile := flag.String("auth-pass-file", env.get("PROXY_AUTH_PASS_FILE", ""),
@@ -651,6 +658,39 @@ func main() {
 	// paths, and with no UI/API/Metrics it proxies everything. Splitting the
 	// admin surface onto its own listener is therefore two values rather than a
 	// mode flag threaded through the dispatch.
+	// The PAC file is off unless asked for. It has to be served without
+	// authentication — a browser fetches it before it can authenticate — so what
+	// goes in it is the operator's decision rather than a default.
+	var pacHandler http.Handler
+	if *pacEnabled {
+		advertised := *pacAddress
+		if advertised == "" {
+			advertised = cfg.HTTPAddr
+		}
+		if ok, why := pac.Advertisable(advertised); !ok {
+			fatalf("-pac: cannot advertise %q: %s; set -pac-address to the address clients reach", advertised, why)
+		}
+		pacHandler = pac.Handler(func() pac.Config {
+			c := pac.Config{Address: advertised, HintDirect: *pacHintDirect}
+			if *pacHintDirect {
+				// Read per request so the file cannot drift from the policy it
+				// describes.
+				c.Rules = cfg.PolicyRuleSet()
+				if p := cfg.UpstreamProxy(); p.Configured() {
+					c.Bypass = strings.Split(p.BypassList(), ",")
+				}
+			}
+			return c
+		})
+		logger.Info("Serving a PAC file",
+			log.String("path", pac.Path), log.String("advertises", advertised))
+		if *pacHintDirect {
+			logger.Warn("PAC direct hints are on: the file publishes your deny list and "+
+				"bypass entries to anyone who can fetch it, and it is served without authentication",
+				log.String("path", pac.Path))
+		}
+	}
+
 	newRouter := func(proxy, ui, api, metricsH http.Handler) *server.Router {
 		return &server.Router{
 			Proxy:   proxy,
@@ -668,6 +708,7 @@ func main() {
 			AuthFailures:  metrics.AuthFailures,
 			// Both consulted per request, so a rule or quota changed at runtime
 			// applies to the next request rather than the next restart.
+			PAC:           pacHandler,
 			ClientAllowed: cfg.ClientAllowed,
 			// Adapted rather than passed directly so the server package does not
 			// have to know the quota package exists.

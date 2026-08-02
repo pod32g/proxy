@@ -62,6 +62,9 @@ go build -o proxy
 - `-no-proxy` – Hosts, domain suffixes and CIDRs reached directly instead. `PROXY_NO_PROXY`, defaults to `NO_PROXY`.
 - `-upstream-ca` – Additional CA bundle trusted for upstream TLS, added to the system roots. `PROXY_UPSTREAM_CA`.
 - `-upstream-cert` / `-upstream-key` – Client certificate presented to upstreams that ask for one. `PROXY_UPSTREAM_CERT`, `PROXY_UPSTREAM_KEY`.
+- `-pac` – Serve a proxy auto-configuration file at `/proxy.pac`. **Off by default.** `PROXY_PAC`.
+- `-pac-address` – host:port the PAC advertises. Defaults to the listen address, which is often not what clients reach.
+- `-pac-hint-direct` – Add `DIRECT` hints for refused destinations. **Publishes your deny list.** See below.
 - `-config` – YAML configuration file. SIGHUP re-reads it. See below. `PROXY_CONFIG`.
 - `-healthcheck` – Probe the local health endpoint and exit 0 or 1, instead of starting the proxy. Used by the container `HEALTHCHECK`.
 
@@ -556,6 +559,54 @@ reach a span. The only headers read are the propagation ones — `Authorization`
 Spans are flushed on shutdown. A batching exporter holds them in memory, so
 without that the last seconds of traces are lost on every restart — exactly the
 window around a deployment that anyone wants to see.
+
+## PAC file
+
+Browsers and OS proxy settings are usually pointed at a PAC URL rather than a
+host and port, so clients are configured once and routed centrally afterwards.
+
+```sh
+./proxy -pac -pac-address proxy.example.com:8080
+```
+
+Served at `/proxy.pac` as `application/x-ns-proxy-autoconfig`, **generated on
+every request** from live configuration — a PAC that has drifted from the policy
+is worse than none, because clients would be routed by a document nobody is
+looking at.
+
+`-pac-address` matters more than it looks. The proxy's own bind address is
+frequently not something a client can reach — behind NAT, behind a load
+balancer, or bound to `0.0.0.0`, which is meaningless in a PAC. An unusable
+address is a startup error rather than a file that fails at the client with
+nothing pointing back here:
+
+```
+-pac: cannot advertise ":8080": no host: a PAC file has to name an address
+clients can reach; set -pac-address to the address clients reach
+```
+
+### The disclosure question
+
+A PAC file **must** be fetchable without authentication — a browser retrieves it
+before it has anywhere to send credentials. That is in tension with generating
+it from a policy, because a deny list is a map of an organisation's internal
+naming. The two are separated rather than bundled:
+
+- **`-pac`** serves a *minimal* file: everything through the proxy, with a
+  `DIRECT` fallback so a client whose proxy is down degrades instead of losing
+  the network entirely. It discloses only the proxy's address, which the client
+  already had — it just fetched the file from there.
+- **`-pac-hint-direct`** adds the `DIRECT` hints, so clients skip round trips
+  that could only end in a `403`. This is the part that publishes internal
+  hostnames, so it is a separate opt-in and warns at startup naming what it
+  exposes and to whom.
+
+Both default to off, so the endpoint does not exist unless asked for.
+
+Only **leading** denials become hints. A deny sitting behind an allow may be
+unreachable for a given host, and a PAC cannot express "unless an earlier rule
+matched" — emitting it would route a client direct to somewhere the proxy would
+have allowed.
 
 ## Chaining through a parent proxy
 

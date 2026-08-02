@@ -598,3 +598,56 @@ func TestQuotaDoesNotGateHealth(t *testing.T) {
 		t.Errorf("health probe got %d, want 200", rec.Code)
 	}
 }
+
+// A browser fetches the PAC file before it has anywhere to send credentials, so
+// the endpoint has to answer ahead of the auth gate. That is precisely why what
+// goes in the file is an operator decision rather than a default.
+func TestPACIsServedWithoutAuthentication(t *testing.T) {
+	r := &Router{
+		Proxy: okHandler("PROXIED"),
+		Auth:  func() (bool, string, string) { return true, "u", "p" },
+		PAC:   okHandler("function FindProxyForURL(){}"),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/proxy.pac", nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want the PAC served without credentials", rec.Code)
+	}
+	if rec.Body.String() != "function FindProxyForURL(){}" {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+}
+
+// Nil means the endpoint does not exist, which is what "off by default" has to
+// mean for something served unauthenticated.
+func TestPACAbsentWhenNotConfigured(t *testing.T) {
+	r := &Router{Proxy: okHandler("PROXIED")}
+	req := httptest.NewRequest(http.MethodGet, "/proxy.pac", nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Body.String() == "function FindProxyForURL(){}" {
+		t.Error("the PAC endpoint answered while disabled")
+	}
+}
+
+// A client asking the proxy to fetch http://host/proxy.pac wants that origin's
+// file, not ours. Serving ours would make the path unproxyable.
+func TestPACDoesNotShadowAProxiedRequest(t *testing.T) {
+	r := &Router{
+		Proxy: okHandler("PROXIED"),
+		PAC:   okHandler("OURS"),
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/proxy.pac", nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Body.String() != "PROXIED" {
+		t.Errorf("body = %q, want the origin's file", rec.Body.String())
+	}
+}

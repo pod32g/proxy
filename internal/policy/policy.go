@@ -65,6 +65,13 @@ type Rule struct {
 	net *net.IPNet
 }
 
+// Network returns the parsed network for a cidr rule, or nil.
+//
+// Exported for the PAC generator, which has to render a mask a browser can
+// evaluate; nothing on the request path needs it, since Match does its own
+// containment check.
+func (r Rule) Network() *net.IPNet { return r.net }
+
 // String renders the rule in the syntax Parse accepts.
 func (r Rule) String() string {
 	if r.Kind == KindAll {

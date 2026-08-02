@@ -86,6 +86,16 @@ header_rules: |
 
 # secret_file: /run/secrets/proxy-secret   # encrypts credentials at rest (restart)
 
+# --- restart: PAC file -------------------------------------------------------
+#
+# Served at /proxy.pac, without authentication by necessity — a browser fetches
+# it before it can authenticate. Off unless enabled, and configured by flag
+# (-pac, -pac-address, -pac-hint-direct).
+#
+# hint_direct adds DIRECT hints for destinations the proxy would refuse. It
+# makes client routing better and publishes your deny list to anyone who can
+# fetch the file, which is why it is a separate switch.
+
 # --- live: parent proxy ------------------------------------------------------
 #
 # All outbound traffic passes through this. Credentials may be in the URL and
