@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -936,3 +937,35 @@ func TestReverseModeReachesAPrivateTarget(t *testing.T) {
 		t.Errorf("body = %q, want BACKEND — the operator's own target was refused", body)
 	}
 }
+
+// PROXY-93. The CONNECT path classified a timeout as 504 and the ordinary path
+// called everything 502, so one blackholed destination answered differently
+// depending on the verb — and clients act on that difference.
+func TestBothPathsClassifyATimeoutTheSameWay(t *testing.T) {
+	for _, err := range []error{
+		&net.OpError{Op: "dial", Err: &timeoutError{}},
+		errors.New("connection refused"),
+	} {
+		got := upstreamStatus(err)
+		want := http.StatusBadGateway
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			want = http.StatusGatewayTimeout
+		}
+		if got != want {
+			t.Errorf("upstreamStatus(%v) = %d, want %d", err, got, want)
+		}
+	}
+	// The property that matters is that one function answers for every path,
+	// which the call sites now share. A live check costs the dialer's full
+	// 15s timeout twice and lives in the end-to-end notes instead.
+	if upstreamStatus(&net.OpError{Op: "dial", Err: &timeoutError{}}) != http.StatusGatewayTimeout {
+		t.Error("a timeout is not 504")
+	}
+}
+
+type timeoutError struct{}
+
+func (t *timeoutError) Error() string   { return "i/o timeout" }
+func (t *timeoutError) Timeout() bool   { return true }
+func (t *timeoutError) Temporary() bool { return true }

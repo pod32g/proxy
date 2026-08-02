@@ -618,9 +618,10 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 				http.Error(w, "Destination not permitted", http.StatusForbidden)
 				return
 			}
+			status := upstreamStatus(err)
 			logger.Errorf("Upstream error: %v", err)
-			endSpan(http.StatusBadGateway, err)
-			http.Error(w, "Bad gateway", http.StatusBadGateway)
+			endSpan(status, err)
+			http.Error(w, http.StatusText(status), status)
 			return
 		}
 		endSpan(resp.StatusCode, nil)
@@ -660,8 +661,26 @@ func NewForward(logger *log.Logger, headers func(string) map[string]string, pol 
 			w.Header().Set("X-Cache", "MISS")
 		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, body)
+		relay(w, body, logger, r)
 	})
+}
+
+// upstreamStatus maps a failure to reach an origin onto the status the client
+// should see.
+//
+// One function because there were two answers. The CONNECT path distinguished a
+// timeout and returned 504; the ordinary path returned 502 for everything, so
+// one blackholed destination produced 504 through CONNECT and 502 through a
+// GET, at the same moment, from the same dialer. 504 is what a timeout is
+// (RFC 9110 §15.6.5), and clients act on the difference: retry policies and
+// circuit breakers commonly treat 504 as worth retrying and 502 as a bad
+// backend.
+func upstreamStatus(err error) int {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return http.StatusGatewayTimeout
+	}
+	return http.StatusBadGateway
 }
 
 // requestedUpgrade returns the protocol a client is asking to switch to, or ""
@@ -696,6 +715,28 @@ type servedSetter interface{ SetServed() }
 func markServed(w http.ResponseWriter) {
 	if s, ok := w.(servedSetter); ok {
 		s.SetServed()
+	}
+}
+
+// relay copies a response body to the client and reports a failure that the
+// status can no longer express.
+//
+// The error used to be discarded. An origin that declared 1000 bytes, sent 100
+// and hung up produced a client-side "unexpected EOF" — correct, the framing
+// tells the truth — against an access record of status 200, served, and nothing
+// in the process log at any level. Someone investigating truncated downloads
+// had a wall of clean 200s and no signal.
+//
+// The status cannot be corrected; it is already on the wire. What can be said
+// is that it did not finish, in the two places anyone looks.
+func relay(w http.ResponseWriter, body io.Reader, logger *log.Logger, r *http.Request) {
+	if _, err := io.Copy(w, body); err != nil {
+		if s, ok := w.(interface{ SetIncomplete() }); ok {
+			s.SetIncomplete()
+		}
+		logger.Warn("Relay ended early; the client received a truncated response",
+			log.String("host", r.URL.Host), log.String("error", err.Error()),
+			log.String("request_id", reqid.FromContext(r.Context())))
 	}
 }
 
@@ -740,8 +781,9 @@ func handleUpgrade(
 			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return
 		}
+		status := upstreamStatus(err)
 		logger.Errorf("Upgrade upstream error: %v", err)
-		http.Error(w, "Bad gateway", http.StatusBadGateway)
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
 
@@ -754,7 +796,7 @@ func handleUpgrade(
 		removeHopByHop(resp.Header)
 		copyHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		relay(w, resp.Body, logger, r)
 		return
 	}
 
@@ -819,7 +861,16 @@ func handleUpgrade(
 	// hijack buffer; it belongs to the upgraded protocol and would be lost.
 	if n := clientBuf.Reader.Buffered(); n > 0 {
 		if pending, err := clientBuf.Reader.Peek(n); err == nil {
-			upstream.Write(pending)
+			// These bytes belong to the upgraded protocol. Dropping the error
+			// here would splice a tunnel whose first frame never arrived, which
+			// for a WebSocket is a corrupt stream rather than a failed one.
+			if _, err := upstream.Write(pending); err != nil {
+				pol.Tunnels.Release(client)
+				logger.Errorf("Upgrade: could not replay pipelined bytes: %v", err)
+				upstream.Close()
+				clientConn.Close()
+				return
+			}
 		}
 	}
 
@@ -877,13 +928,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 			http.Error(w, "Destination not permitted", http.StatusForbidden)
 			return
 		}
+		status := upstreamStatus(err)
 		logger.Errorf("CONNECT dial error: %v", err)
-		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
-			http.Error(w, "Gateway timeout", http.StatusGatewayTimeout)
-			return
-		}
-		http.Error(w, "Bad gateway", http.StatusBadGateway)
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
 	markServed(w)

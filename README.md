@@ -108,9 +108,10 @@ believes it took effect.
 
 ### Reloading
 
-`SIGHUP` re-reads the file. It is validated in full before anything is applied,
-so **a bad file leaves the running configuration exactly as it was** and says
-which setting and line are wrong:
+`SIGHUP` re-reads the file. It is validated in full before anything is applied
+— including reading anything the file points at, such as `auth.password_file` —
+so **a bad file leaves the running configuration exactly as it was**, changes
+nothing in the database, and says which setting and line are wrong:
 
 ```
 ERROR Reload rejected, keeping the running configuration:
@@ -276,7 +277,11 @@ More details about the interface and its pages can be found in [docs/GUI.md](doc
   Kubernetes secrets already have. The proxy warns when a credential arrives by
   flag or environment, and when a secret file is world-readable. A missing or
   empty secret file is a startup error rather than an empty credential.
-- - **Bound what clients can hold.** Set `-max-tunnels-per-client`; a request
+- - **Authentication cannot be enabled without a credential.** Every path refuses
+  it — startup, reload, API and UI — because the Router fails closed on that
+  combination and the admin surface is behind the same gate, so the change
+  could not be undone through the interface that made it.
+- **Bound what clients can hold.** Set `-max-tunnels-per-client`; a request
   quota limits how fast tunnels are opened, not how many stay open.
 - **Failed logins are logged and throttled.** Ten failures from one address
   within a minute earn a `429` for the rest of that minute, and every failure
@@ -824,6 +829,10 @@ instead of a body, which is the entire economy of holding a validator.
 
 `X-Cache` on the response says `HIT`, `MISS` or `REVALIDATED`, so the cache is
 visible from outside rather than only by watching the origin.
+
+A relay that ends before the body does is marked `incomplete` in the access
+record and logged with the request id. The status is already on the wire by
+then and cannot say so, and the byte count alone cannot either.
 
 Stored entries are **immutable**: a revalidation installs a replacement rather
 than editing the entry a concurrent request may be writing to a client. Response

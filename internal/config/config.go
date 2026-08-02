@@ -248,16 +248,33 @@ func LevelString(level log.LogLevel) string {
 }
 
 // SetAuth updates the authentication settings. Empty username or password are ignored.
-func (c *Config) SetAuth(enabled bool, username, password string) {
+// SetAuth updates the authentication settings, refusing a combination that
+// would take the proxy off the air.
+//
+// Enabling authentication with no credential makes the Router refuse every
+// request — deliberately, since the alternative is passing traffic the operator
+// asked to have gated. The trap is that the admin API is behind the same gate,
+// so the change cannot be undone through the surface that made it. A file
+// reload reached this state through a mistyped password path (PROXY-90); the
+// API reaches it by sending {"enabled": true} with no credentials, which is one
+// curl away.
+func (c *Config) SetAuth(enabled bool, username, password string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.AuthEnabled = enabled
+	user, pass := c.Username, c.Password
 	if username != "" {
-		c.Username = username
+		user = username
 	}
 	if password != "" {
-		c.Password = password
+		pass = password
 	}
+	if enabled && (user == "" || pass == "") {
+		return fmt.Errorf("cannot enable authentication without a username and password: " +
+			"the proxy would refuse every request, including this API")
+	}
+	c.AuthEnabled = enabled
+	c.Username, c.Password = user, pass
+	return nil
 }
 
 // SetAuthEnabled toggles authentication without touching the stored credentials.

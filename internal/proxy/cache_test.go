@@ -1,11 +1,15 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +17,8 @@ import (
 	"github.com/pod32g/proxy/internal/cache"
 	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
+	"github.com/pod32g/proxy/internal/server"
+	log "github.com/pod32g/simple-logger"
 )
 
 // cachingProxy wires a real cache into a real handler. The predicates are unit
@@ -632,5 +638,62 @@ func TestHeadAndGetDoNotShareAnEntry(t *testing.T) {
 	hd := do(http.MethodHead)
 	if hd.Body.Len() != 0 {
 		t.Errorf("HEAD returned %d body bytes from the GET entry", hd.Body.Len())
+	}
+}
+
+// PROXY-91. An origin that declares more than it sends leaves the client with a
+// truncated body and a correct framing error. The proxy used to record the same
+// exchange as a clean 200, served, with nothing in the log at any level.
+func TestTruncatedRelayIsVisible(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				bufio.NewReader(c).ReadString('\n')
+				io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n"+
+					strings.Repeat("x", 100))
+			}(c)
+		}
+	}()
+
+	var diag bytes.Buffer
+	lg, _ := log.New(log.WithOutput(&diag), log.WithLevel(log.WARN))
+	var got server.Exchange
+	h := server.AccountingMiddleware(
+		NewForward(lg, func(string) map[string]string { return nil }, Policy{AllowPrivate: true}),
+		server.Accounting{Completed: func(e server.Exchange) { got = e }})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := proxyClient(t, srv.URL).Get("http://" + ln.Addr().String() + "/a")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr == nil || len(body) != 100 {
+		t.Fatalf("expected a truncated read, got %d bytes and err=%v", len(body), readErr)
+	}
+
+	// Both surfaces, because an operator looks in one or the other.
+	if !got.Incomplete {
+		t.Errorf("the access record says the exchange completed: %+v", got)
+	}
+	if !strings.Contains(diag.String(), "Relay ended early") {
+		t.Errorf("nothing was logged about a truncated relay:\n%s", diag.String())
+	}
+	// The signal has to survive the assembled stack, not just a bare writer —
+	// which is how SetServed was lost in PROXY-63.
+	if got.Status != http.StatusOK {
+		t.Errorf("status = %d; the status is on the wire before the failure and cannot change", got.Status)
 	}
 }

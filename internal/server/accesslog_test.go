@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -623,5 +624,71 @@ func TestProxiedRequestProducesExactlyOneRecord(t *testing.T) {
 	}
 	if v := testutil.ToFloat64(m.Requests.WithLabelValues("GET", "200", "")); v != 1 {
 		t.Errorf("request counter = %v, want exactly 1", v)
+	}
+}
+
+// PROXY-92. The write error was discarded, so a full disk or a rotation script
+// that removed the file stopped the record silently — and an absence of entries
+// reads as an absence of traffic to whoever is reconstructing an incident.
+type flakyWriter struct {
+	mu   sync.Mutex
+	fail bool
+	ok   int
+}
+
+func (f *flakyWriter) setFailing(v bool) {
+	f.mu.Lock()
+	f.fail = v
+	f.mu.Unlock()
+}
+
+func (f *flakyWriter) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return 0, errors.New("no space left on device")
+	}
+	f.ok++
+	return len(p), nil
+}
+
+func TestAccessLogReportsItsOwnFailures(t *testing.T) {
+	var diag bytes.Buffer
+	lg, err := log.New(log.WithOutput(&diag), log.WithLevel(log.DEBUG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &flakyWriter{fail: true}
+	sink := NewAccessLog("combined", lg, w)
+	if sink == nil {
+		t.Fatal("no sink")
+	}
+
+	record := Exchange{Client: "10.1.2.3", Method: "GET", Host: "example.com", Path: "/a", Status: 200}
+	for i := 0; i < 50; i++ {
+		sink(record)
+	}
+	out := diag.String()
+	if !strings.Contains(out, "Access log records are being dropped") {
+		t.Fatalf("a failing access log said nothing:\n%s", out)
+	}
+	// Rate-limited: a proxy under load writes thousands a second, and a
+	// diagnostic per dropped record would take the other log down with it.
+	if n := strings.Count(out, "Access log records are being dropped"); n != 1 {
+		t.Errorf("50 failed writes produced %d diagnostics, want 1", n)
+	}
+
+	// Recovery is reported too, so the gap has both ends marked.
+	w.setFailing(false)
+	sink(record)
+	out = diag.String()
+	if !strings.Contains(out, "Access log writing again") {
+		t.Errorf("recovery was not reported:\n%s", out)
+	}
+	if !strings.Contains(out, "records_lost") {
+		t.Errorf("recovery did not say how many records were lost:\n%s", out)
+	}
+	if w.ok != 1 {
+		t.Errorf("the writer took %d records after recovery, want 1", w.ok)
 	}
 }

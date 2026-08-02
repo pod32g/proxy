@@ -105,6 +105,12 @@ type File struct {
 	// unconditional one and keeps working; both are applied, map first.
 	HeaderRules *string `yaml:"header_rules"`
 
+	// resolvedPassword is the password read from auth.password_file at load
+	// time. Everything a file references is resolved before anything is
+	// applied, so ApplyTo cannot fail partway and leave a configuration that
+	// exists in no file. See LoadFile.
+	resolvedPassword *string
+
 	// Listeners are additional bound addresses, each with its own TLS material,
 	// mode and rule sets. The top-level http/https settings remain exactly what
 	// they were; these are in addition to them.
@@ -156,6 +162,20 @@ func LoadFile(path string) (*File, error) {
 	}
 	if err := f.validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	// Everything the file points at is resolved here, before anything is
+	// applied, because "validated in full before anything is applied" has to
+	// include the filesystem. It did not: auth.password_file was read from
+	// inside ApplyTo, after ten settings had already been written, so a
+	// mistyped path applied auth.enabled without a password and the Router
+	// then — correctly — refused every request, including the admin API that
+	// would have fixed it.
+	if f.Auth != nil && f.Auth.PasswordFile != nil {
+		v, err := SecretFromFile(*f.Auth.PasswordFile)
+		if err != nil {
+			return nil, fmt.Errorf("%s: auth.password_file: %w", path, err)
+		}
+		f.resolvedPassword = &v
 	}
 	return &f, nil
 }
@@ -366,6 +386,12 @@ func (f *File) Password() (string, bool, error) {
 	if f.Auth == nil {
 		return "", false, nil
 	}
+	// Resolved at load time when the file came from LoadFile, so a password
+	// file that has gone missing since cannot fail an apply that is already
+	// half done. A File built directly — in a test — still reads it here.
+	if f.resolvedPassword != nil {
+		return *f.resolvedPassword, true, nil
+	}
 	if f.Auth.PasswordFile != nil {
 		v, err := SecretFromFile(*f.Auth.PasswordFile)
 		if err != nil {
@@ -389,6 +415,17 @@ func (f *File) ApplyTo(cfg *Config) ([]string, error) {
 	if f == nil {
 		return nil, nil
 	}
+	// Everything that can fail, before anything is written.
+	//
+	// This used to fail partway and return with some settings applied and some
+	// not, producing a live configuration that existed in no file. LoadFile now
+	// resolves the one thing that could fail late, so this is a second line
+	// rather than the only one — but a setting added later that can fail is
+	// caught here instead of halfway through the apply.
+	if err := f.applicable(cfg); err != nil {
+		return nil, err
+	}
+
 	var changed []string
 	note := func(name string) { changed = append(changed, name) }
 
@@ -490,6 +527,42 @@ func (f *File) ApplyTo(cfg *Config) ([]string, error) {
 	}
 	sort.Strings(changed)
 	return changed, nil
+}
+
+// applicable reports whether this file can be applied in full, without
+// applying any of it.
+//
+// The resulting authentication state is the substance. Enabling authentication
+// without a credential makes the Router refuse every request — deliberately,
+// and correctly, since the alternative is passing traffic the operator asked to
+// have gated. What must not happen is a configuration change producing that
+// state, because the surface that would undo it is behind the same gate.
+func (f *File) applicable(cfg *Config) error {
+	if _, _, err := f.Password(); err != nil {
+		return err
+	}
+	if f.Auth == nil {
+		// The file has no opinion about authentication, so it cannot be what
+		// breaks it. Checking anyway would refuse every reload for a proxy
+		// already in the bad state — trapping the operator in it rather than
+		// letting them edit their way out.
+		return nil
+	}
+	enabled, user, pass := cfg.GetAuth()
+	if f.Auth.Enabled != nil {
+		enabled = *f.Auth.Enabled
+	}
+	if f.Auth.Username != nil {
+		user = *f.Auth.Username
+	}
+	if p, ok, _ := f.Password(); ok {
+		pass = p
+	}
+	if enabled && (user == "" || pass == "") {
+		return fmt.Errorf("auth.enabled is true but no username and password are configured; " +
+			"the proxy would refuse every request, including the admin API")
+	}
+	return nil
 }
 
 func sameHeaders(a, b map[string]string) bool {

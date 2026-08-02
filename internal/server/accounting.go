@@ -39,6 +39,11 @@ type Exchange struct {
 	// counting it as traffic to that host would let a client put entries in the
 	// "busiest destinations" view using requests that never succeeded.
 	Served bool
+	// Incomplete marks an exchange whose body did not finish relaying. The
+	// status is already on the wire by then and cannot say so, and the byte
+	// count alone cannot either without a Content-Length to compare it against
+	// — so a truncated download used to be indistinguishable from a served one.
+	Incomplete bool
 	// Tunnel marks an exchange that was hijacked — a CONNECT tunnel or a
 	// protocol upgrade. Its record arrives when the connection closes, not when
 	// it was established, so the byte counts mean something.
@@ -219,6 +224,7 @@ type accountedWriter struct {
 	hijacked   atomic.Bool
 	served     atomic.Bool
 	skipped    atomic.Bool
+	incomplete atomic.Bool
 
 	start time.Time
 	// mu guards exchange, which the handler mutates through SetProtocol while
@@ -290,6 +296,16 @@ func (m *accountedWriter) SetServed() {
 
 // SetStatus records a status the handler could not write through WriteHeader,
 // and forwards it to the metrics recorder underneath.
+// SetIncomplete records that the response body stopped short. Only the handler
+// knows: by the time a relay fails the status is on the wire and this writer
+// sees nothing but a byte count with no expected total to compare it against.
+func (m *accountedWriter) SetIncomplete() {
+	m.incomplete.Store(true)
+	if s, ok := m.ResponseWriter.(interface{ SetIncomplete() }); ok {
+		s.SetIncomplete()
+	}
+}
+
 func (m *accountedWriter) SetStatus(code int) {
 	m.status.Store(int32(code))
 	if s, ok := m.ResponseWriter.(interface{ SetStatus(int) }); ok {
@@ -367,6 +383,7 @@ func (m *accountedWriter) finish() {
 	e.Duration = time.Since(m.start)
 	e.Tunnel = m.hijacked.Load()
 	e.Served = m.served.Load()
+	e.Incomplete = m.incomplete.Load()
 	m.completed(e)
 }
 

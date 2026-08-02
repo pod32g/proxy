@@ -435,7 +435,17 @@ func main() {
 		fatalf("failed to build logger: %v", err)
 	}
 
-	accessLog, closeAccessLog, err := newAccessLog(accessFormat, *accessLogFile, logFormat)
+	// Refuse rather than start something that refuses everything. The Router
+	// fails closed on this combination, deliberately, so a proxy in it serves
+	// nothing and cannot be fixed through its own admin API — and the startup
+	// Save would persist it. Failing here is strictly better than failing on
+	// every request afterwards.
+	if enabled, user, pass := cfg.GetAuth(); enabled && (user == "" || pass == "") {
+		fatalf("authentication is enabled but no username and password are set: " +
+			"the proxy would refuse every request, including the admin API")
+	}
+
+	accessLog, closeAccessLog, err := newAccessLog(accessFormat, *accessLogFile, logFormat, logger)
 	if err != nil {
 		fatalf("-access-log-file: %v", err)
 	}
@@ -903,7 +913,7 @@ func main() {
 // proxy brokered, and losing the access log as a side effect of a logging tweak
 // is the kind of gap discovered only when someone needs it. -access-log off is
 // the one way to turn it off.
-func newAccessLog(format, path, logFormat string) (func(server.Exchange), func(), error) {
+func newAccessLog(format, path, logFormat string, logger *log.Logger) (func(server.Exchange), func(), error) {
 	noop := func() {}
 	if format == "off" {
 		return nil, noop, nil
@@ -925,7 +935,11 @@ func newAccessLog(format, path, logFormat string) (func(server.Exchange), func()
 	}
 
 	if format == "combined" {
-		return server.NewAccessLog(format, nil, out), closeFn, nil
+		// The process logger, so a failure to write the access log is reported
+		// somewhere. The combined format writes bytes straight to a file; the
+		// structured one goes through a logger that reports its own failures,
+		// which is why only this branch needed saying.
+		return server.NewAccessLog(format, logger, out), closeFn, nil
 	}
 	accessLogger, err := config.NewLogger(out, log.INFO, logFormat)
 	if err != nil {
@@ -1160,10 +1174,17 @@ func watchReloads(path string, current *config.File, cfg *config.Config,
 
 		changed, err := next.ApplyTo(cfg)
 		if err != nil {
-			// ApplyTo validated the same values LoadFile did, so reaching here
-			// means something outside the file failed — an unreadable password
-			// file, most likely. Say so rather than reporting a partial success.
-			logger.Errorf("Reload partially applied then failed: %v", err)
+			// Nothing was applied: ApplyTo validates in full before it writes
+			// anything, and LoadFile resolved everything the file points at.
+			// So this is the same outcome as a file that failed to parse —
+			// the running configuration is untouched, and nothing is persisted.
+			//
+			// It did not used to be. A mistyped auth.password_file applied ten
+			// settings and then failed, and because some had changed the state
+			// was written to the store — which outranks the file at startup, so
+			// a restart with a corrected file did not recover it.
+			logger.Errorf("Reload rejected, keeping the running configuration: %v", err)
+			continue
 		}
 
 		// Explicit settings still outrank the file after a reload, exactly as

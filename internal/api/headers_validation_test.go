@@ -53,3 +53,37 @@ func TestInvalidHeadersAreRefusedAtTheWrite(t *testing.T) {
 		t.Errorf("a valid header was not stored: %v", cfg.GetHeaders())
 	}
 }
+
+// PROXY-90, the API's route to the same brick. {"enabled":true} with no
+// credentials is one curl away, and the Router then refuses every request —
+// including this API, which is the only way to undo it.
+func TestAuthCannotBeEnabledWithoutCredentialsViaAPI(t *testing.T) {
+	cfg, h := newAPI()
+	post := func(body string) int {
+		req := httptest.NewRequest("POST", "/auth", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := post(`{"enabled":true}`); code != http.StatusBadRequest {
+		t.Errorf("enabling auth with no credentials answered %d, want 400", code)
+	}
+	if code := post(`{"enabled":true,"username":"admin"}`); code != http.StatusBadRequest {
+		t.Errorf("enabling auth with no password answered %d, want 400", code)
+	}
+	if on, _, _ := cfg.GetAuth(); on {
+		t.Fatal("authentication was enabled anyway")
+	}
+	// With both, it works — this is a guard, not a wall.
+	if code := post(`{"enabled":true,"username":"admin","password":"pw"}`); code != http.StatusNoContent {
+		t.Errorf("a complete credential answered %d, want 204", code)
+	}
+	if on, u, _ := cfg.GetAuth(); !on || u != "admin" {
+		t.Errorf("auth not enabled with a complete credential: on=%v user=%q", on, u)
+	}
+	// And turning it off never needs one.
+	if code := post(`{"enabled":false}`); code != http.StatusNoContent {
+		t.Errorf("disabling auth answered %d, want 204", code)
+	}
+}

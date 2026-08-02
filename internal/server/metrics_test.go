@@ -213,3 +213,54 @@ func TestMethodLabelKeepsTheStandardSet(t *testing.T) {
 		}
 	}
 }
+
+// Every signal a handler sends to the accounting layer has to survive whatever
+// wrappers sit between them, in whatever order they are composed. PROXY-63 lost
+// SetServed to a wrapper that did not forward it; PROXY-85 found Skipped
+// working only because accounting happened to wrap metrics. This asserts the
+// whole set both ways round, so the next signal added is covered by an existing
+// test rather than by whoever remembers.
+func TestEverySignalSurvivesTheStack(t *testing.T) {
+	for _, order := range []string{"accounting outside", "metrics outside"} {
+		t.Run(order, func(t *testing.T) {
+			var got Exchange
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if s, ok := w.(interface{ SetServed() }); ok {
+					s.SetServed()
+				}
+				if s, ok := w.(interface{ SetProtocol(string) }); ok {
+					s.SetProtocol("HTTP/2.0")
+				}
+				if s, ok := w.(interface{ SetIncomplete() }); ok {
+					s.SetIncomplete()
+				}
+				if s, ok := w.(interface{ SetStatus(int) }); ok {
+					s.SetStatus(http.StatusSwitchingProtocols)
+				}
+			})
+			acct := Accounting{Completed: func(e Exchange) { got = e }}
+			var h http.Handler
+			if order == "accounting outside" {
+				h = AccountingMiddleware(MetricsMiddleware(handler, mustMetrics(t)), acct)
+			} else {
+				h = MetricsMiddleware(AccountingMiddleware(handler, acct), mustMetrics(t))
+			}
+			req := httptest.NewRequest("GET", "http://example.com/", nil)
+			req.RemoteAddr = "10.1.2.3:5000"
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			if !got.Served {
+				t.Error("SetServed was swallowed")
+			}
+			if got.Protocol != "HTTP/2.0" {
+				t.Errorf("SetProtocol was swallowed: %q", got.Protocol)
+			}
+			if !got.Incomplete {
+				t.Error("SetIncomplete was swallowed")
+			}
+			if got.Status != http.StatusSwitchingProtocols {
+				t.Errorf("SetStatus was swallowed: %d", got.Status)
+			}
+		})
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/pod32g/simple-logger"
@@ -50,7 +51,8 @@ func NewAccessLog(format string, logger *log.Logger, out io.Writer) func(Exchang
 		if out == nil {
 			return nil
 		}
-		return func(e Exchange) { writeCombined(out, e) }
+		w := &reportingWriter{out: out, logger: logger}
+		return func(e Exchange) { writeCombined(w, e) }
 	default:
 		return nil
 	}
@@ -86,6 +88,9 @@ func logStructured(logger *log.Logger, e Exchange) {
 	if e.Tunnel {
 		fields = append(fields, log.Bool("tunnel", true))
 	}
+	if e.Incomplete {
+		fields = append(fields, log.Bool("incomplete", true))
+	}
 	logger.Info("access", fields...)
 }
 
@@ -117,6 +122,66 @@ func writeCombined(out io.Writer, e Exchange) {
 	// exposure, so they are recorded as absent rather than forwarded.
 	line.WriteString(` "-" "-"` + "\n")
 	io.WriteString(out, line.String())
+}
+
+// reportingWriter says something when the access log cannot be written.
+//
+// The error used to be discarded, so a full disk, a filesystem gone read-only
+// or a rotation script that removed the file without signalling all produced
+// the same outcome: records stop, silently. That is worse than no access log at
+// all, because an absence of entries reads as an absence of traffic to whoever
+// is reconstructing an incident.
+//
+// The care taken elsewhere makes the omission plainer. NewAccessLog gives the
+// log its own logger so that raising -log-level cannot silence it, on the
+// argument that "losing the access log as a side effect of a logging tweak is
+// the kind of gap discovered only when someone needs it". A full disk silenced
+// it just as completely. The structured format never had the problem: it goes
+// through the process logger, which reports its own failures.
+//
+// Rate-limited because the failure is per-record and a proxy under load writes
+// thousands a second — a diagnostic that floods the log it is warning about
+// would take the other log down with it. Recovery is reported too, so the gap
+// in the record has both ends marked and can be measured.
+type reportingWriter struct {
+	out    io.Writer
+	logger *log.Logger
+
+	mu       sync.Mutex
+	failing  bool
+	dropped  int
+	lastSaid time.Time
+}
+
+// howOftenToComplain bounds the diagnostic. Long enough that a sustained
+// failure is a handful of lines an hour, short enough that a transient one is
+// still reported.
+const howOftenToComplain = time.Minute
+
+func (w *reportingWriter) Write(p []byte) (int, error) {
+	n, err := w.out.Write(p)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err != nil {
+		w.dropped++
+		if !w.failing || time.Since(w.lastSaid) >= howOftenToComplain {
+			w.failing, w.lastSaid = true, time.Now()
+			if w.logger != nil {
+				w.logger.Error("Access log records are being dropped",
+					log.String("error", err.Error()), log.Int("dropped", w.dropped))
+			}
+		}
+		return n, err
+	}
+	if w.failing {
+		w.failing = false
+		if w.logger != nil {
+			w.logger.Warn("Access log writing again",
+				log.Int("records_lost", w.dropped))
+		}
+		w.dropped = 0
+	}
+	return n, err
 }
 
 // quoteField neutralises anything in a client-controlled string that could

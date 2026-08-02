@@ -715,7 +715,10 @@ func (h *handler) setAuth(w http.ResponseWriter, r *http.Request) {
 	if pass == "" {
 		pass = curPass
 	}
-	h.cfg.SetAuth(enabled, user, pass)
+	if err := h.cfg.SetAuth(enabled, user, pass); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if h.logger != nil {
 		h.logger.Info("Updated auth settings", log.Bool("enabled", enabled), log.String("user", user))
 	}

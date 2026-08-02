@@ -165,7 +165,14 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) bool {
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	// The status is already on the wire, so a failure here cannot be reported
+	// to the caller — but a truncated body that looks like a served one should
+	// not also be invisible on this side.
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		if s, ok := w.(interface{ SetIncomplete() }); ok {
+			s.SetIncomplete()
+		}
+	}
 }
 
 // persist writes the configuration through to the store, and reports whether
@@ -296,7 +303,10 @@ func (h *handler) auth(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `"enabled" is required`, http.StatusBadRequest)
 			return
 		}
-		h.cfg.SetAuth(*req.Enabled, req.Username, req.Password)
+		if err := h.cfg.SetAuth(*req.Enabled, req.Username, req.Password); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if h.logger != nil {
 			h.logger.Info("updated auth settings")
 		}

@@ -252,7 +252,16 @@ type statusRecorder struct {
 // SetStatus records a status the handler could not report through WriteHeader.
 // A protocol switch is written directly to a hijacked connection, so without
 // this the exchange would be counted as a 200 like any other.
-func (r *statusRecorder) SetStatus(code int) { r.status = code }
+func (r *statusRecorder) SetStatus(code int) {
+	r.status = code
+	// Forwarded, like every other signal here. It was not, so in the order the
+	// proxy actually composes these — accounting outside metrics — a protocol
+	// upgrade's 101 reached the request counter and stopped there. The access
+	// log recorded every WebSocket handshake as a 200.
+	if s, ok := r.ResponseWriter.(interface{ SetStatus(int) }); ok {
+		s.SetStatus(code)
+	}
+}
 
 // SetProtocol passes the negotiated protocol down to the accounting layer.
 func (r *statusRecorder) SetProtocol(proto string) {
@@ -293,6 +302,13 @@ func (r *statusRecorder) Skipped() bool {
 func (r *statusRecorder) SetServed() {
 	if s, ok := r.ResponseWriter.(interface{ SetServed() }); ok {
 		s.SetServed()
+	}
+}
+
+// SetIncomplete passes the truncation signal down to the accounting layer.
+func (r *statusRecorder) SetIncomplete() {
+	if s, ok := r.ResponseWriter.(interface{ SetIncomplete() }); ok {
+		s.SetIncomplete()
 	}
 }
 

@@ -283,10 +283,83 @@ func TestPasswordFromFile(t *testing.T) {
 
 // A password file that cannot be read must be an error, not an empty password —
 // with auth enabled, an empty credential is the fail-open case.
-func TestUnreadablePasswordFileIsAnError(t *testing.T) {
-	f := mustLoad(t, "auth:\n  password_file: /nonexistent/proxy-password\n")
-	if _, err := f.ApplyTo(&Config{}); err == nil {
-		t.Fatal("a missing password file was accepted")
+// PROXY-90. The error has to arrive at load, not at apply. Read from inside
+// ApplyTo it failed after ten settings had been written, leaving a live
+// configuration that existed in no file — and, when the file also enabled
+// authentication, one that refused every request including the admin API.
+func TestUnreadablePasswordFileIsRejectedAtLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proxy.yaml")
+	body := "auth:\n  enabled: true\n  username: admin\n  password_file: /nonexistent/proxy-password\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := LoadFile(path)
+	if err == nil {
+		t.Fatal("a missing password file was accepted at load")
+	}
+	if f != nil {
+		t.Error("LoadFile returned a file alongside the error")
+	}
+	if !strings.Contains(err.Error(), "auth.password_file") {
+		t.Errorf("error does not name the setting: %v", err)
+	}
+}
+
+// And nothing is applied when it is rejected, which is the property the README
+// promises and the one that was false.
+func TestARejectedFileChangesNothing(t *testing.T) {
+	cfg := &Config{}
+	cfg.SetProxyName("original")
+	cfg.SetCredentials("admin", "pw")
+	cfg.SetAuthEnabled(false)
+
+	// Built directly rather than loaded, so the unreadable file is still
+	// unresolved and ApplyTo is the one that has to refuse.
+	missing := "/nonexistent/proxy-password"
+	enabled := true
+	name := "changed"
+	f := &File{ProxyName: &name}
+	f.Auth = &struct {
+		Enabled      *bool   `yaml:"enabled"`
+		Username     *string `yaml:"username"`
+		Password     *string `yaml:"password"`
+		PasswordFile *string `yaml:"password_file"`
+	}{Enabled: &enabled, PasswordFile: &missing}
+
+	changed, err := f.ApplyTo(cfg)
+	if err == nil {
+		t.Fatal("ApplyTo accepted a file it could not finish")
+	}
+	if len(changed) != 0 {
+		t.Errorf("ApplyTo reported %v applied while failing", changed)
+	}
+	if got, _ := cfg.GetIdentity(); got != "original" {
+		t.Errorf("proxy_name = %q; a rejected file changed the running configuration", got)
+	}
+	if on, _, _ := cfg.GetAuth(); on {
+		t.Error("a rejected file enabled authentication")
+	}
+}
+
+// Enabling authentication without a credential is refused wherever it comes
+// from, because the surface that would undo it sits behind the same gate.
+func TestAuthCannotBeEnabledWithoutCredentials(t *testing.T) {
+	cfg := &Config{}
+	enabled := true
+	f := &File{}
+	f.Auth = &struct {
+		Enabled      *bool   `yaml:"enabled"`
+		Username     *string `yaml:"username"`
+		Password     *string `yaml:"password"`
+		PasswordFile *string `yaml:"password_file"`
+	}{Enabled: &enabled}
+
+	if _, err := f.ApplyTo(cfg); err == nil {
+		t.Fatal("auth.enabled with no credentials was accepted")
+	}
+	if on, _, _ := cfg.GetAuth(); on {
+		t.Error("authentication was enabled anyway")
 	}
 }
 
