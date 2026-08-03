@@ -69,6 +69,34 @@ func (e *environment) get(key, def string) string {
 	return def
 }
 
+// envInt and envDuration read a typed setting from the environment, recording
+// that it was supplied so the precedence chain can tell it from a default.
+// A value that will not parse is an error rather than a silent fallback, for
+// the same reason -mode and -log-level are.
+func envInt(key string, e *environment, def int) int {
+	raw := e.get(key, "")
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		fatalf("%s: %q is not a non-negative number", key, raw)
+	}
+	return n
+}
+
+func envDuration(key string, e *environment, def time.Duration) time.Duration {
+	raw := e.get(key, "")
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		fatalf("%s: %q is not a duration (try 30m)", key, raw)
+	}
+	return d
+}
+
 func fatalf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(2)
@@ -204,11 +232,11 @@ func main() {
 		"client certificate presented to upstreams that ask for one")
 	upstreamKey := flag.String("upstream-key", env.get("PROXY_UPSTREAM_KEY", ""),
 		"key for -upstream-cert")
-	maxTunnels := flag.Int("max-tunnels", 0,
+	maxTunnels := flag.Int("max-tunnels", envInt("PROXY_MAX_TUNNELS", env, 0),
 		"most CONNECT tunnels and protocol upgrades held open at once across all clients; 0 is unlimited")
-	maxTunnelsPerClient := flag.Int("max-tunnels-per-client", 0,
+	maxTunnelsPerClient := flag.Int("max-tunnels-per-client", envInt("PROXY_MAX_TUNNELS_PER_CLIENT", env, 0),
 		"most tunnels one source address may hold open at once; 0 is unlimited")
-	tunnelIdle := flag.Duration("tunnel-idle-timeout", 0,
+	tunnelIdle := flag.Duration("tunnel-idle-timeout", envDuration("PROXY_TUNNEL_IDLE_TIMEOUT", env, 0),
 		"close a tunnel neither side has moved bytes on for this long; 0 disables it")
 	pacEnabled := flag.Bool("pac", env.get("PROXY_PAC", "") == "true",
 		"serve a proxy auto-configuration file at "+pac.Path+"; off by default, and unauthenticated by necessity")
@@ -284,6 +312,11 @@ func main() {
 			upstreamCA:   upstreamCA,
 			upstreamCert: upstreamCert,
 			upstreamKey:  upstreamKey,
+
+			cacheSize: cacheSize, cacheMaxEntry: cacheMaxEntry,
+			upstreamHTTP2: upstreamHTTP2,
+			pacEnabled:    pacEnabled, pacAddress: pacAddress, pacHintDirect: pacHintDirect,
+			maxTunnels: maxTunnels, maxPerClient: maxTunnelsPerClient, tunnelIdle: tunnelIdle,
 		})
 	}
 
@@ -590,13 +623,13 @@ func main() {
 		if cfg.Mode == "reverse" {
 			fatalf("-cache is not supported in reverse mode: the response cache is part of the forward proxy")
 		}
-		total, err := parseBytes(*cacheSize)
+		total, err := config.ParseBytes(*cacheSize)
 		if err != nil {
 			fatalf("-cache: %v", err)
 		}
 		var perEntry int64
 		if *cacheMaxEntry != "" {
-			if perEntry, err = parseBytes(*cacheMaxEntry); err != nil {
+			if perEntry, err = config.ParseBytes(*cacheMaxEntry); err != nil {
 				fatalf("-cache-max-entry: %v", err)
 			}
 			if perEntry > total {
@@ -1114,6 +1147,15 @@ type startupFlags struct {
 	upstreamCA    *string
 	upstreamCert  *string
 	upstreamKey   *string
+	cacheSize     *string
+	cacheMaxEntry *string
+	upstreamHTTP2 *string
+	pacEnabled    *bool
+	pacAddress    *string
+	pacHintDirect *bool
+	maxTunnels    *int
+	maxPerClient  *int
+	tunnelIdle    *time.Duration
 }
 
 // applyStartupFile writes file values into the startup settings, skipping any
@@ -1179,6 +1221,30 @@ func applyStartupFile(f *config.File, set overrides, s *startupFlags) {
 		boolean("destination-metrics", "PROXY_DESTINATION_METRICS", s.destMetrics, f.DestinationMetrics.Enabled)
 		if f.DestinationMetrics.Top != nil && !set.has("destination-metrics-top", "") {
 			*s.destTop = *f.DestinationMetrics.Top
+		}
+	}
+	if f.Cache != nil {
+		str("cache", "PROXY_CACHE", s.cacheSize, f.Cache.Size)
+		str("cache-max-entry", "PROXY_CACHE_MAX_ENTRY", s.cacheMaxEntry, f.Cache.MaxEntry)
+	}
+	str("upstream-http2", "PROXY_UPSTREAM_HTTP2", s.upstreamHTTP2, f.UpstreamHTTP2)
+	if f.PAC != nil {
+		boolean("pac", "PROXY_PAC", s.pacEnabled, f.PAC.Enabled)
+		str("pac-address", "PROXY_PAC_ADDRESS", s.pacAddress, f.PAC.Address)
+		boolean("pac-hint-direct", "PROXY_PAC_HINT_DIRECT", s.pacHintDirect, f.PAC.HintDirect)
+	}
+	if f.Tunnels != nil {
+		if f.Tunnels.Max != nil && !set.has("max-tunnels", "PROXY_MAX_TUNNELS") {
+			*s.maxTunnels = *f.Tunnels.Max
+		}
+		if f.Tunnels.MaxPerClient != nil && !set.has("max-tunnels-per-client", "PROXY_MAX_TUNNELS_PER_CLIENT") {
+			*s.maxPerClient = *f.Tunnels.MaxPerClient
+		}
+		if f.Tunnels.IdleTimeout != nil && *f.Tunnels.IdleTimeout != "" &&
+			!set.has("tunnel-idle-timeout", "PROXY_TUNNEL_IDLE_TIMEOUT") {
+			// Validated by LoadFile, so this cannot fail here.
+			d, _ := time.ParseDuration(*f.Tunnels.IdleTimeout)
+			*s.tunnelIdle = d
 		}
 	}
 }
@@ -1301,29 +1367,3 @@ func overrideNote(has bool) string {
 // Both spellings are accepted for the same reason the quota parser accepts
 // both: they are both in common use, and guessing which one an operator meant
 // is how you end up off by five per cent on a memory ceiling.
-func parseBytes(s string) (int64, error) {
-	upper := strings.ToUpper(strings.TrimSpace(s))
-	for _, sfx := range []struct {
-		suffix string
-		mult   int64
-	}{
-		{"KIB", 1 << 10}, {"MIB", 1 << 20}, {"GIB", 1 << 30},
-		{"KB", 1e3}, {"MB", 1e6}, {"GB", 1e9},
-		{"K", 1e3}, {"M", 1e6}, {"G", 1e9},
-	} {
-		digits, ok := strings.CutSuffix(upper, sfx.suffix)
-		if !ok {
-			continue
-		}
-		n, err := strconv.ParseInt(strings.TrimSpace(digits), 10, 64)
-		if err != nil || n <= 0 {
-			return 0, fmt.Errorf("%q is not a positive size", s)
-		}
-		return n * sfx.mult, nil
-	}
-	n, err := strconv.ParseInt(upper, 10, 64)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%q is not a size (try 256MB)", s)
-	}
-	return n, nil
-}

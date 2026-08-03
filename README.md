@@ -58,7 +58,7 @@ go build -o proxy
 - `-metrics-public` – Serve `/metrics` without authentication. Can be set with `PROXY_METRICS_PUBLIC`.
 - `-admin-http` – Serve the UI, API and metrics on their own listener. Can be set with `PROXY_ADMIN_ADDR`.
 - `-admin-cert` / `-admin-key` – TLS material for the admin listener. `PROXY_ADMIN_CERT_FILE`, `PROXY_ADMIN_KEY_FILE`.
-- `-cache` – Enable the shared response cache with this much memory, e.g. `256MB`. **Off by default; forward mode only** — reverse mode refuses to start with it rather than ignoring it. `PROXY_CACHE`.
+- `-cache` – Enable the shared response cache with this much memory, e.g. `256MB`. Also `cache.size` in the file. **Off by default; forward mode only** — reverse mode refuses to start with it rather than ignoring it. `PROXY_CACHE`.
 - `-cache-max-entry` – Largest single response to hold. Defaults to a tenth of `-cache`. `PROXY_CACHE_MAX_ENTRY`.
 - `-upstream-http2` – How to speak HTTP/2 to origins: `auto`, `off` or `h2c`. `PROXY_UPSTREAM_HTTP2`.
 - `-upstream-proxy` – Parent proxy all outbound traffic passes through. `PROXY_UPSTREAM_PROXY`.
@@ -93,7 +93,22 @@ policy: |
   allow all
 quotas: |
   client requests 50/s burst 100
+cache:
+  size: 256MB
+  max_entry: 32MB
+upstream_http2: auto
+tunnels:
+  max_per_client: 100
+  idle_timeout: 30m
+pac:
+  enabled: false
 ```
+
+**Every flag has a config-file equivalent**, except the three that name where
+configuration lives or run where no file is available: `-config`, `-db` and
+`-healthcheck`. That is asserted by a test rather than maintained by hand — nine
+settings had drifted out of the file before it existed, including three added
+after the file was written.
 
 The rule sets take the same text the flags and the UI take, rather than a YAML
 transliteration of an ordered list — the ordering is the semantics, and encoding

@@ -64,7 +64,16 @@ var settingCases = map[string]settingCase{
 		before: "upstream_tls:\n  cert: /etc/ssl/a.pem\n  key: /etc/ssl/a.key\n",
 		after:  "upstream_tls:\n  cert: /etc/ssl/a.pem\n  key: /etc/ssl/b.key\n",
 	},
-	"listeners": {after: "listeners:\n  - name: extra\n    address: \":9091\"\n"},
+	"listeners":              {after: "listeners:\n  - name: extra\n    address: \":9091\"\n"},
+	"cache.size":             {after: "cache:\n  size: 256MB\n"},
+	"cache.max_entry":        {after: "cache:\n  max_entry: 32MB\n"},
+	"upstream_http2":         {after: "upstream_http2: h2c\n"},
+	"pac.enabled":            {after: "pac:\n  enabled: true\n"},
+	"pac.address":            {after: "pac:\n  address: proxy.example.com:8080\n"},
+	"pac.hint_direct":        {after: "pac:\n  hint_direct: true\n"},
+	"tunnels.max":            {after: "tunnels:\n  max: 1000\n"},
+	"tunnels.max_per_client": {after: "tunnels:\n  max_per_client: 100\n"},
+	"tunnels.idle_timeout":   {after: "tunnels:\n  idle_timeout: 30m\n"},
 
 	// Reloadable.
 	"log.level":    {after: "log:\n  level: DEBUG\n"},

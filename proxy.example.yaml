@@ -194,3 +194,28 @@ quotas: |
 #       ca: /etc/pki/internal-ca.pem
 #       cert: /etc/pki/proxy.crt
 #       key: /etc/pki/proxy.key
+
+# The shared response cache. Forward mode only — reverse mode refuses to start
+# with it rather than ignoring it.
+cache:
+  size: 256MB
+  max_entry: 32MB
+
+# How the proxy speaks HTTP/2 to origins: auto, off or h2c.
+upstream_http2: auto
+
+# How many hijacked connections a client may hold. A request quota bounds the
+# rate a client opens tunnels, not the number it keeps open; 0 is unlimited.
+tunnels:
+  max: 0
+  max_per_client: 0
+  # Close a tunnel neither side has moved bytes on for this long. Empty
+  # disables it — SSH over CONNECT and an open WebSocket are legitimately quiet.
+  idle_timeout: ""
+
+# A proxy auto-configuration file at /proxy.pac. Served without authentication
+# by necessity, so what goes in it is a decision rather than a default.
+pac:
+  enabled: false
+  address: ""
+  hint_direct: false

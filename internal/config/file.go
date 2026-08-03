@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pod32g/proxy/internal/header"
 	"github.com/pod32g/proxy/internal/policy"
@@ -62,6 +63,33 @@ type File struct {
 		Enabled *bool `yaml:"enabled"`
 		Top     *int  `yaml:"top"`
 	} `yaml:"destination_metrics"`
+
+	// Cache is the shared response cache. Forward mode only; reverse mode
+	// refuses to start with it rather than ignoring it.
+	Cache *struct {
+		Size     *string `yaml:"size,omitempty"`
+		MaxEntry *string `yaml:"max_entry,omitempty"`
+	} `yaml:"cache"`
+
+	// UpstreamHTTP2 is how the proxy speaks HTTP/2 to origins: auto, off or h2c.
+	UpstreamHTTP2 *string `yaml:"upstream_http2"`
+
+	// PAC serves a proxy auto-configuration file. Off unless asked for, and
+	// unauthenticated by necessity — see internal/pac.
+	PAC *struct {
+		Enabled    *bool   `yaml:"enabled,omitempty"`
+		Address    *string `yaml:"address,omitempty"`
+		HintDirect *bool   `yaml:"hint_direct,omitempty"`
+	} `yaml:"pac"`
+
+	// Tunnels bounds how many hijacked connections may be held at once, and
+	// how long an idle one survives. A request quota bounds the rate a client
+	// acquires tunnels, not the stock it holds; see proxy.TunnelLimit.
+	Tunnels *struct {
+		Max          *int    `yaml:"max,omitempty"`
+		MaxPerClient *int    `yaml:"max_per_client,omitempty"`
+		IdleTimeout  *string `yaml:"idle_timeout,omitempty"`
+	} `yaml:"tunnels"`
 
 	// UpstreamTLS is what the proxy presents and trusts when connecting
 	// outward, distinct from cert/key above, which is what it presents to its
@@ -181,6 +209,44 @@ func LoadFile(path string) (*File, error) {
 }
 
 func (f *File) validate() error {
+	if f.Cache != nil {
+		for name, v := range map[string]*string{
+			"cache.size": f.Cache.Size, "cache.max_entry": f.Cache.MaxEntry,
+		} {
+			if v == nil || *v == "" {
+				continue
+			}
+			if _, err := ParseBytes(*v); err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+		}
+		if f.Cache.Size != nil && *f.Cache.Size != "" &&
+			f.Cache.MaxEntry != nil && *f.Cache.MaxEntry != "" {
+			size, _ := ParseBytes(*f.Cache.Size)
+			entry, _ := ParseBytes(*f.Cache.MaxEntry)
+			if entry > size {
+				return fmt.Errorf("cache.max_entry (%s) is larger than cache.size (%s)",
+					*f.Cache.MaxEntry, *f.Cache.Size)
+			}
+		}
+	}
+	if f.Tunnels != nil {
+		// An empty string is "not set", as it is for every other optional
+		// string here — an example file that spells the key out with no value
+		// should not be a startup error.
+		if f.Tunnels.IdleTimeout != nil && *f.Tunnels.IdleTimeout != "" {
+			if _, err := time.ParseDuration(*f.Tunnels.IdleTimeout); err != nil {
+				return fmt.Errorf("tunnels.idle_timeout: %w", err)
+			}
+		}
+		for name, v := range map[string]*int{
+			"tunnels.max": f.Tunnels.Max, "tunnels.max_per_client": f.Tunnels.MaxPerClient,
+		} {
+			if v != nil && *v < 0 {
+				return fmt.Errorf("%s: %d is negative; 0 is unlimited", name, *v)
+			}
+		}
+	}
 	if f.Mode != nil && *f.Mode != "forward" && *f.Mode != "reverse" {
 		return fmt.Errorf("mode %q: want \"forward\" or \"reverse\"", *f.Mode)
 	}
@@ -606,6 +672,58 @@ var restartOnly = []struct {
 			return deref(nil)
 		}
 		return deref(f.UpstreamTLS.Key)
+	}},
+
+	{"cache.size", func(f *File) string {
+		if f.Cache == nil {
+			return deref(nil)
+		}
+		return deref(f.Cache.Size)
+	}},
+	{"cache.max_entry", func(f *File) string {
+		if f.Cache == nil {
+			return deref(nil)
+		}
+		return deref(f.Cache.MaxEntry)
+	}},
+	{"upstream_http2", func(f *File) string { return deref(f.UpstreamHTTP2) }},
+
+	{"pac.enabled", func(f *File) string {
+		if f.PAC == nil {
+			return boolStr(nil)
+		}
+		return boolStr(f.PAC.Enabled)
+	}},
+	{"pac.address", func(f *File) string {
+		if f.PAC == nil {
+			return deref(nil)
+		}
+		return deref(f.PAC.Address)
+	}},
+	{"pac.hint_direct", func(f *File) string {
+		if f.PAC == nil {
+			return boolStr(nil)
+		}
+		return boolStr(f.PAC.HintDirect)
+	}},
+
+	{"tunnels.max", func(f *File) string {
+		if f.Tunnels == nil {
+			return intStr(nil)
+		}
+		return intStr(f.Tunnels.Max)
+	}},
+	{"tunnels.max_per_client", func(f *File) string {
+		if f.Tunnels == nil {
+			return intStr(nil)
+		}
+		return intStr(f.Tunnels.MaxPerClient)
+	}},
+	{"tunnels.idle_timeout", func(f *File) string {
+		if f.Tunnels == nil {
+			return deref(nil)
+		}
+		return deref(f.Tunnels.IdleTimeout)
 	}},
 
 	{"listeners", listenersStr},
