@@ -3,7 +3,7 @@ module github.com/pod32g/proxy
 go 1.25.0
 
 require (
-	github.com/mattn/go-sqlite3 v1.14.48
+	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/pod32g/simple-logger v0.8.1
 	github.com/prometheus/client_golang v1.24.1
 	go.opentelemetry.io/otel v1.44.0
