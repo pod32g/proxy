@@ -37,6 +37,10 @@ var deprecated = map[string]deprecatedFlag{
 		instead: "quotas: in the config file",
 		why:     "the file holds the rules themselves rather than pointing at a second file",
 	},
+	"header": {
+		instead: "header_rules: in the config file, or -header-rule",
+		why:     "a conditional rule can express an unconditional one and more, and it is validated where it is written",
+	},
 }
 
 // warnDeprecated reports every deprecated flag the operator actually set.

@@ -320,12 +320,7 @@ func TestARejectedFileChangesNothing(t *testing.T) {
 	enabled := true
 	name := "changed"
 	f := &File{ProxyName: &name}
-	f.Auth = &struct {
-		Enabled      *bool   `yaml:"enabled"`
-		Username     *string `yaml:"username"`
-		Password     *string `yaml:"password"`
-		PasswordFile *string `yaml:"password_file"`
-	}{Enabled: &enabled, PasswordFile: &missing}
+	f.Auth = &AuthFile{Enabled: &enabled, PasswordFile: &missing}
 
 	changed, err := f.ApplyTo(cfg)
 	if err == nil {
@@ -348,12 +343,7 @@ func TestAuthCannotBeEnabledWithoutCredentials(t *testing.T) {
 	cfg := &Config{}
 	enabled := true
 	f := &File{}
-	f.Auth = &struct {
-		Enabled      *bool   `yaml:"enabled"`
-		Username     *string `yaml:"username"`
-		Password     *string `yaml:"password"`
-		PasswordFile *string `yaml:"password_file"`
-	}{Enabled: &enabled}
+	f.Auth = &AuthFile{Enabled: &enabled}
 
 	if _, err := f.ApplyTo(cfg); err == nil {
 		t.Fatal("auth.enabled with no credentials was accepted")

@@ -17,121 +17,85 @@ import (
 
 // File is the on-disk configuration.
 //
+// The yaml tags carry omitempty so -print-config emits a file rather than a
+// schema: a page of `null` is harder to read than the settings that are
+// actually in force, and harder to diff against what is on disk. omitempty
+// affects marshalling only — decoding, and the KnownFields check that makes a
+// misspelled key a startup error, are unchanged.
+//
 // Every field is a pointer or a slice so that "absent" is distinguishable from
 // "set to the zero value". Without that distinction a file that says nothing
 // about authentication would read as `enabled: false` and silently turn it off,
 // which is the failure mode the precedence work in PROXY-11 exists to prevent.
 type File struct {
-	Mode   *string `yaml:"mode"`
-	Target *string `yaml:"target"`
-	HTTP   *string `yaml:"http"`
-	HTTPS  *string `yaml:"https"`
-	Cert   *string `yaml:"cert"`
-	Key    *string `yaml:"key"`
-	DB     *string `yaml:"db"`
+	Mode   *string `yaml:"mode,omitempty"`
+	Target *string `yaml:"target,omitempty"`
+	HTTP   *string `yaml:"http,omitempty"`
+	HTTPS  *string `yaml:"https,omitempty"`
+	Cert   *string `yaml:"cert,omitempty"`
+	Key    *string `yaml:"key,omitempty"`
+	DB     *string `yaml:"db,omitempty"`
 
-	Admin *struct {
-		HTTP *string `yaml:"http"`
-		Cert *string `yaml:"cert"`
-		Key  *string `yaml:"key"`
-	} `yaml:"admin"`
+	Admin *AdminFile `yaml:"admin,omitempty"`
 
-	Auth *struct {
-		Enabled      *bool   `yaml:"enabled"`
-		Username     *string `yaml:"username"`
-		Password     *string `yaml:"password"`
-		PasswordFile *string `yaml:"password_file"`
-	} `yaml:"auth"`
+	Auth *AuthFile `yaml:"auth,omitempty"`
 
-	Log *struct {
-		Level  *string `yaml:"level"`
-		Format *string `yaml:"format"`
-	} `yaml:"log"`
+	Log *LogFile `yaml:"log,omitempty"`
 
-	AccessLog *struct {
-		Format *string `yaml:"format"`
-		File   *string `yaml:"file"`
-	} `yaml:"access_log"`
+	AccessLog *AccessLogFile `yaml:"access_log,omitempty"`
 
-	Tracing *struct {
-		Endpoint *string  `yaml:"endpoint"`
-		Insecure *bool    `yaml:"insecure"`
-		Sample   *float64 `yaml:"sample"`
-	} `yaml:"tracing"`
+	Tracing *TracingFile `yaml:"tracing,omitempty"`
 
-	DestinationMetrics *struct {
-		Enabled *bool `yaml:"enabled"`
-		Top     *int  `yaml:"top"`
-	} `yaml:"destination_metrics"`
+	DestinationMetrics *DestinationMetricsFile `yaml:"destination_metrics,omitempty"`
 
 	// Cache is the shared response cache. Forward mode only; reverse mode
 	// refuses to start with it rather than ignoring it.
-	Cache *struct {
-		Size     *string `yaml:"size,omitempty"`
-		MaxEntry *string `yaml:"max_entry,omitempty"`
-	} `yaml:"cache"`
+	Cache *CacheFile `yaml:"cache,omitempty"`
 
 	// UpstreamHTTP2 is how the proxy speaks HTTP/2 to origins: auto, off or h2c.
-	UpstreamHTTP2 *string `yaml:"upstream_http2"`
+	UpstreamHTTP2 *string `yaml:"upstream_http2,omitempty"`
 
 	// PAC serves a proxy auto-configuration file. Off unless asked for, and
 	// unauthenticated by necessity — see internal/pac.
-	PAC *struct {
-		Enabled    *bool   `yaml:"enabled,omitempty"`
-		Address    *string `yaml:"address,omitempty"`
-		HintDirect *bool   `yaml:"hint_direct,omitempty"`
-	} `yaml:"pac"`
+	PAC *PACFile `yaml:"pac,omitempty"`
 
 	// Tunnels bounds how many hijacked connections may be held at once, and
 	// how long an idle one survives. A request quota bounds the rate a client
 	// acquires tunnels, not the stock it holds; see proxy.TunnelLimit.
-	Tunnels *struct {
-		Max          *int    `yaml:"max,omitempty"`
-		MaxPerClient *int    `yaml:"max_per_client,omitempty"`
-		IdleTimeout  *string `yaml:"idle_timeout,omitempty"`
-	} `yaml:"tunnels"`
+	Tunnels *TunnelsFile `yaml:"tunnels,omitempty"`
 
 	// UpstreamTLS is what the proxy presents and trusts when connecting
 	// outward, distinct from cert/key above, which is what it presents to its
 	// own clients.
-	UpstreamTLS *struct {
-		CA   *string `yaml:"ca"`
-		Cert *string `yaml:"cert"`
-		Key  *string `yaml:"key"`
-	} `yaml:"upstream_tls"`
+	UpstreamTLS *UpstreamTLSFile `yaml:"upstream_tls,omitempty"`
 
-	Stats         *bool   `yaml:"stats"`
-	AllowPrivate  *bool   `yaml:"allow_private"`
-	ConnectPorts  []int   `yaml:"connect_ports"`
-	HealthPath    *string `yaml:"health_path"`
-	MetricsPublic *bool   `yaml:"metrics_public"`
-	SecretFile    *string `yaml:"secret_file"`
-	Secret        *string `yaml:"secret"`
+	Stats         *bool   `yaml:"stats,omitempty"`
+	AllowPrivate  *bool   `yaml:"allow_private,omitempty"`
+	ConnectPorts  []int   `yaml:"connect_ports,omitempty"`
+	HealthPath    *string `yaml:"health_path,omitempty"`
+	MetricsPublic *bool   `yaml:"metrics_public,omitempty"`
+	SecretFile    *string `yaml:"secret_file,omitempty"`
+	Secret        *string `yaml:"secret,omitempty"`
 
-	ProxyName *string `yaml:"proxy_name"`
-	ProxyID   *string `yaml:"proxy_id"`
+	ProxyName *string `yaml:"proxy_name,omitempty"`
+	ProxyID   *string `yaml:"proxy_id,omitempty"`
 
-	Headers map[string]string `yaml:"headers"`
+	Headers map[string]string `yaml:"headers,omitempty"`
 
 	// Policy, Clients and Quotas take the same text the flags and the UI take,
 	// so there is one syntax to learn rather than a YAML transliteration of an
 	// ordered rule list — which would make the ordering, the whole point, an
 	// accident of how the YAML happens to be written.
-	Policy  *string `yaml:"policy"`
-	Clients *string `yaml:"clients"`
-	Quotas  *string `yaml:"quotas"`
+	Policy  *string `yaml:"policy,omitempty"`
+	Clients *string `yaml:"clients,omitempty"`
+	Quotas  *string `yaml:"quotas,omitempty"`
 
 	// UpstreamProxy is a parent proxy all outbound traffic passes through.
-	UpstreamProxy *struct {
-		URL      *string `yaml:"url"`
-		Username *string `yaml:"username"`
-		Password *string `yaml:"password"`
-		NoProxy  *string `yaml:"no_proxy"`
-	} `yaml:"upstream_proxy"`
+	UpstreamProxy *UpstreamProxyFile `yaml:"upstream_proxy,omitempty"`
 
 	// HeaderRules are the conditional form. The headers map above is the
 	// unconditional one and keeps working; both are applied, map first.
-	HeaderRules *string `yaml:"header_rules"`
+	HeaderRules *string `yaml:"header_rules,omitempty"`
 
 	// resolvedPassword is the password read from auth.password_file at load
 	// time. Everything a file references is resolved before anything is
@@ -142,7 +106,82 @@ type File struct {
 	// Listeners are additional bound addresses, each with its own TLS material,
 	// mode and rule sets. The top-level http/https settings remain exactly what
 	// they were; these are in addition to them.
-	Listeners []ListenerFile `yaml:"listeners"`
+	Listeners []ListenerFile `yaml:"listeners,omitempty"`
+}
+
+// AdminFile is the `admin` block of a config file.
+type AdminFile struct {
+	HTTP *string `yaml:"http,omitempty"`
+	Cert *string `yaml:"cert,omitempty"`
+	Key  *string `yaml:"key,omitempty"`
+}
+
+// AuthFile is the `auth` block of a config file.
+type AuthFile struct {
+	Enabled      *bool   `yaml:"enabled,omitempty"`
+	Username     *string `yaml:"username,omitempty"`
+	Password     *string `yaml:"password,omitempty"`
+	PasswordFile *string `yaml:"password_file,omitempty"`
+}
+
+// LogFile is the `log` block of a config file.
+type LogFile struct {
+	Level  *string `yaml:"level,omitempty"`
+	Format *string `yaml:"format,omitempty"`
+}
+
+// AccessLogFile is the `access_log` block of a config file.
+type AccessLogFile struct {
+	Format *string `yaml:"format,omitempty"`
+	File   *string `yaml:"file,omitempty"`
+}
+
+// TracingFile is the `tracing` block of a config file.
+type TracingFile struct {
+	Endpoint *string  `yaml:"endpoint,omitempty"`
+	Insecure *bool    `yaml:"insecure,omitempty"`
+	Sample   *float64 `yaml:"sample,omitempty"`
+}
+
+// DestinationMetricsFile is the `destination_metrics` block of a config file.
+type DestinationMetricsFile struct {
+	Enabled *bool `yaml:"enabled,omitempty"`
+	Top     *int  `yaml:"top,omitempty"`
+}
+
+// CacheFile is the `cache` block of a config file.
+type CacheFile struct {
+	Size     *string `yaml:"size,omitempty"`
+	MaxEntry *string `yaml:"max_entry,omitempty"`
+}
+
+// PACFile is the `pac` block of a config file.
+type PACFile struct {
+	Enabled    *bool   `yaml:"enabled,omitempty"`
+	Address    *string `yaml:"address,omitempty"`
+	HintDirect *bool   `yaml:"hint_direct,omitempty"`
+}
+
+// TunnelsFile is the `tunnels` block of a config file.
+type TunnelsFile struct {
+	Max          *int    `yaml:"max,omitempty"`
+	MaxPerClient *int    `yaml:"max_per_client,omitempty"`
+	IdleTimeout  *string `yaml:"idle_timeout,omitempty"`
+}
+
+// UpstreamTLSFile is the `upstream_tls` block of a config file.
+type UpstreamTLSFile struct {
+	CA   *string `yaml:"ca,omitempty"`
+	Cert *string `yaml:"cert,omitempty"`
+	Key  *string `yaml:"key,omitempty"`
+}
+
+// UpstreamProxyFile is the `upstream_proxy` block of a config file.
+type UpstreamProxyFile struct {
+	URL      *string `yaml:"url,omitempty"`
+	Username *string `yaml:"username,omitempty"`
+	Password *string `yaml:"password,omitempty"`
+	NoProxy  *string `yaml:"no_proxy,omitempty"`
 }
 
 // ListenerFile is one entry in the listeners list. Anything it does not set

@@ -1,12 +1,14 @@
 package main
 
 import (
-	"os"
 	"os/exec"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/pod32g/proxy/internal/config"
 )
 
 // bootstrapOnly are the flags that deliberately have no config-file equivalent.
@@ -15,10 +17,12 @@ import (
 // putting it in the file would be circular or useless. Everything else must be
 // expressible in the file — see TestEveryFlagCanBeSetInTheConfigFile.
 var bootstrapOnly = map[string]string{
-	"config":      "names the file itself",
-	"db":          "names the database the file's settings are persisted to",
-	"healthcheck": "runs in a container HEALTHCHECK, with no file mounted",
-	"help":        "not a setting",
+	"config":       "names the file itself",
+	"db":           "names the database the file's settings are persisted to",
+	"healthcheck":  "runs in a container HEALTHCHECK, with no file mounted",
+	"validate":     "checks a file without starting; it is given one, not set in one",
+	"print-config": "reports the effective configuration; a setting for it would be circular",
+	"help":         "not a setting",
 }
 
 // aliases maps a flag to the yaml path that expresses it. A flag whose name
@@ -147,49 +151,48 @@ func declaredFlags(t *testing.T) []string {
 // fileSettings returns every yaml path the config file accepts, as
 // "block.field" for nested ones.
 //
-// A nested block's own yaml tag sits on its closing brace, *after* its fields,
-// so the fields have to be held until the block names itself. Written the
-// obvious way — assume the block name comes first — every nested setting is
-// attributed to whatever block preceded it, and the test passes by matching
-// nothing.
+// Reflection over the struct, not a scan of its source. The source version got
+// this wrong twice: a nested block's yaml tag sits on its closing brace, after
+// its fields, so the obvious parse attributed every nested setting to the
+// preceding block and passed by matching nothing; and its tag regex was
+// [a-z_]+, which does not match the 2 in upstream_http2. Both were only caught
+// by checking a result that should have been clean. The struct is the truth,
+// and reflect reads it without a parser in between.
 func fileSettings(t *testing.T) map[string]bool {
 	t.Helper()
-	src, err := os.ReadFile("internal/config/file.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := string(src)
-	start := strings.Index(body, "type File struct {")
-	if start < 0 {
-		t.Fatal("could not find the File struct")
-	}
-	end := strings.Index(body[start:], "\n}\n") + start
-
-	tag := regexp.MustCompile(`yaml:"([a-z0-9_]+)`)
 	out := map[string]bool{}
-	var pending []string
-	for _, line := range strings.Split(body[start:end], "\n") {
-		m := tag.FindStringSubmatch(line)
-		if m == nil {
-			continue
+	var walk func(reflect.Type, string)
+	walk = func(typ reflect.Type, prefix string) {
+		for typ.Kind() == reflect.Ptr {
+			typ = typ.Elem()
 		}
-		key := m[1]
-		indent := len(line) - len(strings.TrimLeft(line, "\t"))
-		if indent > 1 {
-			pending = append(pending, key)
-			continue
+		if typ.Kind() != reflect.Struct {
+			return
 		}
-		// A top-level tag. If fields are waiting, this is their block's
-		// closing brace naming it; otherwise it is a scalar of its own.
-		out[key] = true
-		for _, f := range pending {
-			out[key+"."+f] = true
+		for i := 0; i < typ.NumField(); i++ {
+			f := typ.Field(i)
+			tag := strings.Split(f.Tag.Get("yaml"), ",")[0]
+			if tag == "" || tag == "-" {
+				continue
+			}
+			path := tag
+			if prefix != "" {
+				path = prefix + "." + tag
+			}
+			out[path] = true
+
+			ft := f.Type
+			for ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			// Listeners is a slice of structs and is treated as one setting,
+			// the way the reload does.
+			if ft.Kind() == reflect.Struct {
+				walk(ft, path)
+			}
 		}
-		pending = nil
 	}
-	if len(pending) != 0 {
-		t.Fatalf("nested settings with no block: %v", pending)
-	}
+	walk(reflect.TypeOf(config.File{}), "")
 	return out
 }
 

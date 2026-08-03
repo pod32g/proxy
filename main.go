@@ -298,6 +298,10 @@ func main() {
 		"file containing the basic-auth password; preferred over -auth-pass, which is visible in ps")
 	secretFile := flag.String("secret-file", env.get("PROXY_SECRET_FILE", ""),
 		"file containing the credential-encryption secret; preferred over -secret, which is visible in ps")
+	validateOnly := flag.Bool("validate", false,
+		"check the configuration and exit, without starting anything or touching the database")
+	printConfig := flag.Bool("print-config", false,
+		"print the effective configuration as a config file and exit")
 	healthcheck := flag.Bool("healthcheck", false,
 		"probe the local health endpoint and exit 0 or 1 (used by the container HEALTHCHECK)")
 	otelEndpoint := flag.String("otel-endpoint", env.get("PROXY_OTEL_ENDPOINT", ""),
@@ -464,40 +468,54 @@ func main() {
 	}
 	set := overrides{flags: setFlags, envs: env.set}
 
-	store, err := config.NewStore(*dbPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr,
-			"Failed to open %s: %v\nStored configuration will be neither read nor written; "+
-				"the proxy will run from flags, environment and -config only.\n", *dbPath, err)
-	} else {
-		defer store.Close()
-		if err := store.Load(cfg); err != nil {
-			// Fatal, not a warning. A read failure used to be printed and
-			// stepped over, which left the proxy running with whatever had
-			// loaded — in practice no destination policy, no client table and
-			// no quotas, since those live only in the database when they were
-			// set through the UI. It fails open: a client table saying
-			// "default deny" becomes one that admits everyone.
-			//
-			// The startup Save then wrote those defaults back over the settings
-			// it had failed to read, so a transient disk error destroyed the
-			// configuration and the audit trail recorded it as a legitimate
-			// change. Refusing to start is the only answer that neither serves
-			// traffic under a policy nobody chose nor overwrites the real one.
-			fatalf("Failed to read the stored configuration from %s: %v\n"+
-				"Refusing to start: continuing would run without the stored policy "+
-				"and overwrite it on the next save.", *dbPath, err)
+	// The store is skipped entirely for -validate: creating a database as a
+	// side effect of a read-only check is not a check.
+	var store *config.Store
+	if !*validateOnly {
+		store, err = config.NewStore(*dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr,
+				"Failed to open %s: %v\nStored configuration will be neither read nor written; "+
+					"the proxy will run from flags, environment and -config only.\n", *dbPath, err)
+		} else {
+			defer store.Close()
+			if err := store.Load(cfg); err != nil {
+				// Fatal, not a warning. A read failure used to be printed and
+				// stepped over, which left the proxy running with whatever had
+				// loaded — in practice no destination policy, no client table
+				// and no quotas, since those live only in the database when
+				// they were set through the UI. It fails open: a client table
+				// saying "default deny" becomes one that admits everyone.
+				//
+				// The startup Save then wrote those defaults back over the
+				// settings it had failed to read, so a transient disk error
+				// destroyed the configuration and the audit trail recorded it
+				// as a legitimate change. Refusing to start is the only answer
+				// that neither serves traffic under a policy nobody chose nor
+				// overwrites the real one.
+				fatalf("Failed to read the stored configuration from %s: %v\n"+
+					"Refusing to start: continuing would run without the stored policy "+
+					"and overwrite it on the next save.", *dbPath, err)
+			}
 		}
-		// flag > env > file > stored > default. The file lands between the
-		// database and the explicit settings: it outranks what a previous UI
-		// edit persisted, and is outranked by anything the operator passed on
-		// this invocation.
-		if _, err := cfgFile.ApplyTo(cfg); err != nil {
-			fatalf("-config: %v", err)
-		}
-		if err := reapply(cfg, cli, set); err != nil {
-			fatalf("applying flags and environment over the stored configuration: %v", err)
-		}
+	}
+
+	// Outside the store block, deliberately.
+	//
+	// These used to sit inside its else branch, so a database that failed to
+	// open took the config file and the flag re-application down with it: the
+	// proxy warned that stored settings would not be read, then silently
+	// ignored -config as well and ran on defaults. The two have nothing to do
+	// with each other.
+	//
+	// flag > env > file > stored > default. The file lands between the database
+	// and the explicit settings: it outranks what a previous UI edit persisted,
+	// and is outranked by anything the operator passed on this invocation.
+	if _, err := cfgFile.ApplyTo(cfg); err != nil {
+		fatalf("-config: %v", err)
+	}
+	if err := reapply(cfg, cli, set); err != nil {
+		fatalf("applying flags and environment over the stored configuration: %v", err)
 	}
 
 	logger, err := config.NewLogger(os.Stdout, cfg.GetLogLevel(), logFormat)
@@ -513,6 +531,35 @@ func main() {
 	if enabled, user, pass := cfg.GetAuth(); enabled && (user == "" || pass == "") {
 		fatalf("authentication is enabled but no username and password are set: " +
 			"the proxy would refuse every request, including the admin API")
+	}
+
+	// Both exit before the store is written and before a socket is bound.
+	// Everything that can be checked has been by now — the file parsed, the
+	// rule sets compiled, the enums validated, the resulting auth state judged
+	// — so reaching here is the answer rather than a second implementation of
+	// it. A separate validator would be one more thing that can disagree with
+	// the real startup path.
+	inspect := &startupFlags{
+		cfg: cfg, dbPath: dbPath, allowPrivate: allowPrivate,
+		connectPorts: connectPorts, healthPath: healthPath,
+		metricsPublic: metricsPublic, adminAddr: adminAddr,
+		adminCert: adminCert, adminKey: adminKey,
+		logLevel: &logLevelStr, logFormat: &logFormatStr,
+		accessLog: accessLogStr, accessLogFile: accessLogFile,
+		otelEndpoint: otelEndpoint, otelInsecure: otelInsecure, otelSample: otelSample,
+		destMetrics: destinationMetrics, destTop: topDestinations,
+		secretFile: secretFile, upstreamCA: upstreamCA,
+		upstreamCert: upstreamCert, upstreamKey: upstreamKey,
+		cacheSize: cacheSize, cacheMaxEntry: cacheMaxEntry,
+		upstreamHTTP2: upstreamHTTP2,
+		pacEnabled:    pacEnabled, pacAddress: pacAddress, pacHintDirect: pacHintDirect,
+		maxTunnels: maxTunnels, maxPerClient: maxTunnelsPerClient, tunnelIdle: tunnelIdle,
+	}
+	if *validateOnly {
+		validateAndExit(*configPath, append(store.Warnings(), deprecationNotes(set)...))
+	}
+	if *printConfig {
+		printEffectiveConfig(inspect, cfg, ports, cfgFile)
 	}
 
 	accessLog, closeAccessLog, err := newAccessLog(accessFormat, *accessLogFile, logFormat, logger)

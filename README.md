@@ -10,14 +10,50 @@ go build -o proxy
 
 ## Usage
 
+**Configure it with a file.** Everything the proxy can do is expressible in one,
+it is what the reload reads, and it is the only form you can diff, review and
+check before rolling out:
+
 ```sh
-./proxy -mode reverse -target http://localhost:9000 -http :8080 \
-        -https :8443 -cert path/to/cert.pem -key path/to/key.pem \
-        -auth -auth-user admin -auth-pass secret -secret mykey \
-        -header "X-Example=1" -header "X-Other=2"
+./proxy -config proxy.yaml
+```
+
+```yaml
+http: ":8080"
+allow_private: false
+policy: |
+  deny domain internal.example.com
+  allow all
+quotas: |
+  client requests 50/s burst 100
+```
+
+Check it before you deploy it, and ask a running proxy what it thinks it is
+doing:
+
+```sh
+./proxy -config proxy.yaml -validate      # parses, compiles the rules, exits 0 or 2
+./proxy -config proxy.yaml -print-config  # the effective configuration, as a file
+```
+
+`-validate` opens no database and binds no socket. `-print-config` emits the
+merged result of flags, environment, file and stored settings — as a config file
+that reproduces it, with credentials named rather than shown. Running from its
+own output produces the same output again, which is the property that makes it
+worth trusting.
+
+Flags still work, and the small set that makes the proxy usable without a file
+is not going anywhere:
+
+```sh
+./proxy -http :8080 -allow-private -log-level DEBUG
 ```
 
 ### Flags and environment variables
+
+Every flag has a config-file equivalent except `-config`, `-db`, `-healthcheck`,
+`-validate` and `-print-config`, which name where configuration lives or run
+where none is available. Where both are given, the flag wins.
 
 - `-target` – Backend server URL. Defaults to `http://localhost:9000` or `PROXY_TARGET`.
 - `-http` – HTTP listen address. Defaults to `:8080` or `PROXY_HTTP_ADDR`.
