@@ -41,12 +41,12 @@ go build -o proxy
 - `-allow-private` – Permit proxying to loopback, private and link-local addresses. **Off by default.** Can be set with `PROXY_ALLOW_PRIVATE`.
 - `-connect-ports` – Comma-separated ports `CONNECT` may tunnel to. Defaults to `443` or `PROXY_CONNECT_PORTS`.
 - `-policy-rule` – Destination rule; repeatable, first match wins. See below.
-- `-policy-file` – File of destination rules, one per line. Can be set with `PROXY_POLICY_FILE`.
+- `-policy-file` – **Deprecated**; use `policy:` in the config file. File of destination rules, one per line. `PROXY_POLICY_FILE`.
 - `-client-rule` – Client access rule; repeatable, longest prefix wins. See below.
-- `-client-file` – File of client access rules. Can be set with `PROXY_CLIENT_FILE`.
+- `-client-file` – **Deprecated**; use `clients:` in the config file. `PROXY_CLIENT_FILE`.
 - `-header-rule` – Conditional header rule; repeatable. See below.
 - `-quota-rule` – Request or byte quota; repeatable. Unlimited by default. See below.
-- `-quota-file` – File of quota rules, one per line. Can be set with `PROXY_QUOTA_FILE`.
+- `-quota-file` – **Deprecated**; use `quotas:` in the config file. `PROXY_QUOTA_FILE`.
 - `-access-log` – Access log format: `structured`, `combined` or `off`. Defaults to `structured` or `PROXY_ACCESS_LOG`.
 - `-access-log-file` – Write access records to this file instead of stdout. Can be set with `PROXY_ACCESS_LOG_FILE`.
 - `-destination-metrics` – Export per-destination request counts. **Off by default**; see Metrics. `PROXY_DESTINATION_METRICS`.
@@ -109,6 +109,13 @@ configuration lives or run where no file is available: `-config`, `-db` and
 `-healthcheck`. That is asserted by a test rather than maintained by hand — nine
 settings had drifted out of the file before it existed, including three added
 after the file was written.
+
+Each rule set has exactly one flag route — the repeatable `-policy-rule`,
+`-client-rule`, `-quota-rule`, `-header-rule` — plus the config file. The
+`-*-file` flags are deprecated: they point at a second file holding rules the
+config file can hold directly. Where both a repeatable flag and a `-*-file` are
+given, the inline rules come first and the file's follow, applied as one ordered
+list; either outranks the config file's own key.
 
 The rule sets take the same text the flags and the UI take, rather than a YAML
 transliteration of an ordered list — the ordering is the semantics, and encoding

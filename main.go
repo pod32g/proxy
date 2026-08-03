@@ -97,6 +97,54 @@ func envDuration(key string, e *environment, def time.Duration) time.Duration {
 	return d
 }
 
+// ruleSetting is one of the four ordered rule lists — destinations, clients,
+// quotas, header rules — and the routes its text arrives by.
+//
+// The four used to be assembled by four near-identical blocks in main, each
+// reading a file, splitting on newlines, appending to whatever the repeatable
+// flag collected and applying the result. Four copies of one idea is four
+// places for the next one to diverge, and one already had: header rules never
+// got a file flag, for no reason anyone chose.
+type ruleSetting struct {
+	// flag is the repeatable inline flag, and the name recorded when it is
+	// used, so the config file knows not to overwrite an explicit setting.
+	flag  string
+	lines *policyFlags
+	// path is the deprecated -*-file flag, nil for a setting that never had
+	// one. The config file's own key does this better: it holds the rules
+	// themselves rather than pointing at a second file.
+	path     *string
+	pathFlag string
+	apply    func(string) error
+}
+
+// applyRuleSettings assembles each rule list from its routes and installs it.
+//
+// Precedence, stated once here rather than implied by four copies: rules given
+// inline come first, then rules read from a -*-file, and the combined text is
+// applied as one ordered list. The config file's own key is outranked by either,
+// which applyStartupFile enforces by consulting the same record this writes.
+func applyRuleSettings(cfg *config.Config, explicit map[string]bool, settings []ruleSetting) error {
+	for _, r := range settings {
+		lines := *r.lines
+		if r.path != nil && *r.path != "" {
+			data, err := os.ReadFile(*r.path)
+			if err != nil {
+				return fmt.Errorf("%s: %v", r.pathFlag, err)
+			}
+			lines = append(lines, strings.Split(string(data), "\n")...)
+		}
+		if len(lines) == 0 {
+			continue
+		}
+		if err := r.apply(strings.Join(lines, "\n")); err != nil {
+			return fmt.Errorf("invalid %s rules: %v", strings.TrimSuffix(r.flag, "-rule"), err)
+		}
+		explicit[r.flag] = true
+	}
+	return nil
+}
+
 func fatalf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(2)
@@ -377,58 +425,20 @@ func main() {
 	// Validate rules before anything else touches them: an unparseable rule set
 	// must not reach the request path, and an operator needs to be told which
 	// line is wrong rather than discovering it as unexpected traffic.
-	if *policyFile != "" {
-		data, err := os.ReadFile(*policyFile)
-		if err != nil {
-			fatalf("-policy-file: %v", err)
-		}
-		policyRules = append(policyRules, strings.Split(string(data), "\n")...)
-	}
-	if len(policyRules) > 0 {
-		if err := cfg.SetPolicyRules(strings.Join(policyRules, "\n")); err != nil {
-			fatalf("invalid policy rules: %v", err)
-		}
-		setFlagsExtra["policy-rule"] = true
+	if err := applyRuleSettings(cfg, setFlagsExtra, []ruleSetting{
+		{"policy-rule", &policyRules, policyFile, "-policy-file", cfg.SetPolicyRules},
+		{"client-rule", &clientRules, clientFile, "-client-file", cfg.SetClientRules},
+		{"quota-rule", &quotaRules, quotaFile, "-quota-file", cfg.SetQuotas},
+		{"header-rule", &headerRules, nil, "", cfg.SetHeaderRules},
+	}); err != nil {
+		fatalf("%v", err)
 	}
 
-	if *clientFile != "" {
-		data, err := os.ReadFile(*clientFile)
-		if err != nil {
-			fatalf("-client-file: %v", err)
-		}
-		clientRules = append(clientRules, strings.Split(string(data), "\n")...)
-	}
-	if len(clientRules) > 0 {
-		if err := cfg.SetClientRules(strings.Join(clientRules, "\n")); err != nil {
-			fatalf("invalid client rules: %v", err)
-		}
-		setFlagsExtra["client-rule"] = true
-	}
-
-	if *quotaFile != "" {
-		data, err := os.ReadFile(*quotaFile)
-		if err != nil {
-			fatalf("-quota-file: %v", err)
-		}
-		quotaRules = append(quotaRules, strings.Split(string(data), "\n")...)
-	}
-	if len(quotaRules) > 0 {
-		if err := cfg.SetQuotas(strings.Join(quotaRules, "\n")); err != nil {
-			fatalf("invalid quota rules: %v", err)
-		}
-		setFlagsExtra["quota-rule"] = true
-	}
 	if *upstreamProxy != "" {
 		if err := cfg.SetUpstreamProxy(*upstreamProxy, *noProxy); err != nil {
 			fatalf("-upstream-proxy: %v", err)
 		}
 		setFlagsExtra["upstream-proxy"] = true
-	}
-	if len(headerRules) > 0 {
-		if err := cfg.SetHeaderRules(strings.Join(headerRules, "\n")); err != nil {
-			fatalf("invalid header rules: %v", err)
-		}
-		setFlagsExtra["header-rule"] = true
 	}
 
 	// Through the accessor, not by assignment: the merged rule sets are rebuilt
@@ -514,6 +524,7 @@ func main() {
 	for _, w := range store.Warnings() {
 		logger.Warn(w)
 	}
+	warnDeprecated(logger, set)
 	warnFlagSecrets(logger, set, secretsFromFile)
 	for _, f := range []struct{ path, flag string }{
 		{*authPassFile, "-auth-pass-file"}, {*secretFile, "-secret-file"},
