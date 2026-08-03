@@ -8,9 +8,6 @@ import (
 	"strconv"
 
 	"github.com/pod32g/proxy/internal/config"
-	"github.com/pod32g/proxy/internal/header"
-	"github.com/pod32g/proxy/internal/policy"
-	"github.com/pod32g/proxy/internal/quota"
 	"github.com/pod32g/proxy/internal/server"
 	log "github.com/pod32g/simple-logger"
 )
@@ -356,43 +353,21 @@ func (h *handler) policy(w http.ResponseWriter, r *http.Request) {
 		if !decodeJSON(w, r, &req) {
 			return
 		}
-		// Validate both before applying either: a half-applied policy is worse
-		// than a rejected one, and the parsers already name the bad line.
-		if req.Destinations != nil {
-			if _, err := policy.Parse(*req.Destinations); err != nil {
-				http.Error(w, "destinations: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		if req.Clients != nil {
-			if _, err := policy.ParseClients(*req.Clients); err != nil {
-				http.Error(w, "clients: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		if req.Quotas != nil {
-			if _, err := quota.Parse(*req.Quotas); err != nil {
-				http.Error(w, "quotas: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		if req.HeaderRules != nil {
-			if _, err := header.Parse(*req.HeaderRules); err != nil {
-				http.Error(w, "header_rules: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		if req.Destinations != nil {
-			_ = h.cfg.SetPolicyRules(*req.Destinations)
-		}
-		if req.Clients != nil {
-			_ = h.cfg.SetClientRules(*req.Clients)
-		}
-		if req.Quotas != nil {
-			_ = h.cfg.SetQuotas(*req.Quotas)
-		}
-		if req.HeaderRules != nil {
-			_ = h.cfg.SetHeaderRules(*req.HeaderRules)
+		// One transaction: validated in full, then applied under one lock.
+		//
+		// Validating before applying was already the rule here — "a
+		// half-applied policy is worse than a rejected one" — but applying the
+		// four with four setters left the same gap a reload had. The
+		// destination policy and the client table are composed on the read
+		// path, so a rule moved between them belonged to neither in between.
+		if _, err := h.cfg.Apply(config.Update{
+			Policy:      req.Destinations,
+			Clients:     req.Clients,
+			Quotas:      req.Quotas,
+			HeaderRules: req.HeaderRules,
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		if h.logger != nil {
 			h.logger.Info("Updated policy")

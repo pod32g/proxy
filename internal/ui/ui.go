@@ -557,10 +557,20 @@ func (h *handler) setPolicy(w http.ResponseWriter, r *http.Request) {
 		policyPage.Execute(w, data)
 		return
 	}
-	_ = h.cfg.SetPolicyRules(destinations)
-	_ = h.cfg.SetClientRules(clients)
-	_ = h.cfg.SetQuotas(quotas)
-	_ = h.cfg.SetHeaderRules(headerRules)
+	// One transaction. The per-field validation above stays because it renders
+	// a precise message next to the field; this is what makes the four land
+	// together, so a rule moved between the policy and the client table is
+	// never absent from both.
+	if _, err := h.cfg.Apply(config.Update{
+		Policy:      &destinations,
+		Clients:     &clients,
+		Quotas:      &quotas,
+		HeaderRules: &headerRules,
+	}); err != nil {
+		data.PolicyError = err.Error()
+		policyPage.Execute(w, data)
+		return
+	}
 	if h.logger != nil {
 		h.logger.Info("Updated policy")
 	}

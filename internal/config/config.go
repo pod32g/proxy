@@ -431,10 +431,9 @@ func (c *Config) SetUpstreamProxy(rawURL, noProxy string) error {
 func (c *Config) SetUpstreamProxyCredentials(user, pass string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.upstreamProxy == nil {
-		c.upstreamProxy = &upstream.Proxy{}
-	}
-	c.upstreamProxy.SetCredentials(user, pass)
+	// Replaced, not edited. UpstreamProxy hands this pointer to every request,
+	// so writing through it races every reader currently holding one.
+	c.upstreamProxy = c.upstreamProxy.WithCredentials(user, pass)
 }
 
 // UpstreamProxy returns the configured parent, or nil.

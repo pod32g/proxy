@@ -99,12 +99,35 @@ func Parse(rawURL, noProxy string) (*Proxy, error) {
 	return p, nil
 }
 
-// SetCredentials replaces the parent's credentials, for the persistence path.
+// SetCredentials replaces the parent's credentials in place.
+//
+// Only safe before the value is published. Config hands this pointer to every
+// request through UpstreamProxy, so mutating one that readers already hold is a
+// data race — a confirmed one, on Username and Password, reachable on any
+// reload carrying parent credentials. Use WithCredentials there.
 func (p *Proxy) SetCredentials(user, pass string) {
 	if p == nil {
 		return
 	}
 	p.Username, p.Password = user, pass
+}
+
+// WithCredentials returns a copy carrying the given credentials, leaving the
+// receiver untouched.
+//
+// The same rule cache.Entry follows, for the same reason: a value handed to
+// readers under a lock and then edited is edited without one. Replacing it is
+// how a reader either sees the whole old parent or the whole new one.
+//
+// The bypass list is shared with the copy rather than duplicated — it is never
+// written after Parse, which is what makes that safe.
+func (p *Proxy) WithCredentials(user, pass string) *Proxy {
+	if p == nil {
+		return &Proxy{Username: user, Password: pass}
+	}
+	clone := *p
+	clone.Username, clone.Password = user, pass
+	return &clone
 }
 
 // Bypass reports whether a destination should be reached directly.

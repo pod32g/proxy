@@ -415,154 +415,56 @@ func (f *File) ApplyTo(cfg *Config) ([]string, error) {
 	if f == nil {
 		return nil, nil
 	}
-	// Everything that can fail, before anything is written.
+	// Everything that can fail is checked by Config.Apply before it writes
+	// anything — including the resulting authentication state, which it can
+	// judge better than this can because it sees the live values under the same
+	// lock it will write through. A rejected update changes nothing.
+
+	// One transaction, rather than a setter per field.
 	//
-	// This used to fail partway and return with some settings applied and some
-	// not, producing a live configuration that existed in no file. LoadFile now
-	// resolves the one thing that could fail late, so this is a second line
-	// rather than the only one — but a setting added later that can fail is
-	// caught here instead of halfway through the apply.
-	if err := f.applicable(cfg); err != nil {
-		return nil, err
+	// Applied one at a time, a reader between two calls saw a configuration
+	// that was half old and half new — and the policy and the client table are
+	// composed on the read path, so a rule moved between them existed in
+	// neither for 43% of a reload. See config.Update.
+	u := Update{
+		Stats:       f.Stats,
+		ProxyName:   f.ProxyName,
+		ProxyID:     f.ProxyID,
+		Policy:      f.Policy,
+		Clients:     f.Clients,
+		Quotas:      f.Quotas,
+		HeaderRules: f.HeaderRules,
+		Headers:     f.Headers,
 	}
-
-	var changed []string
-	note := func(name string) { changed = append(changed, name) }
-
 	if f.Log != nil && f.Log.Level != nil {
 		lvl, _ := ParseLogLevelStrict(*f.Log.Level)
-		if lvl != cfg.GetLogLevel() {
-			cfg.SetLogLevel(lvl)
-			note("log.level")
-		}
-	}
-	if f.Stats != nil && *f.Stats != cfg.StatsEnabledState() {
-		cfg.SetStatsEnabled(*f.Stats)
-		note("stats")
-	}
-	if f.ProxyName != nil || f.ProxyID != nil {
-		name, id := cfg.GetIdentity()
-		if f.ProxyName != nil && *f.ProxyName != name {
-			cfg.SetProxyName(*f.ProxyName)
-			note("proxy_name")
-		}
-		if f.ProxyID != nil && *f.ProxyID != id {
-			cfg.SetProxyID(*f.ProxyID)
-			note("proxy_id")
-		}
-	}
-	if f.Policy != nil && *f.Policy != cfg.PolicyRulesText() {
-		if err := cfg.SetPolicyRules(*f.Policy); err != nil {
-			return changed, err
-		}
-		note("policy")
-	}
-	if f.Clients != nil && *f.Clients != cfg.ClientRulesText() {
-		if err := cfg.SetClientRules(*f.Clients); err != nil {
-			return changed, err
-		}
-		note("clients")
-	}
-	if f.Quotas != nil && *f.Quotas != cfg.QuotaText() {
-		if err := cfg.SetQuotas(*f.Quotas); err != nil {
-			return changed, err
-		}
-		note("quotas")
-	}
-	if f.Headers != nil {
-		if !sameHeaders(cfg.GetHeaders(), f.Headers) {
-			cfg.ReplaceHeaders(f.Headers)
-			note("headers")
-		}
+		u.LogLevel = &lvl
 	}
 	if f.UpstreamProxy != nil && f.UpstreamProxy.URL != nil {
-		no := ""
+		up := &UpstreamUpdate{URL: *f.UpstreamProxy.URL}
 		if f.UpstreamProxy.NoProxy != nil {
-			no = *f.UpstreamProxy.NoProxy
+			up.NoProxy = *f.UpstreamProxy.NoProxy
 		}
-		if *f.UpstreamProxy.URL != cfg.UpstreamProxyURL() || no != cfg.UpstreamProxyBypass() {
-			if err := cfg.SetUpstreamProxy(*f.UpstreamProxy.URL, no); err != nil {
-				return changed, err
-			}
-			note("upstream_proxy")
-		}
-		if f.UpstreamProxy.Username != nil || f.UpstreamProxy.Password != nil {
-			user, pass := cfg.UpstreamProxyCredentials()
-			if f.UpstreamProxy.Username != nil {
-				user = *f.UpstreamProxy.Username
-			}
-			if f.UpstreamProxy.Password != nil {
-				pass = *f.UpstreamProxy.Password
-			}
-			cfg.SetUpstreamProxyCredentials(user, pass)
-			note("upstream_proxy.credentials")
-		}
-	}
-	if f.HeaderRules != nil && *f.HeaderRules != cfg.HeaderRulesText() {
-		if err := cfg.SetHeaderRules(*f.HeaderRules); err != nil {
-			return changed, err
-		}
-		note("header_rules")
+		up.Username = f.UpstreamProxy.Username
+		up.Password = f.UpstreamProxy.Password
+		u.Upstream = up
 	}
 	if f.Auth != nil {
-		enabled, user, pass := cfg.GetAuth()
-		if f.Auth.Enabled != nil && *f.Auth.Enabled != enabled {
-			cfg.SetAuthEnabled(*f.Auth.Enabled)
-			note("auth.enabled")
-		}
-		newUser, newPass := user, pass
-		if f.Auth.Username != nil {
-			newUser = *f.Auth.Username
-		}
+		a := &AuthUpdate{Enabled: f.Auth.Enabled, Username: f.Auth.Username}
 		if p, ok, err := f.Password(); err != nil {
-			return changed, err
+			return nil, err
 		} else if ok {
-			newPass = p
+			a.Password = strPtr(p)
 		}
-		if newUser != user || newPass != pass {
-			cfg.SetCredentials(newUser, newPass)
-			// Named without the value, as everywhere else.
-			note("auth.credentials")
-		}
+		u.Auth = a
+	}
+
+	changed, err := cfg.Apply(u)
+	if err != nil {
+		return nil, err
 	}
 	sort.Strings(changed)
 	return changed, nil
-}
-
-// applicable reports whether this file can be applied in full, without
-// applying any of it.
-//
-// The resulting authentication state is the substance. Enabling authentication
-// without a credential makes the Router refuse every request — deliberately,
-// and correctly, since the alternative is passing traffic the operator asked to
-// have gated. What must not happen is a configuration change producing that
-// state, because the surface that would undo it is behind the same gate.
-func (f *File) applicable(cfg *Config) error {
-	if _, _, err := f.Password(); err != nil {
-		return err
-	}
-	if f.Auth == nil {
-		// The file has no opinion about authentication, so it cannot be what
-		// breaks it. Checking anyway would refuse every reload for a proxy
-		// already in the bad state — trapping the operator in it rather than
-		// letting them edit their way out.
-		return nil
-	}
-	enabled, user, pass := cfg.GetAuth()
-	if f.Auth.Enabled != nil {
-		enabled = *f.Auth.Enabled
-	}
-	if f.Auth.Username != nil {
-		user = *f.Auth.Username
-	}
-	if p, ok, _ := f.Password(); ok {
-		pass = p
-	}
-	if enabled && (user == "" || pass == "") {
-		return fmt.Errorf("auth.enabled is true but no username and password are configured; " +
-			"the proxy would refuse every request, including the admin API")
-	}
-	return nil
 }
 
 func sameHeaders(a, b map[string]string) bool {

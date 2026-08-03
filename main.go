@@ -100,36 +100,44 @@ func (o overrides) has(flagName, envName string) bool {
 
 // reapply restores the explicitly-supplied settings over whatever Load read
 // from the database.
-func reapply(cfg *config.Config, cli startupValues, set overrides) {
+func reapply(cfg *config.Config, cli startupValues, set overrides) error {
+	// One transaction, like every other multi-setting change.
+	//
+	// This runs after every reload, so applying six settings one at a time put
+	// six more windows on the same request path the reload had. The auth pair
+	// is the one that matters: enabled and the credentials landing separately
+	// is the state the Router refuses everything in.
+	u := config.Update{}
 	if set.has("log-level", "PROXY_LOG_LEVEL") {
-		cfg.SetLogLevel(cli.logLevel)
-	}
-	if set.has("auth", "PROXY_AUTH_ENABLED") {
-		cfg.SetAuthEnabled(cli.authEnabled)
+		u.LogLevel = &cli.logLevel
 	}
 	if set.has("stats", "PROXY_STATS_ENABLED") {
-		cfg.SetStatsEnabled(cli.statsEnabled)
+		u.Stats = &cli.statsEnabled
 	}
 	if set.has("proxy-name", "PROXY_NAME") {
-		cfg.SetProxyName(cli.proxyName)
+		u.ProxyName = &cli.proxyName
 	}
 	if set.has("proxy-id", "PROXY_ID") {
-		cfg.SetProxyID(cli.proxyID)
+		u.ProxyID = &cli.proxyID
 	}
-	// Credentials move together, so read the current pair and replace only the
-	// half that was given explicitly.
+
 	userSet := set.has("auth-user", "PROXY_AUTH_USER")
 	passSet := set.has("auth-pass", "PROXY_AUTH_PASS")
-	if userSet || passSet {
-		_, user, pass := cfg.GetAuth()
+	if set.has("auth", "PROXY_AUTH_ENABLED") || userSet || passSet {
+		a := &config.AuthUpdate{}
+		if set.has("auth", "PROXY_AUTH_ENABLED") {
+			a.Enabled = &cli.authEnabled
+		}
 		if userSet {
-			user = cli.username
+			a.Username = &cli.username
 		}
 		if passSet {
-			pass = cli.password
+			a.Password = &cli.password
 		}
-		cfg.SetCredentials(user, pass)
+		u.Auth = a
 	}
+	_, err := cfg.Apply(u)
+	return err
 }
 
 func main() {
@@ -444,7 +452,9 @@ func main() {
 		if _, err := cfgFile.ApplyTo(cfg); err != nil {
 			fatalf("-config: %v", err)
 		}
-		reapply(cfg, cli, set)
+		if err := reapply(cfg, cli, set); err != nil {
+			fatalf("applying flags and environment over the stored configuration: %v", err)
+		}
 	}
 
 	logger, err := config.NewLogger(os.Stdout, cfg.GetLogLevel(), logFormat)
@@ -1216,7 +1226,9 @@ func watchReloads(path string, current *config.File, cfg *config.Config,
 		// Explicit settings still outrank the file after a reload, exactly as
 		// they do at startup. Without this, editing the file would let it win
 		// over a flag the operator passed on this invocation.
-		reapply(cfg, cli, set)
+		if err := reapply(cfg, cli, set); err != nil {
+			logger.Errorf("Could not re-apply flags and environment after the reload: %v", err)
+		}
 
 		if len(changed) > 0 {
 			logger.Info("Configuration applied", log.String("settings", strings.Join(changed, ", ")))
